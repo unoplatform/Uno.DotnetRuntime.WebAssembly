@@ -1,0 +1,84 @@
+jobs:
+- job: Mono_Build
+
+  container: 
+    image: unoplatform/mono-wasm-build:1.0
+    options: "--name ci-container -v /usr/bin/docker:/tmp/docker:ro"
+
+  timeoutInMinutes: 240
+
+  workspace:
+    clean: all
+      
+  pool:
+    vmImage: 'ubuntu-latest'
+
+  variables:
+    NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
+    VersionCodeOffset: 400559 # last value for the APK release
+    EMSDK_VERSION: 2.0.6
+
+  steps:
+  - bash: |
+      sudo apt-get update
+      sudo apt-get install -y python3-pip locales p7zip-full zip
+      sudo apt-get install -y unzip python python3.7 msbuild libc6 ninja-build
+      sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
+        libtool build-essential python curl git lldb-6.0 liblldb-6.0-dev \
+        libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+        libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+      sudo locale-gen en_US.UTF-8
+
+    displayName: Install dotnet/runtime dependencies
+
+  - bash: |
+      sudo apt install libicu-dev
+      sudo apt remove -y --purge cmake
+      sudo apt install -y build-essential libssl-dev
+      wget https://github.com/Kitware/CMake/releases/download/v3.16.5/cmake-3.16.5.tar.gz
+      tar -zxvf cmake-3.16.5.tar.gz
+      cd cmake-3.16.5
+      ./bootstrap
+      make
+      sudo make install 
+    displayName: Install cmake 3.16 
+
+  - bash: |
+      cd ~
+      git clone --branch $(EMSDK_VERSION) https://github.com/emscripten-core/emsdk
+      cd emsdk
+      ./emsdk install $(EMSDK_VERSION)
+      ./emsdk activate $(EMSDK_VERSION)
+    displayName: 'Setup Emscripten'
+
+  - bash: |
+      git clone --recursive https://github.com/dotnet/runtime
+
+    displayName: Clone dotnet/runtime
+
+  - bash: |
+      set -e
+      cd runtime
+      git reset --hard c5b97a6a505ccf19f6246df6a7a47deddf035d43
+      echo dotnet/runtime base SHA1: `git rev-parse HEAD`
+      # git apply $(Build.SourcesDirectory)/build/force-enable-idbfs.patch
+      git config --global user.email "ci@platform.uno"
+      git config --global user.name "Uno Platform CI"
+      # git add .
+      # git commit -m "apply patches"
+
+    displayName: Apply Patches
+
+  - bash: |
+      export EMSDK_PATH=~/emsdk
+      cd runtime
+      ./build.sh -arch wasm -os Browser -c Release
+      cp -R artifacts/packages/Release $(build.artifactstagingdirectory)
+
+    displayName: Build Wasm Runtime
+
+  - task: PublishBuildArtifacts@1
+    inputs:
+      PathtoPublish: $(build.artifactstagingdirectory)
+      ArtifactName: dotnet-wasm-sdk
+      ArtifactType: Container
