@@ -20,6 +20,28 @@ jobs:
 
   steps:
   - bash: |
+      git clone --recursive https://github.com/dotnet/runtime
+
+    displayName: Clone dotnet/runtime
+
+  - bash: |
+      set -e
+      cd runtime
+      git reset --hard 7d15ecf121ea848b5fa1ccb7aa0df29f1d8066dd
+      echo dotnet/runtime base SHA1: `git rev-parse HEAD`
+      git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
+      git apply $(Build.SourcesDirectory)/patches/pr43785-0001.patch
+      git apply $(Build.SourcesDirectory)/patches/pr43785-0002.patch
+      git apply $(Build.SourcesDirectory)/patches/pr43785-0003.patch
+      git config --global user.email "ci@platform.uno"
+      git config --global user.name "Uno Platform CI"
+      git add .
+      git commit -m "apply patches"
+      echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
+
+    displayName: Apply Patches
+
+  - bash: |
       sudo apt-get update
       sudo apt-get install -y python3-pip locales p7zip-full zip
       sudo apt-get install -y unzip python python3.7 msbuild libc6 ninja-build
@@ -32,15 +54,9 @@ jobs:
     displayName: Install dotnet/runtime dependencies
 
   - bash: |
-      sudo apt install libicu-dev
-      sudo apt remove -y --purge cmake
-      sudo apt install -y build-essential libssl-dev
-      wget https://github.com/Kitware/CMake/releases/download/v3.16.5/cmake-3.16.5.tar.gz
-      tar -zxvf cmake-3.16.5.tar.gz
-      cd cmake-3.16.5
-      ./bootstrap
-      make
-      sudo make install 
+      wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
+      sudo tar --strip-components=1 -xz -C /usr/local
+
     displayName: Install cmake 3.16 
 
   - bash: |
@@ -50,24 +66,6 @@ jobs:
       ./emsdk install $(EMSDK_VERSION)
       ./emsdk activate $(EMSDK_VERSION)
     displayName: 'Setup Emscripten'
-
-  - bash: |
-      git clone --recursive https://github.com/dotnet/runtime
-
-    displayName: Clone dotnet/runtime
-
-  - bash: |
-      set -e
-      cd runtime
-      git reset --hard c5b97a6a505ccf19f6246df6a7a47deddf035d43
-      echo dotnet/runtime base SHA1: `git rev-parse HEAD`
-      # git apply $(Build.SourcesDirectory)/build/force-enable-idbfs.patch
-      git config --global user.email "ci@platform.uno"
-      git config --global user.name "Uno Platform CI"
-      # git add .
-      # git commit -m "apply patches"
-
-    displayName: Apply Patches
 
   - bash: |
       export EMSDK_PATH=~/emsdk
