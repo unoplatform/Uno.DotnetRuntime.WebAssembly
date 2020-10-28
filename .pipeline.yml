@@ -21,6 +21,14 @@ jobs:
   steps:
   - bash: |
       set -e
+      CURRENT_COMMIT=`git rev-parse --short HEAD`
+      echo "##vso[task.setvariable variable=CURRENT_COMMIT]$CURRENT_COMMIT"
+      echo "CurrentCommit=$CURRENT_COMMIT"
+
+    displayName: Set Variable from current Commit
+
+  - bash: |
+      set -e
       git clone --recursive https://github.com/mono/linker
       cd linker
       git reset --hard 57974c1f5790e6fb33f5fce161707be5cd86c4d3
@@ -105,7 +113,7 @@ jobs:
       rootFolderOrFile: 'runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release'
       includeRootFolder: false
       archiveType: 'zip'
-      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(Build.BuildId).zip'
+      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(CURRENT_COMMIT)-$(Build.BuildId).zip'
 
   - task: PublishBuildArtifacts@1
     inputs:
