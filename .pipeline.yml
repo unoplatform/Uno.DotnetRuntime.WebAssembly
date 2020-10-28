@@ -42,6 +42,7 @@ jobs:
     displayName: Apply Patches
 
   - bash: |
+      set -e
       sudo apt-get update
       sudo apt-get install -y python3-pip locales p7zip-full zip
       sudo apt-get install -y unzip python python3.7 msbuild libc6 ninja-build
@@ -54,12 +55,14 @@ jobs:
     displayName: Install dotnet/runtime dependencies
 
   - bash: |
+      set -e
       wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
       sudo tar --strip-components=1 -xz -C /usr/local
 
     displayName: Install cmake 3.16 
 
   - bash: |
+      set -e
       cd ~
       git clone --branch $(EMSDK_VERSION) https://github.com/emscripten-core/emsdk
       cd emsdk
@@ -68,10 +71,11 @@ jobs:
     displayName: 'Setup Emscripten'
 
   - bash: |
+      set -e
       export EMSDK_PATH=~/emsdk
       cd runtime
       ./build.sh -arch wasm -os Browser -c Release
-      cp -R artifacts/packages/Release $(build.artifactstagingdirectory)
+      cp -R artifacts/bin/microsoft.netcore.app.runtime.browser-wasm $(build.artifactstagingdirectory)
 
     displayName: Build Wasm Runtime
 
