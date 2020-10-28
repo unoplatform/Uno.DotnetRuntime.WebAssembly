@@ -20,6 +20,21 @@ jobs:
 
   steps:
   - bash: |
+      set -e
+      git clone --recursive https://github.com/mono/linker
+      cd linker
+      git reset --hard 57974c1f5790e6fb33f5fce161707be5cd86c4d3
+
+    displayName: Clone mono/linker
+
+  - bash: |
+      set -e
+      cd linker
+      msbuild /r /bl /p:Configuration=Release monolinker.sln
+
+    displayName: Build mono/linker
+
+  - bash: |
       git clone --recursive https://github.com/dotnet/runtime
 
     displayName: Clone dotnet/runtime
@@ -77,6 +92,13 @@ jobs:
       ./build.sh -arch wasm -os Browser -c Release
 
     displayName: Build Wasm Runtime
+
+  - bash: |
+      LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release/tools
+      mkdir -p $LINKER_OUT
+      cp -r linker/src/linker/bin/Release/net471/* $LINKER_OUT
+
+    displayName: Copy mono/linker files
 
   - task: ArchiveFiles@2
     inputs:
