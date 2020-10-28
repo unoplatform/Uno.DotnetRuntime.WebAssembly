@@ -75,9 +75,15 @@ jobs:
       export EMSDK_PATH=~/emsdk
       cd runtime
       ./build.sh -arch wasm -os Browser -c Release
-      cp -R artifacts/bin/microsoft.netcore.app.runtime.browser-wasm $(build.artifactstagingdirectory)
 
     displayName: Build Wasm Runtime
+
+  - task: ArchiveFiles@2
+    inputs:
+      rootFolderOrFile: 'runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release'
+      includeRootFolder: false
+      archiveType: 'zip'
+      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(Build.BuildId).zip'
 
   - task: PublishBuildArtifacts@1
     inputs:
