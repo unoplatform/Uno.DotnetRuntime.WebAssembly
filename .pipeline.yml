@@ -1,6 +1,13 @@
 jobs:
 - job: Mono_Build
 
+  variables:
+    NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
+    VersionCodeOffset: 400559 # last value for the APK release
+    EMSDK_VERSION: 2.0.6
+    DOTNETRUNTIME_COMMIT: 4d3ca5fb4a839ce85c489c3445c0a6ee4a7618ce
+    LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
+
   container: 
     image: unoplatform/mono-wasm-build:1.0
     options: "--name ci-container -v /usr/bin/docker:/tmp/docker:ro"
@@ -13,12 +20,13 @@ jobs:
   pool:
     vmImage: 'ubuntu-latest'
 
-  variables:
-    NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
-    VersionCodeOffset: 400559 # last value for the APK release
-    EMSDK_VERSION: 2.0.6
-    DOTNETRUNTIME_COMMIT: 4d3ca5fb4a839ce85c489c3445c0a6ee4a7618ce
-    LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
+  strategy:
+    matrix:
+      Debug:
+        BUILD_CONFIGURATION: 'Debug'
+
+      Release:
+        BUILD_CONFIGURATION: 'Release'
 
   steps:
   - bash: |
@@ -99,15 +107,15 @@ jobs:
       set -e
       export EMSDK_PATH=~/emsdk
       cd runtime
-      ./build.sh -arch wasm -os Browser -c Release
+      ./build.sh -arch wasm -os Browser -c $(BUILD_CONFIGURATION)
 
       # Workaround for https://github.com/dotnet/runtime/issues/44033
-      cp ./artifacts/bin/ref/net6.0/System.Net.Quic.dll ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release/runtimes/browser-wasm/lib/net6.0
+      cp ./artifacts/bin/ref/net6.0/System.Net.Quic.dll ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/lib/net6.0
 
     displayName: Build Wasm Runtime
 
   - bash: |
-      LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release/tools
+      LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/tools
       mkdir -p $LINKER_OUT
       cp -r linker/src/linker/bin/Release/net471/* $LINKER_OUT
 
@@ -115,10 +123,10 @@ jobs:
 
   - task: ArchiveFiles@2
     inputs:
-      rootFolderOrFile: 'runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release'
+      rootFolderOrFile: 'runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)'
       includeRootFolder: false
       archiveType: 'zip'
-      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(CURRENT_COMMIT)-$(Build.BuildId).zip'
+      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(CURRENT_COMMIT)-$(Build.BuildId)-$(BUILD_CONFIGURATION).zip'
 
   - task: PublishBuildArtifacts@1
     inputs:
