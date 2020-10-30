@@ -1,22 +1,22 @@
-From 316ef37f6612f4d8e40a2a238bb5221d937d052e Mon Sep 17 00:00:00 2001
+From 7fb337249735aa3cf54cddab7fd26456c980c1df Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 29 Oct 2020 16:03:05 +0000
-Subject: [PATCH] Enable Wasm AOT support
+Date: Fri, 30 Oct 2020 18:59:24 +0000
+Subject: [PATCH] enable AOT for WASM
 
 ---
  src/mono/mono.proj | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
-index 5d36956027e..0b681855d18 100644
+index 90385f06c80..d351ddc780e 100644
 --- a/src/mono/mono.proj
 +++ b/src/mono/mono.proj
 @@ -185,7 +185,7 @@
-       <_MonoMinimal Condition="'$(Configuration)' == 'Debug'">full_messages,assert_messages</_MonoMinimal>
+       <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,assert_messages</_MonoMinimal>
      </PropertyGroup>
      <ItemGroup Condition="'$(TargetsBrowser)' == 'true'">
--      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,aot,interpreter,qcalls,$(_MonoMinimal)"/>
-+      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,interpreter,qcalls,$(_MonoMinimal)"/>
+-      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,aot,interpreter,qcalls$(_MonoMinimal)"/>
++      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,interpreter,qcalls$(_MonoMinimal)"/>
        <_MonoCMakeArgs Include="-DENABLE_INTERP_LIB=1"/>
        <_MonoCMakeArgs Include="-DDISABLE_ICALL_TABLES=1"/>
        <_MonoCMakeArgs Include="-DDISABLE_CRASH_REPORTING=1"/>
