@@ -17,6 +17,8 @@ jobs:
     NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
     VersionCodeOffset: 400559 # last value for the APK release
     EMSDK_VERSION: 2.0.6
+    DOTNETRUNTIME_COMMIT: 4d3ca5fb4a839ce85c489c3445c0a6ee4a7618ce
+    LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
 
   steps:
   - bash: |
@@ -31,7 +33,7 @@ jobs:
       set -e
       git clone --recursive https://github.com/mono/linker
       cd linker
-      git reset --hard 57974c1f5790e6fb33f5fce161707be5cd86c4d3
+      git reset --hard $(LINKER_COMMIT)
 
     displayName: Clone mono/linker
 
@@ -50,7 +52,7 @@ jobs:
   - bash: |
       set -e
       cd runtime
-      git reset --hard d84d05f898c6e46d46af6752fc1604fe639065c9
+      git reset --hard $(DOTNETRUNTIME_COMMIT)
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
       git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
       git apply $(Build.SourcesDirectory)/patches/pr43785-0001.patch
