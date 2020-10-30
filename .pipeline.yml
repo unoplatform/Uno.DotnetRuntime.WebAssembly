@@ -99,6 +99,9 @@ jobs:
       cd runtime
       ./build.sh -arch wasm -os Browser -c Release
 
+      # Workaround for https://github.com/dotnet/runtime/issues/44033
+      cp ./artifacts/bin/ref/net6.0/System.Net.Quic.dll runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/Release/runtimes/browser-wasm/lib/net6.0
+
     displayName: Build Wasm Runtime
 
   - bash: |
