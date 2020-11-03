@@ -1,32 +1,17 @@
-From 6f0a2ced40103ae0a165eda4594b37cf2d8d408d Mon Sep 17 00:00:00 2001
+From ffb5d7b59573ae59003264e4039b9d6f811a94cf Mon Sep 17 00:00:00 2001
 From: Zoltan Varga <vargaz@gmail.com>
 Date: Mon, 26 Oct 2020 12:40:15 -0400
 Subject: [PATCH 3/3] Remove unused libicu files.
 
 ---
- src/mono/wasm/Makefile  | 3 +--
  src/mono/wasm/wasm.proj | 3 ---
- 2 files changed, 1 insertion(+), 5 deletions(-)
+ 1 file changed, 3 deletions(-)
 
-diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
-index 48a336d9b8a..9913c4f84bd 100644
---- a/src/mono/wasm/Makefile
-+++ b/src/mono/wasm/Makefile
-@@ -58,8 +58,7 @@ MONO_LIBS = \
- 	${NATIVE_BIN_DIR}/libSystem.Native.a \
- 	${NATIVE_BIN_DIR}/libSystem.IO.Compression.Native.a \
- 	$(ICU_LIBDIR)/libicuuc.a \
--	$(ICU_LIBDIR)/libicui18n.a \
--	$(ICU_LIBDIR)/libicudata.a
-+	$(ICU_LIBDIR)/libicui18n.a
- 
- EMCC_FLAGS=--profiling-funcs -s WASM=1 -s ALLOW_MEMORY_GROWTH=1 -s BINARYEN=1 -s ALIASING_FUNCTION_POINTERS=0 -s NO_EXIT_RUNTIME=1 -s "EXTRA_EXPORTED_RUNTIME_METHODS=['ccall', 'FS_createPath', 'FS_createDataFile', 'cwrap', 'setValue', 'getValue', 'UTF8ToString', 'UTF8ArrayToString', 'addFunction']" -s "EXPORTED_FUNCTIONS=['_putchar']" --source-map-base http://example.com  -emit-llvm -s FORCE_FILESYSTEM=1 -s USE_ZLIB=1
- ifneq ($(ENABLE_ES6),false)
 diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
-index df8d78e7528..8c0b945c923 100644
+index 1848ba8f6d4..b1be12a4fd6 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
-@@ -103,10 +103,7 @@
+@@ -105,10 +105,7 @@
                         $(MonoProjectRoot)wasm\runtime\library_mono.js;
                         $(LibrariesProjectRoot)Native\Unix\System.Native\pal_random.js;
                         $(ArtifactsObjDir)wasm\pinvoke-table.h;
