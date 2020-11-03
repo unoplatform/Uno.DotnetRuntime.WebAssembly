@@ -63,6 +63,7 @@ jobs:
       git reset --hard $(DOTNETRUNTIME_COMMIT)
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
       git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
+      git apply $(Build.SourcesDirectory)/patches/enable-wasm-llvm.patch
       git apply $(Build.SourcesDirectory)/patches/pr43785-0001.patch
       git apply $(Build.SourcesDirectory)/patches/pr43785-0002.patch
       git apply $(Build.SourcesDirectory)/patches/pr43785-0003.patch
