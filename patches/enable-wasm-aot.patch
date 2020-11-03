@@ -1,18 +1,22 @@
-From 7fb337249735aa3cf54cddab7fd26456c980c1df Mon Sep 17 00:00:00 2001
+From f224332f8b6ef83aea7b816ca9829c39e9e9d56c Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Fri, 30 Oct 2020 18:59:24 +0000
-Subject: [PATCH] enable AOT for WASM
+Subject: [PATCH] update
 
 ---
- src/mono/mono.proj | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ src/mono/mono.proj | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
-index 90385f06c80..d351ddc780e 100644
+index 90385f06c80..fba24bd36c0 100644
 --- a/src/mono/mono.proj
 +++ b/src/mono/mono.proj
-@@ -185,7 +185,7 @@
-       <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,assert_messages</_MonoMinimal>
+@@ -182,10 +182,10 @@
+     </ItemGroup>
+     <!-- WASM specific options -->
+     <PropertyGroup Condition="'$(TargetsBrowser)' == 'true'">
+-      <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,assert_messages</_MonoMinimal>
++      <_MonoMinimal Condition="'$(Configuration)' == 'Release'"></_MonoMinimal>
      </PropertyGroup>
      <ItemGroup Condition="'$(TargetsBrowser)' == 'true'">
 -      <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,aot,interpreter,qcalls$(_MonoMinimal)"/>
