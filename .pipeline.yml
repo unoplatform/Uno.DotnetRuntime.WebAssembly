@@ -29,6 +29,14 @@ jobs:
         BUILD_CONFIGURATION: 'Release'
 
   steps:
+  - task: UseDotNet@2
+    displayName: 'Install .NET 5 SDK'
+    inputs:
+      packageType: sdk
+      version: 5.0.100-rc.2.20479.15
+      includePreviewVersions: true
+      installationPath: $(Agent.ToolsDirectory)/dotnet
+
   - bash: |
       set -e
       CURRENT_COMMIT=`git rev-parse --short HEAD`
@@ -48,7 +56,7 @@ jobs:
   - bash: |
       set -e
       cd linker
-      msbuild /r /bl /p:Configuration=Release monolinker.sln
+      dotnet msbuild /r /bl /p:Configuration=Release illink.sln
 
     displayName: Build mono/linker
 
@@ -121,7 +129,7 @@ jobs:
   - bash: |
       LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/tools
       mkdir -p $LINKER_OUT
-      cp -r linker/src/linker/bin/Release/net471/* $LINKER_OUT
+      cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
 
     displayName: Copy mono/linker files
 
