@@ -22,11 +22,10 @@ jobs:
 
   strategy:
     matrix:
-      Debug:
-        BUILD_CONFIGURATION: 'Debug'
-
       Release:
         BUILD_CONFIGURATION: 'Release'
+      Debug:
+        BUILD_CONFIGURATION: 'Debug'
 
   steps:
   - task: UseDotNet@2
@@ -132,6 +131,13 @@ jobs:
       cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
 
     displayName: Copy mono/linker files
+
+  - bash: |
+      LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/dbg-proxy/net5
+      mkdir -p $LINKER_OUT
+      cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$(BUILD_CONFIGURATION) $LINKER_OUT
+
+    displayName: Copy Wasm Debugger files
 
   - task: ArchiveFiles@2
     inputs:
