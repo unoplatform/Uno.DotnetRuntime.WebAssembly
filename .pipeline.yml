@@ -5,7 +5,7 @@ jobs:
     NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
     VersionCodeOffset: 400559 # last value for the APK release
     EMSDK_VERSION: 2.0.6
-    DOTNETRUNTIME_COMMIT: 0eb6c4eba8b391db117a22bf60d9eaec9695fa97
+    DOTNETRUNTIME_COMMIT: cd714d6fdd83f6ed53f3113bdeb3765c1bbc5955
     LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
 
   container: 
