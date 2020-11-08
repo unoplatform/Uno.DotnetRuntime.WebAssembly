@@ -117,9 +117,6 @@ jobs:
       cd runtime
       ./build.sh -arch wasm -os Browser -c $(BUILD_CONFIGURATION)
 
-      # Workaround for https://github.com/dotnet/runtime/issues/44033
-      cp ./artifacts/bin/ref/net6.0/System.Net.Quic.dll ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/lib/net6.0
-
       # Mark AOT generation binaries executable
       chmod +x ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/native/cross/*
 
