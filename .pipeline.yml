@@ -5,7 +5,7 @@ jobs:
     NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
     VersionCodeOffset: 400559 # last value for the APK release
     EMSDK_VERSION: 2.0.6
-    DOTNETRUNTIME_COMMIT: cd714d6fdd83f6ed53f3113bdeb3765c1bbc5955
+    DOTNETRUNTIME_COMMIT: 38c9b98eb12a7cb976c77e89a070fa2803abc9df
     LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
 
   container: 
@@ -70,10 +70,6 @@ jobs:
       git reset --hard $(DOTNETRUNTIME_COMMIT)
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
       git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
-      git apply $(Build.SourcesDirectory)/patches/enable-wasm-llvm.patch
-      git apply $(Build.SourcesDirectory)/patches/pr43785-0001.patch
-      git apply $(Build.SourcesDirectory)/patches/pr43785-0002.patch
-      git apply $(Build.SourcesDirectory)/patches/pr43785-0003.patch
       git config --global user.email "ci@platform.uno"
       git config --global user.name "Uno Platform CI"
       git add .
