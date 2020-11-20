@@ -116,6 +116,11 @@ jobs:
       # Mark AOT generation binaries executable
       chmod +x ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/native/cross/*
 
+      # Move src and include files to locations compatible with mono's packager
+      cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/native
+      mv include/wasm/* .
+      mv src/* .
+
     displayName: Build Wasm Runtime
 
   - bash: |
