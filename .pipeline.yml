@@ -6,7 +6,7 @@ jobs:
     VersionCodeOffset: 400559 # last value for the APK release
     EMSDK_VERSION: 2.0.6
     DOTNETRUNTIME_COMMIT: 38c9b98eb12a7cb976c77e89a070fa2803abc9df
-    LINKER_COMMIT: 57974c1f5790e6fb33f5fce161707be5cd86c4d3
+    LINKER_COMMIT: 93caeb4b18a229c686d8760d4a5710b4f323055d
 
   container: 
     image: unoplatform/mono-wasm-build:1.0
