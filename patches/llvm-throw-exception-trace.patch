@@ -1,0 +1,42 @@
+From 8cc3d6cf7d6eade1d19e1b715dbed7d83e739f0e Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Wed, 25 Nov 2020 03:31:29 +0000
+Subject: [PATCH 2/2] [AOT] Log on LLVM throw exception
+
+---
+ src/mono/mono/mini/llvm-runtime.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/mono/mono/mini/llvm-runtime.cpp b/src/mono/mono/mini/llvm-runtime.cpp
+index 9982cccfb0f..1b4ec1dc453 100644
+--- a/src/mono/mono/mini/llvm-runtime.cpp
++++ b/src/mono/mono/mini/llvm-runtime.cpp
+@@ -1,6 +1,10 @@
+ #include <config.h>
+ #include "llvm-runtime.h"
+ 
++#ifdef HOST_WASM
++#include <emscripten.h>
++#endif
++
+ #include <glib.h>
+ 
+ extern "C" {
+@@ -10,6 +14,14 @@ mono_llvm_cpp_throw_exception (void)
+ {
+ 	gint32 *ex = NULL;
+ 
++#ifdef HOST_WASM
++	EM_ASM(
++		var err = new Error();
++		console.log ("Native Stacktrace (mono_llvm_cpp_throw_exception): \n");
++		console.log (err.stack);
++	);
++#endif
++
+ 	/* The generated code catches an int32* */
+ 	throw ex;
+ }
+-- 
+2.17.1
+
