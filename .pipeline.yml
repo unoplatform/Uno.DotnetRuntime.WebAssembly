@@ -5,7 +5,7 @@ jobs:
     NUGET_PACKAGES: $(build.sourcesdirectory)/.nuget
     VersionCodeOffset: 400559 # last value for the APK release
     EMSDK_VERSION: 2.0.9
-    DOTNETRUNTIME_COMMIT: c6e5ef17d1e35800d7090872859cb408fe0f6e61
+    DOTNETRUNTIME_COMMIT: eb25a59de3ea4fa1c24544e876554be96afa5280
     LINKER_COMMIT: 93caeb4b18a229c686d8760d4a5710b4f323055d
 
   container: 
@@ -71,7 +71,6 @@ jobs:
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
       git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
       git apply $(Build.SourcesDirectory)/patches/enable-js-exception-trace.patch
-      git apply $(Build.SourcesDirectory)/patches/preserve-unmanagedcallersonlyattribute.patch
       git config --global user.email "ci@platform.uno"
       git config --global user.name "Uno Platform CI"
       git add .
