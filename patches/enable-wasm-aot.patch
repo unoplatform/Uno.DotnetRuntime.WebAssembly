@@ -20,14 +20,6 @@ index 7726c9b21b2..2279acb2aca 100644
      </PropertyGroup>
      <ItemGroup Condition="'$(TargetsBrowser)' == 'true'">
        <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,qcalls$(_MonoMinimal)"/>
-@@ -192,6 +192,7 @@
-       <_MonoCMakeArgs Include="-DDISABLE_CRASH_REPORTING=1"/>
-       <_MonoCMakeArgs Include="-DENABLE_ICALL_EXPORT=1"/>
-       <_MonoCMakeArgs Include="-DENABLE_LAZY_GC_THREAD_CREATION=1"/>
-+      <_MonoCMakeArgs Include="-DENABLE_LLVM_RUNTIME=1"/>
-       <_MonoCFLAGS Include="-I$(PkgMicrosoft_NETCore_Runtime_ICU_Transport)/runtimes/browser-wasm/native/include"/>
-     </ItemGroup>
-     <!-- iOS/tvOS specific options -->
 -- 
 2.17.1
 
