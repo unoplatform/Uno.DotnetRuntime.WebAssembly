@@ -73,6 +73,7 @@ jobs:
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
       git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
       git apply $(Build.SourcesDirectory)/patches/enable-js-exception-trace.patch
+      git apply $(Build.SourcesDirectory)/patches/enable-idbfs.patch
       git config --global user.email "ci@platform.uno"
       git config --global user.name "Uno Platform CI"
       git add .

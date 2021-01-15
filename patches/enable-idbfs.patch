@@ -1,0 +1,25 @@
+From f645ca4585175aa9d0144d5c7846a96fd5a7bc2e Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Thu, 14 Jan 2021 22:05:31 -0500
+Subject: [PATCH] enable IDFBS support
+
+---
+ src/mono/wasm/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
+index 4f955afe57f..037b54be8e6 100644
+--- a/src/mono/wasm/Makefile
++++ b/src/mono/wasm/Makefile
+@@ -61,7 +61,7 @@ MONO_LIBS = \
+ 	$(ICU_LIBDIR)/libicuuc.a \
+ 	$(ICU_LIBDIR)/libicui18n.a
+ 
+-EMCC_FLAGS=--profiling-funcs -s ALLOW_MEMORY_GROWTH=1 -s NO_EXIT_RUNTIME=1 -s USE_ZLIB=1  -s FORCE_FILESYSTEM=1 -s "EXTRA_EXPORTED_RUNTIME_METHODS=['ccall', 'FS_createPath', 'FS_createDataFile', 'cwrap', 'setValue', 'getValue', 'UTF8ToString', 'UTF8ArrayToString', 'addFunction']" -s "EXPORTED_FUNCTIONS=['_putchar']" --source-map-base http://example.com  -emit-llvm
++EMCC_FLAGS=--profiling-funcs -s ALLOW_MEMORY_GROWTH=1 -s NO_EXIT_RUNTIME=1 -s USE_ZLIB=1 -lidbfs.js -s FORCE_FILESYSTEM=1 -s "EXTRA_EXPORTED_RUNTIME_METHODS=['ccall', 'FS_createPath', 'FS_createDataFile', 'cwrap', 'setValue', 'getValue', 'UTF8ToString', 'UTF8ArrayToString', 'addFunction']" -s "EXPORTED_FUNCTIONS=['_putchar']" --source-map-base http://example.com  -emit-llvm
+ ifneq ($(ENABLE_ES6),false)
+     EMCC_FLAGS+=-s MODULARIZE=1 -s EXPORT_ES6=1
+ endif
+-- 
+2.21.0.windows.1
+
