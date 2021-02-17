@@ -15,11 +15,10 @@ index 7726c9b21b2..2279acb2aca 100644
      </ItemGroup>
      <!-- WASM specific options -->
      <PropertyGroup Condition="'$(TargetsBrowser)' == 'true'">
--      <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,assert_messages</_MonoMinimal>
-+      <_MonoMinimal Condition="'$(Configuration)' == 'Release'"></_MonoMinimal>
+-      <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,debugger_agent,assert_messages</_MonoMinimal>
++      <_MonoMinimal Condition="'$(Configuration)' == 'Release'">,debugger_agent</_MonoMinimal>
      </PropertyGroup>
      <ItemGroup Condition="'$(TargetsBrowser)' == 'true'">
-       <_MonoCMakeArgs Include="-DENABLE_MINIMAL=ssa,com,jit,reflection_emit_save,portability,assembly_remapping,attach,verifier,appdomains,shadowcopy,security,sgen_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,logging,remoting,shared_perfcounters,sgen_debug_helpers,sgen_binary_protocol,soft_debug,interpreter,cleanup,mdb,gac,threads,eventpipe,qcalls$(_MonoMinimal)"/>
+       <_MonoCMakeArgs Include="-DENABLE_MINIMAL=jit,portability,sgen_major_marksweep_conc,sgen_split_nursery,sgen_gc_bridge,sgen_toggleref,sgen_debug_helpers,sgen_binary_protocol,logging,shared_perfcounters,interpreter,threads,eventpipe,qcalls$(_MonoMinimal)"/>
 -- 
 2.17.1
-
