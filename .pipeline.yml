@@ -40,6 +40,19 @@ jobs:
 
   - bash: |
       set -e
+      sudo apt-get update
+      sudo apt-get install -y python3-pip locales p7zip-full zip
+      sudo apt-get install -y unzip python python3.7 msbuild libc6 ninja-build
+      sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
+        libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
+        libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+        libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+      sudo locale-gen en_US.UTF-8
+
+    displayName: Install dotnet/runtime dependencies
+
+  - bash: |
+      set -e
       CURRENT_COMMIT=`git rev-parse --short HEAD`
       echo "##vso[task.setvariable variable=CURRENT_COMMIT]$CURRENT_COMMIT"
       echo "CurrentCommit=$CURRENT_COMMIT"
@@ -71,10 +84,8 @@ jobs:
       cd runtime
       git reset --hard $(DOTNETRUNTIME_COMMIT)
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
-      git apply $(Build.SourcesDirectory)/patches/enable-wasm-aot.patch
       git apply $(Build.SourcesDirectory)/patches/enable-js-exception-trace.patch
       git apply $(Build.SourcesDirectory)/patches/enable-idbfs.patch
-      git apply $(Build.SourcesDirectory)/patches/bug48391.patch
       git config --global user.email "ci@platform.uno"
       git config --global user.name "Uno Platform CI"
       git add .
@@ -82,19 +93,6 @@ jobs:
       echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
 
     displayName: Apply Patches
-
-  - bash: |
-      set -e
-      sudo apt-get update
-      sudo apt-get install -y python3-pip locales p7zip-full zip
-      sudo apt-get install -y unzip python python3.7 msbuild libc6 ninja-build
-      sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
-        libtool build-essential python curl git lldb-6.0 liblldb-6.0-dev \
-        libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
-        libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
-      sudo locale-gen en_US.UTF-8
-
-    displayName: Install dotnet/runtime dependencies
 
   - bash: |
       set -e
@@ -115,6 +113,7 @@ jobs:
   - bash: |
       set -e
       export EMSDK_PATH=~/emsdk
+      export MonoEnableAssertMessages=true # enable emsdk assert messages
       cd runtime
       ./build.sh -arch wasm -os Browser -c $(BUILD_CONFIGURATION)
 
