@@ -11,7 +11,7 @@ jobs:
     LINKER_COMMIT: 6b3a3050c70577bd1b3fd7611eef56679e22a4f1
 
   container: 
-    image: unoplatform/mono-wasm-build:1.0
+    image: unoplatform/wasm-build:2.3
     options: "--name ci-container -v /usr/bin/docker:/tmp/docker:ro"
 
   timeoutInMinutes: 240
