@@ -124,6 +124,7 @@ jobs:
       cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)/runtimes/browser-wasm/native
       mv include/wasm/* .
       mv src/* .
+      mv System.Private.CoreLib.* ../lib/net6.0
 
     displayName: Build Wasm Runtime
 
