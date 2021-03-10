@@ -83,7 +83,11 @@ jobs:
       set -e
       cd runtime
       git reset --hard $(DOTNETRUNTIME_COMMIT)
+
       echo dotnet/runtime base SHA1: `git rev-parse HEAD`
+      BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
+      echo "##vso[task.setvariable variable=BASE_DOTNET_SHORT_COMMIT]$BASE_DOTNET_SHORT_COMMIT"
+
       git apply $(Build.SourcesDirectory)/patches/enable-js-exception-trace.patch
       git apply $(Build.SourcesDirectory)/patches/enable-idbfs.patch
       git config --global user.email "ci@platform.uno"
@@ -147,7 +151,7 @@ jobs:
       rootFolderOrFile: 'runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$(BUILD_CONFIGURATION)'
       includeRootFolder: false
       archiveType: 'zip'
-      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(CURRENT_COMMIT)-$(Build.BuildId)-$(BUILD_CONFIGURATION).zip'
+      archiveFile: '$(Build.ArtifactStagingDirectory)/dotnet-runtime-wasm-$(CURRENT_COMMIT)-$(BASE_DOTNET_SHORT_COMMIT)-$(Build.BuildId)-$(BUILD_CONFIGURATION).zip'
 
   - task: PublishBuildArtifacts@1
     inputs:
