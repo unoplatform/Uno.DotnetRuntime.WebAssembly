@@ -90,6 +90,7 @@ jobs:
 
       git apply $(Build.SourcesDirectory)/patches/enable-js-exception-trace.patch
       git apply $(Build.SourcesDirectory)/patches/enable-idbfs.patch
+      git apply $(Build.SourcesDirectory)/patches/pr50217.patch
       git config --global user.email "ci@platform.uno"
       git config --global user.name "Uno Platform CI"
       git add .
