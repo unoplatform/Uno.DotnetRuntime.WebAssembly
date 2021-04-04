@@ -126,7 +126,7 @@ jobs:
     - name: Build Wasm Runtime
       run: |
         set -e
-        export EMSDK_PATH=~/emsdk
+        export EMSDK_PATH=$HOME/emsdk
         export MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
         ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
@@ -154,9 +154,10 @@ jobs:
 
     - name: Zip Archive
       run: |
-        mkdir -p ci-artifacts
+        ARTIFACTS_FOLDER=`pwd`/ci-artifacts
+        mkdir -p $ARTIFACTS_FOLDER
         cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r ci-artifacts/dotnet-runtime-wasm-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
