@@ -19,6 +19,7 @@ jobs:
   build_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
+    container: 'unoplatform/wasm-build:2.3'
             
     env:
       EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
@@ -34,10 +35,6 @@ jobs:
          - BUILD_CONFIGURATION: Debug
 
     steps:
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
-          
     - name: Setup .NET Core SDK
       uses: actions/setup-dotnet@v1.7.2
       with:
@@ -54,7 +51,19 @@ jobs:
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
-
+        
+    - name: Update to Git 2.18 or later
+      run: |
+        set -e       
+        sudo apt install -y software-properties-common
+        sudo add-apt-repository ppa:git-core/ppa
+        sudo apt update;
+        sudo apt install -y git
+        
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+        
     - name: Set Variable from current Commit
       run: |
         set -e
@@ -90,9 +99,9 @@ jobs:
         BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
         echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $GITHUB_ENV
 
-        git apply ${{ github.workspace }}/patches/enable-js-exception-trace.patch
-        git apply ${{ github.workspace }}/patches/enable-idbfs.patch
-        git apply ${{ github.workspace }}/patches/pr50217.patch
+        git apply ../patches/enable-js-exception-trace.patch
+        git apply ../patches/enable-idbfs.patch
+        git apply ../patches/pr50217.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -117,7 +126,7 @@ jobs:
     - name: Build Wasm Runtime
       run: |
         set -e
-        export EMSDK_PATH=~/emsdk
+        export EMSDK_PATH=$HOME/emsdk
         export MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
         ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
@@ -145,15 +154,16 @@ jobs:
 
     - name: Zip Archive
       run: |
-        mkdir -p ${{ github.workspace }}/ci-artifacts
+        ARTIFACTS_FOLDER=`pwd`/ci-artifacts
+        mkdir -p $ARTIFACTS_FOLDER
         cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r ${{ github.workspace }}/ci-artifacts/dotnet-runtime-wasm-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
         name: wasm
-        path: ${{ github.workspace }}/ci-artifacts
+        path: ci-artifacts
         
   ##
   ## Release Job
