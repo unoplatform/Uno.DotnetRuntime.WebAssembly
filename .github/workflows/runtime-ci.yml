@@ -24,10 +24,10 @@ jobs:
             
     env:
       EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-      DOTNETRUNTIME_COMMIT: af5eae3c87db470b6e1352ed637869ec5b7e110a
+      DOTNETRUNTIME_COMMIT: 99e4fdac44bc6a094087b2f8590b6acd83774bc2
 
       # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
-      LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
+      LINKER_COMMIT: 6b3a3050c70577bd1b3fd7611eef56679e22a4f1
 
     strategy:
       matrix:
@@ -102,7 +102,6 @@ jobs:
 
         git apply ../patches/enable-js-exception-trace.patch
         git apply ../patches/enable-idbfs.patch
-        git apply ../patches/pr50217.patch
         git apply ../patches/dbg-proxy-net5.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
@@ -152,9 +151,10 @@ jobs:
       run: |
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
         mkdir -p $DEBUGGER_OUT/net5
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0 $DEBUGGER_OUT/net5
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
         mkdir -p $DEBUGGER_OUT/net6.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net6.0 $DEBUGGER_OUT/net6.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net6.0
+        rm -fr $DEBUGGER_OUT/net6.0/net5.0 # remove additional required for standard net6.0 packaging
 
     - name: Zip Archive
       run: |

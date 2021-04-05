@@ -44,4 +44,3 @@ index b26c6334224..114557e3fc0 100644
  		MONO_PROFILER_RAISE (exception_throw, (obj));
 -- 
 2.17.1
-
