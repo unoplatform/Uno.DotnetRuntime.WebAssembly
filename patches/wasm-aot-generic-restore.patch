@@ -1,0 +1,61 @@
+From be70895b081efdd29397912d8397f4e5643ecf2c Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Wed, 7 Apr 2021 13:51:39 +0000
+Subject: [PATCH] fix: Restore WASM AOT for shared generics
+
+---
+ src/mono/mono/mini/aot-compiler.c | 22 +++++++++++-----------
+ src/mono/mono/mini/aot-runtime.c  |  4 ++--
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/src/mono/mono/mini/aot-compiler.c b/src/mono/mono/mini/aot-compiler.c
+index 3ca94121b6c..a4fbe16c951 100644
+--- a/src/mono/mono/mini/aot-compiler.c
++++ b/src/mono/mono/mini/aot-compiler.c
+@@ -5353,17 +5353,17 @@ add_generic_class_with_depth (MonoAotCompile *acfg, MonoClass *klass, int depth,
+ 		(!strcmp (m_class_get_name (klass), "Dictionary`2") || !strcmp (m_class_get_name (klass), "List`1") || !strcmp (m_class_get_name (klass), "ReadOnlyCollection`1")))
+ 		use_gsharedvt = TRUE;
+ 
+-#ifdef TARGET_WASM
+-	/*
+-	 * Use gsharedvt for instances with vtype arguments.
+-	 * WASM only since other platforms depend on the
+-	 * previous behavior.
+-	 */
+-	if ((acfg->jit_opts & MONO_OPT_GSHAREDVT) && mono_class_is_ginst (klass) && mono_class_get_generic_class (klass)->context.class_inst && is_vt_inst_no_enum (mono_class_get_generic_class (klass)->context.class_inst)) {
+-		use_gsharedvt = TRUE;
+-		use_gsharedvt_for_array = TRUE;
+-	}
+-#endif
++// #ifdef TARGET_WASM
++// 	/*
++// 	 * Use gsharedvt for instances with vtype arguments.
++// 	 * WASM only since other platforms depend on the
++// 	 * previous behavior.
++// 	 */
++// 	if ((acfg->jit_opts & MONO_OPT_GSHAREDVT) && mono_class_is_ginst (klass) && mono_class_get_generic_class (klass)->context.class_inst && is_vt_inst_no_enum (mono_class_get_generic_class (klass)->context.class_inst)) {
++// 		use_gsharedvt = TRUE;
++// 		use_gsharedvt_for_array = TRUE;
++// 	}
++// #endif
+ 
+ 	iter = NULL;
+ 	while ((method = mono_class_get_methods (klass, &iter))) {
+diff --git a/src/mono/mono/mini/aot-runtime.c b/src/mono/mono/mini/aot-runtime.c
+index 2152352d767..d174af62f0a 100644
+--- a/src/mono/mono/mini/aot-runtime.c
++++ b/src/mono/mono/mini/aot-runtime.c
+@@ -4346,8 +4346,8 @@ mono_aot_can_dedup (MonoMethod *method)
+ 		!mini_is_gsharedvt_signature (mono_method_signature_internal (method)) &&
+ 		!mini_is_gsharedvt_klass (method->klass)) {
+ 		MonoGenericContext *context = mono_method_get_context (method);
+-		if (context->method_inst && mini_is_gsharedvt_inst (context->method_inst))
+-			return FALSE;
++		// if (context->method_inst && mini_is_gsharedvt_inst (context->method_inst))
++		// 	return FALSE;
+ 		/* No point in dedup-ing private instances */
+ 		if ((context->class_inst && inst_is_private (context->class_inst)) ||
+ 			(context->method_inst && inst_is_private (context->method_inst)))
+-- 
+2.17.1
+
