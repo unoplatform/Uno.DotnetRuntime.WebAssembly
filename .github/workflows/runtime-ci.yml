@@ -17,6 +17,142 @@ jobs:
   ##
   ## Build Job
   ##
+  build_windows_job:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: windows-latest
+            
+    env:
+      EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+      DOTNETRUNTIME_COMMIT: 5b683e2076f35e74d550ffa4a3182ebd6726b3c8
+
+      # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
+      LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
+
+    strategy:
+      matrix:
+       include:
+         - BUILD_CONFIGURATION: Release
+         # - BUILD_CONFIGURATION: Debug # Not yet supported
+
+    steps:
+    - name: Setup .NET Core SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version: 5.0.103
+
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+        
+    - name: Set Variable from current Commit
+      run: |
+        Invoke-Expression "git rev-parse --short HEAD"  | Out-String -NoNewLine -OutVariable CURRENT_COMMIT
+        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $env:GITHUB_ENV
+        echo "CurrentCommit=$CURRENT_COMMIT"
+        echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
+
+    - name: Clone mono/linker
+      run: |
+        git clone --recursive https://github.com/mono/linker
+        cd linker
+        git reset --hard $env:LINKER_COMMIT
+
+    - name: Build mono/linker
+      run: |
+        cd linker
+        dotnet msbuild /r /bl /p:Configuration=Release illink.sln
+
+    - name: Clone dotnet/runtime
+      run: |
+        git clone --recursive https://github.com/dotnet/runtime
+
+    - name: Apply Patches
+      run: |
+        cd runtime
+        git reset --hard $env:DOTNETRUNTIME_COMMIT
+
+        Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable BASE_DOTNET_SHORT_COMMIT
+
+        echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
+        echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
+
+        git apply ../patches/enable-js-exception-trace.patch
+        git apply ../patches/enable-idbfs.patch
+        git apply ../patches/pr50217.patch
+        git apply ../patches/dbg-proxy-net5.patch
+        git apply ../patches/wasm-aot-generic-restore.patch
+        git config --global user.email "ci@platform.uno"
+        git config --global user.name "Uno Platform CI"
+        git add .
+        git commit -m "apply patches"
+
+        Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable PATCHED_DOTNET_SHORT_COMMIT
+        echo dotnet/runtime patched SHA1: $PATCHED_DOTNET_SHORT_COMMIT
+
+    - name: 'Setup Emscripten'
+      run: |
+        git clone --branch $env:EMSDK_VERSION https://github.com/emscripten-core/emsdk
+        cd emsdk
+        .\emsdk install $env:EMSDK_VERSION
+        .\emsdk activate $env:EMSDK_VERSION
+
+    - name: 'Setup Ninja'
+      run: |
+        choco install ninja
+
+    - name: Build Wasm Runtime
+      run: |
+        $env:MonoEnableAssertMessages=true # enable emsdk assert messages
+        cd runtime
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl
+
+        # Move src and include files to locations compatible with mono's packager
+        cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
+        move include\wasm\* .
+        move src\* .
+        move System.Private.CoreLib.* ..\lib\net6.0
+
+    - name: Copy mono/linker files
+      run: |
+        $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
+        mkdir -p $LINKER_OUT
+        cp -r linker\artifacts\bin\Mono.Linker\Release\net5.0\* $LINKER_OUT
+
+    - name: Copy Wasm Debugger files
+      run: |
+        $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
+        mkdir -p $DEBUGGER_OUT\net5
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net5.0\* $DEBUGGER_OUT\net5
+        mkdir -p $DEBUGGER_OUT\net6.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net6.0
+        Remove-Item "$DEBUGGER_OUT\net6.0\net5.0" -Recurse # remove additional required for standard net6.0 packaging
+
+    - name: Copy ninja
+      run: |
+        Invoke-WebRequest https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip -OutFile ninja-win.zip 
+        Expand-Archive -LiteralPath 'ninja-win.zip' -DestinationPath runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
+
+    - name: Zip Archive
+      run: |
+        Invoke-Expression "Get-Location | select -ExpandProperty Path" | Out-String -NoNewLine -OutVariable Current_Path
+        $ARTIFACTS_FOLDER="$Current_Path\ci-artifacts"
+        mkdir -p $ARTIFACTS_FOLDER
+        cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
+        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -LiteralPath .
+
+    - name: Copy Logs
+      run: |
+        cp runtime\msbuild.binlog ci-artifacts
+
+    - uses: actions/upload-artifact@v2
+      if: ${{ always() }}
+      with:
+        name: wasm
+        path: ci-artifacts
+
+  ##
+  ## Build Job
+  ##
   build_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
@@ -162,7 +298,7 @@ jobs:
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
         cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
@@ -175,7 +311,7 @@ jobs:
   ##
   release_job:
     if: github.event_name == 'push'
-    needs: build_job
+    needs: [build_job,build_windows_job]
     runs-on: ubuntu-latest
     environment:
         name: Release
