@@ -1,47 +1,45 @@
-From 27fcb1ea433d0f0e2d436517d90e2a9f42e9c490 Mon Sep 17 00:00:00 2001
+From 138e125efa0b393f1077e7c2fbdb98bdd2cba8e6 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Mon, 23 Nov 2020 20:20:53 +0000
-Subject: [PATCH] [Wasm][AOT] Add the ability to the display the native stack
- frames
+Date: Fri, 9 Apr 2021 20:06:13 +0000
+Subject: [PATCH] add support for AOT exception tracing
 
 ---
- src/mono/mono/mini/mini-exceptions.c | 15 ++++++++++++++-
- 1 file changed, 14 insertions(+), 1 deletion(-)
+ src/mono/mono/mini/llvm-runtime.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
 
-diff --git a/src/mono/mono/mini/mini-exceptions.c b/src/mono/mono/mini/mini-exceptions.c
-index b26c6334224..114557e3fc0 100644
---- a/src/mono/mono/mini/mini-exceptions.c
-+++ b/src/mono/mono/mini/mini-exceptions.c
-@@ -99,6 +99,10 @@
- #endif
- #include "mono/utils/mono-tls-inline.h"
+diff --git a/src/mono/mono/mini/llvm-runtime.cpp b/src/mono/mono/mini/llvm-runtime.cpp
+index 9982cccfb0f..e63b260be8f 100644
+--- a/src/mono/mono/mini/llvm-runtime.cpp
++++ b/src/mono/mono/mini/llvm-runtime.cpp
+@@ -1,15 +1,20 @@
+ #include <config.h>
++#include <stdio.h>
+ #include "llvm-runtime.h"
  
-+#ifdef HOST_WASM
-+#include <emscripten.h>
-+#endif
+ #include <glib.h>
+ 
+ extern "C" {
+ 
++G_EXTERN_C
++gboolean mono_trace_is_enabled (void);
 +
- /*
-  * Raw frame information is stored in MonoException.trace_ips as an IntPtr[].
-  * This structure represents one entry.
-@@ -2698,8 +2702,17 @@ mono_handle_exception_internal (MonoContext *ctx, MonoObject *obj, gboolean resu
- 			}
- 			g_print ("[%p:] EXCEPTION handling: %s.%s: %s\n", (void*)(gsize)mono_native_thread_id_get (), m_class_get_name_space (mono_object_class (obj)), m_class_get_name (mono_object_class (obj)), msg);
- 			g_free (msg);
--			if (mono_ex && mono_trace_eval_exception (mono_object_class (mono_ex)))
-+			if (mono_ex && mono_trace_eval_exception (mono_object_class (mono_ex))) {
- 				mono_print_thread_dump_from_ctx (ctx);
-+
-+#ifdef HOST_WASM
-+				EM_ASM(
-+					var err = new Error();
-+					console.log ("Native Stacktrace: \n");
-+					console.log (err.stack);
-+				);
-+#endif
-+			}
- 		}
- 		jit_tls->orig_ex_ctx_set = TRUE;
- 		MONO_PROFILER_RAISE (exception_throw, (obj));
+ void
+ mono_llvm_cpp_throw_exception (void)
+ {
+ 	gint32 *ex = NULL;
+-
++	if (mono_trace_is_enabled ())
++		fprintf (stderr, "Native Stacktrace (mono_llvm_cpp_throw_exception)\n"); 
+ 	/* The generated code catches an int32* */
+ 	throw ex;
+ }
+@@ -25,4 +30,4 @@ mono_llvm_cpp_catch_exception (MonoLLVMInvokeCallback cb, gpointer arg, gboolean
+ 	}
+ }
+ 
+-}
++}
+\ No newline at end of file
 -- 
 2.17.1
 
