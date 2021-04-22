@@ -11,22 +11,21 @@ on:
     branches:
       - master
       - release/**
+            
+env:
+  EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+  DOTNETRUNTIME_COMMIT: df6e9560a47b652fe0ab1782f9c5baf9f11ce22e
+
+  # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
+  LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
 
 jobs:
-
   ##
   ## Build Job
   ##
   build_windows_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: windows-latest
-            
-    env:
-      EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-      DOTNETRUNTIME_COMMIT: 32d1a256262b00e90da76a118cb8859258a8e210
-
-      # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
-      LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
 
     strategy:
       matrix:
@@ -157,13 +156,6 @@ jobs:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     container: 'unoplatform/wasm-build:2.3'
-            
-    env:
-      EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-      DOTNETRUNTIME_COMMIT: c377f4152351dfbe16099317f553b87d2ce24b6b
-
-      # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
-      LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
 
     strategy:
       matrix:
