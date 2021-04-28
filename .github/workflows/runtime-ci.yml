@@ -75,11 +75,8 @@ jobs:
         echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
         echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
 
-        git apply ../patches/enable-js-exception-trace.patch
-        git apply ../patches/enable-idbfs.patch
-        git apply ../patches/pr50217.patch
-        git apply ../patches/dbg-proxy-net5.patch
-        git apply ../patches/wasm-aot-generic-restore.patch
+        git apply ..\patches\enable-idbfs.patch
+        git apply ..\patches\dbg-proxy-net5.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -129,7 +126,7 @@ jobs:
     - name: Copy ninja
       run: |
         Invoke-WebRequest https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip -OutFile ninja-win.zip 
-        Expand-Archive -LiteralPath 'ninja-win.zip' -DestinationPath runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
+        Expand-Archive -LiteralPath 'ninja-win.zip' -DestinationPath runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools
 
     - name: Zip Archive
       run: |
@@ -137,7 +134,7 @@ jobs:
         $ARTIFACTS_FOLDER="$Current_Path\ci-artifacts"
         mkdir -p $ARTIFACTS_FOLDER
         cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
-        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -LiteralPath .
+        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -Path *
 
     - name: Copy Logs
       run: |
