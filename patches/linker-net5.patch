@@ -1,0 +1,26 @@
+﻿From 4a9669d6b62ea8c9b2a791a3550fd9e927a42929 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Tue, 11 May 2021 08:44:43 -0400
+Subject: [PATCH] net5.0 build
+
+---
+ test/Directory.Build.props | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/test/Directory.Build.props b/test/Directory.Build.props
+index a014e1ba..bf207a60 100644
+--- a/test/Directory.Build.props
++++ b/test/Directory.Build.props
+@@ -3,7 +3,7 @@
+ 
+   <PropertyGroup>
+     <RunAnalyzers>false</RunAnalyzers>
+-    <TargetFramework>net6.0</TargetFramework>
++    <TargetFramework>net5.0</TargetFramework>
+     <Nullable>disable</Nullable>
+   </PropertyGroup>
+ </Project>
+\ No newline at end of file
+-- 
+2.21.0.windows.1
+

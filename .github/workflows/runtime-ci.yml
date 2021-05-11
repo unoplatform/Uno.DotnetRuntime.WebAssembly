@@ -14,10 +14,10 @@ on:
             
 env:
   EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: df6e9560a47b652fe0ab1782f9c5baf9f11ce22e
+  DOTNETRUNTIME_COMMIT: 4e2e990229f27b4200249f08e6789f1fe3dbd54c
 
   # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
-  LINKER_COMMIT: 74fb9a962957b8ff2e5ea11030a506c7c86e17dd
+  LINKER_COMMIT: 8a2996c96f9bbcfdf151d57534e05d1f24614242
 
 jobs:
   ##
@@ -58,8 +58,8 @@ jobs:
 
     - name: Build mono/linker
       run: |
-        cd linker
-        dotnet msbuild /r /bl /p:Configuration=Release illink.sln
+        cd linker/src/linker
+        dotnet msbuild /r /bl /p:Configuration=Release
 
     - name: Clone dotnet/runtime
       run: |
@@ -101,6 +101,9 @@ jobs:
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
         .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl
+        
+        # Move cross compiler to appropriate location 
+        move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
 
         # Move src and include files to locations compatible with mono's packager
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -158,7 +161,7 @@ jobs:
       matrix:
        include:
          - BUILD_CONFIGURATION: Release
-         - BUILD_CONFIGURATION: Debug
+         # - BUILD_CONFIGURATION: Debug
 
     steps:
     - name: Setup .NET Core SDK
@@ -208,8 +211,8 @@ jobs:
     - name: Build mono/linker
       run: |
         set -e
-        cd linker
-        dotnet msbuild /r /bl /p:Configuration=Release illink.sln
+        cd linker/src/linker
+        dotnet msbuild /r /bl /p:Configuration=Release
 
     - name: Clone dotnet/runtime
       run: |
@@ -257,7 +260,10 @@ jobs:
         ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
 
         # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native/cross/*
+        chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
+
+        # Move cross compiler to appropriate location 
+        mv ./artifacts/bin/mono/Browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
 
         # Move src and include files to locations compatible with mono's packager
         cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
