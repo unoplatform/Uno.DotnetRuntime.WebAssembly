@@ -158,7 +158,7 @@ jobs:
       matrix:
        include:
          - BUILD_CONFIGURATION: Release
-         - BUILD_CONFIGURATION: Debug
+         # - BUILD_CONFIGURATION: Debug
 
     steps:
     - name: Setup .NET Core SDK
