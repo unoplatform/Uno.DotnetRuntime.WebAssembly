@@ -1,0 +1,43 @@
+From 6c8fcfcbb21dbb60b80a0af4f34424d0b18fcb98 Mon Sep 17 00:00:00 2001
+From: Vlad Brezae <brezaevlad@gmail.com>
+Date: Fri, 28 May 2021 01:42:46 +0300
+Subject: [PATCH] [interp] Fix loading of ThreadStatic value types
+
+---
+ src/mono/mono/mini/interp/transform.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/src/mono/mono/mini/interp/transform.c b/src/mono/mono/mini/interp/transform.c
+index 6e1f8b8f31f40..52e7d118c0c74 100644
+--- a/src/mono/mono/mini/interp/transform.c
++++ b/src/mono/mono/mini/interp/transform.c
+@@ -4090,14 +4090,21 @@ interp_emit_sfld_access (TransformData *td, MonoClassField *field, MonoClass *fi
+ 
+ 		// Do a load/store to this address
+ 		if (is_load) {
+-			int opcode = (mt == MINT_TYPE_VT) ? MINT_LDOBJ_VT : interp_get_ldind_for_mt (mt);
+-			interp_add_ins (td, opcode);
+-			interp_ins_set_sreg (td->last_ins, td->sp [-1].local);
+-			td->sp--;
+-			push_simple_type (td, stack_type [mt]);
+-			interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
+-			if (mt == MINT_TYPE_VT)
+-				td->last_ins->data [0] = get_data_item_index (td, field_class);
++			if (mt == MINT_TYPE_VT) {
++				int field_size = mono_class_value_size (field_class, NULL);
++				interp_add_ins (td, MINT_LDOBJ_VT);
++				interp_ins_set_sreg (td->last_ins, td->sp [-1].local);
++				td->sp--;
++				push_type_vt (td, field_class, field_size);
++				interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
++				td->last_ins->data [0] = field_size;
++			} else {
++				interp_add_ins (td, interp_get_ldind_for_mt (mt));
++				interp_ins_set_sreg (td->last_ins, td->sp [-1].local);
++				td->sp--;
++				push_type (td, stack_type [mt], field_class);
++				interp_ins_set_dreg (td->last_ins, td->sp [-1].local);
++			}
+ 		} else {
+ 			int opcode = (mt == MINT_TYPE_VT) ? MINT_STOBJ_VT : interp_get_stind_for_mt (mt);
+ 			interp_add_ins (td, opcode);
