@@ -63,7 +63,7 @@ jobs:
 
     - name: Clone dotnet/runtime
       run: |
-        git clone --recursive https://github.com/dotnet/runtime
+        git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
     - name: Apply Patches
       run: |
