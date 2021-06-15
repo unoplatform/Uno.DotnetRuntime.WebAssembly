@@ -14,10 +14,10 @@ on:
             
 env:
   EMSDK_VERSION: 2.0.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: d07f9111c57fab97aa135bebb2687471a8bfc5bf
+  DOTNETRUNTIME_COMMIT: 337216a96c10cea1df62af25a49c74e378540cc4
 
   # Original location: https://github.com/dotnet/runtime/blob/af2950f9833371c5749b88c7ed62d5189f384bbc/eng/Version.Details.xml#L203
-  LINKER_COMMIT: 802aa459394baa2451ffacc02219ba54ef77ca44
+  LINKER_COMMIT: caeaf2a3fb3f636805fdd4881df4f9a539fff8f6
 
 jobs:
   ##
@@ -77,7 +77,6 @@ jobs:
 
         git apply ..\patches\enable-idbfs.patch
         git apply ..\patches\dbg-proxy-net5.patch
-        git apply ..\patches\53391.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -231,7 +230,6 @@ jobs:
 
         git apply ../patches/enable-idbfs.patch
         git apply ../patches/dbg-proxy-net5.patch
-        git apply ../patches/53391.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
