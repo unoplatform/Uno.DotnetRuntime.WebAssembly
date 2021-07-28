@@ -1,0 +1,32 @@
+From 00a05ad14ad1773eeb386e91a13f9e7e60f81062 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Wed, 28 Jul 2021 17:45:15 +0000
+Subject: [PATCH] restore AOT for methods containing exception clauses
+
+---
+ src/mono/mono/mini/method-to-ir.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/mono/mono/mini/method-to-ir.c b/src/mono/mono/mini/method-to-ir.c
+index b28e16d6a52..79392693015 100644
+--- a/src/mono/mono/mini/method-to-ir.c
++++ b/src/mono/mono/mini/method-to-ir.c
+@@ -6473,6 +6473,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 	}
+ 
+ 	if (cfg->llvm_only && cfg->interp && cfg->method == method) {
++#if 0 // Disable force caluses-containing methods to use the interpreter (https://github.com/dotnet/runtime/issues/50783)
+ 		if (!cfg->method->wrapper_type && header->num_clauses) {
+ 			for (int i = 0; i < header->num_clauses; ++i) {
+ 				MonoExceptionClause *clause = &header->clauses [i];
+@@ -6481,6 +6482,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 					cfg->interp_entry_only = TRUE;
+ 			}
+ 		}
++#endif
+ 		if (cfg->interp_entry_only)
+ 			emit_llvmonly_interp_entry (cfg, header);
+ 	}
+-- 
+2.17.1
+
