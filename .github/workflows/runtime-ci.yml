@@ -75,9 +75,9 @@ jobs:
         echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
         echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
 
-        git apply ..\patches\enable-idbfs.patch
-        git apply ..\patches\dbg-proxy-net5.patch
-        git apply ..\patches\bug56309.patch
+        # git apply ..\patches\enable-idbfs.patch
+        # git apply ..\patches\dbg-proxy-net5.patch
+        # git apply ..\patches\bug56309.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -229,10 +229,10 @@ jobs:
         BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
         echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $GITHUB_ENV
 
-        git apply ../patches/enable-idbfs.patch
-        git apply ../patches/dbg-proxy-net5.patch
-        git apply ../patches/bug56309.patch
-        git config --global user.email "ci@platform.uno"
+        # git apply ../patches/enable-idbfs.patch
+        # git apply ../patches/dbg-proxy-net5.patch
+        # git apply ../patches/bug56309.patch
+        # git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
         git commit -m "apply patches"
