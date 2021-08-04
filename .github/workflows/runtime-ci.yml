@@ -78,10 +78,10 @@ jobs:
         # git apply ..\patches\enable-idbfs.patch
         # git apply ..\patches\dbg-proxy-net5.patch
         # git apply ..\patches\bug56309.patch
-        git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
+        # git config --global user.email "ci@platform.uno"
+        # git config --global user.name "Uno Platform CI"
+        # git add .
+        # git commit -m "apply patches"
 
         Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable PATCHED_DOTNET_SHORT_COMMIT
         echo dotnet/runtime patched SHA1: $PATCHED_DOTNET_SHORT_COMMIT
@@ -233,9 +233,9 @@ jobs:
         # git apply ../patches/dbg-proxy-net5.patch
         # git apply ../patches/bug56309.patch
         # git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
+        # git config --global user.name "Uno Platform CI"
+        # git add .
+        # git commit -m "apply patches"
         echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
 
     - name: Install cmake 3.16 
