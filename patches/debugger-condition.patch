@@ -1,0 +1,29 @@
+From ac4379413e6a642a0a2e6003d3a1e63fc7d61aeb Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Thu, 5 Aug 2021 01:53:00 +0000
+Subject: [PATCH] fix: Ensure debugger is disabled
+
+---
+ src/mono/mono/component/mini-wasm-debugger.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/mono/mono/component/mini-wasm-debugger.c b/src/mono/mono/component/mini-wasm-debugger.c
+index 5dd9d8ce1d4..3a21e3c3fbc 100644
+--- a/src/mono/mono/component/mini-wasm-debugger.c
++++ b/src/mono/mono/component/mini-wasm-debugger.c
+@@ -144,8 +144,10 @@ static void
+ mono_wasm_enable_debugging_internal (int debug_level)
+ {
+ 	log_level = debug_level;
+-	PRINT_DEBUG_MSG (1, "DEBUGGING ENABLED\n");
+-	debugger_enabled = TRUE;
++	if(debug_level) {
++		PRINT_DEBUG_MSG (1, "DEBUGGING ENABLED\n");
++		debugger_enabled = TRUE;
++	}
+ }
+ 
+ static void
+-- 
+2.17.1
+
