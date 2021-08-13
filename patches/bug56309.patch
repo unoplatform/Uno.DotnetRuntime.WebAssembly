@@ -1,32 +1,36 @@
-From 00a05ad14ad1773eeb386e91a13f9e7e60f81062 Mon Sep 17 00:00:00 2001
+From bfd0fe22b51b5146c1a29a53548d20101ed9a5c4 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Wed, 28 Jul 2021 17:45:15 +0000
+Date: Wed, 11 Aug 2021 14:11:23 +0000
 Subject: [PATCH] restore AOT for methods containing exception clauses
 
 ---
- src/mono/mono/mini/method-to-ir.c | 2 ++
- 1 file changed, 2 insertions(+)
+ src/mono/mono/mini/method-to-ir.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
 
 diff --git a/src/mono/mono/mini/method-to-ir.c b/src/mono/mono/mini/method-to-ir.c
-index b28e16d6a52..79392693015 100644
+index 5b607e55636..1e643440c0d 100644
 --- a/src/mono/mono/mini/method-to-ir.c
 +++ b/src/mono/mono/mini/method-to-ir.c
-@@ -6473,6 +6473,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+@@ -6473,13 +6473,13 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
  	}
  
  	if (cfg->llvm_only && cfg->interp && cfg->method == method) {
-+#if 0 // Disable force caluses-containing methods to use the interpreter (https://github.com/dotnet/runtime/issues/50783)
- 		if (!cfg->method->wrapper_type && header->num_clauses) {
- 			for (int i = 0; i < header->num_clauses; ++i) {
- 				MonoExceptionClause *clause = &header->clauses [i];
-@@ -6481,6 +6482,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
- 					cfg->interp_entry_only = TRUE;
- 			}
+-		if (!cfg->method->wrapper_type && header->num_clauses) {
+-			for (int i = 0; i < header->num_clauses; ++i) {
+-				MonoExceptionClause *clause = &header->clauses [i];
+-				/* Finally clauses are checked after the remove_finally pass */
+-				if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY)
+-					cfg->interp_entry_only = TRUE;
+-			}
++		// Disable force caluses-containing methods to use the interpreter (https://github.com/dotnet/runtime/issues/50783)
++		// The change rolls back to https://github.com/dotnet/runtime/pull/52883/files#diff-7b30038b10c5aa1f90ae73ccfa79f19ea86ec1f3101cb3bab7cf80e4d7513a44
++		// where all clauses are AOTed, except the filtered ones.
++		for (int i = 0; i < header->num_clauses; ++i) {
++			MonoExceptionClause *clause = &header->clauses [i];
++			if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY && clause->flags != MONO_EXCEPTION_CLAUSE_FAULT && clause->flags != MONO_EXCEPTION_CLAUSE_NONE)
++				cfg->interp_entry_only = TRUE;
  		}
-+#endif
  		if (cfg->interp_entry_only)
  			emit_llvmonly_interp_entry (cfg, header);
- 	}
 -- 
 2.17.1
-
