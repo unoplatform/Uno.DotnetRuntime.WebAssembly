@@ -14,10 +14,10 @@ on:
             
 env:
   EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 6696065ab0f517f5a9e5f55c559df0010a816dbe
+  DOTNETRUNTIME_COMMIT: c8a658ccadf808490b206d31d02c957f549d53a2
 
-  # Original location: https://github.com/dotnet/runtime/blob/96a4671bc52e70024da409f5f48b0abaa30cb901/eng/Version.Details.xml#L179
-  LINKER_COMMIT: 6eae01980dc694107bdee0bc723d75a0dd601f0e
+  # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
+  LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
 
 jobs:
   ##
@@ -78,7 +78,6 @@ jobs:
         git apply ..\patches\enable-idbfs.patch
         git apply ..\patches\dbg-proxy-net5.patch
         git apply ..\patches\bug56309.patch
-        git apply ..\patches\debugger-condition.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -233,7 +232,6 @@ jobs:
         git apply ../patches/enable-idbfs.patch
         git apply ../patches/dbg-proxy-net5.patch
         git apply ../patches/bug56309.patch
-        git apply ../patches/debugger-condition.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
