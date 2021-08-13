@@ -1,4 +1,4 @@
-﻿From 6338be5ce4e0acc1a281ed4297f4ddd256bce183 Mon Sep 17 00:00:00 2001
+From 6338be5ce4e0acc1a281ed4297f4ddd256bce183 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Mon, 5 Apr 2021 00:44:39 +0000
 Subject: [PATCH] feat: Restore net5.0 for debugger build
@@ -16,6 +16,7 @@ index 66d0b287f76..4d1b30539b4 100644
  <Project Sdk="Microsoft.NET.Sdk.Web">
  
    <PropertyGroup>
+     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
 -    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
 +    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
