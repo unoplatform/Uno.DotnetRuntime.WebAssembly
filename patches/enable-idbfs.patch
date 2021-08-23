@@ -1,24 +1,24 @@
-From a52deff1d674d96b9d560f63f7b09a263234b19f Mon Sep 17 00:00:00 2001
+From 335027d83d99e6e27e09199794a56d068cd2f0fe Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Sun, 6 Jun 2021 17:42:56 +0000
-Subject: [PATCH] idbfs
+Date: Mon, 23 Aug 2021 20:01:39 +0000
+Subject: [PATCH] support for IDBFS
 
 ---
- src/mono/wasm/Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ src/mono/wasm/wasm.proj | 1 +
+ 1 file changed, 1 insertion(+)
 
-diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
-index 9f6d0555111..226c6398866 100644
---- a/src/mono/wasm/Makefile
-+++ b/src/mono/wasm/Makefile
-@@ -93,7 +93,7 @@ $(BUILDS_OBJ_DIR):
- 	mkdir -p $$@
- 
- $(NATIVE_BIN_DIR)/dotnet.js: $(BUILDS_OBJ_DIR)/driver.o $(BUILDS_OBJ_DIR)/pinvoke.o $(BUILDS_OBJ_DIR)/corebindings.o runtime/library_mono.js runtime/binding_support.js runtime/dotnet_support.js $(SYSTEM_NATIVE_LIBDIR)/pal_random.js $(2) $(EMCC_DEFAULT_RSP) | $(NATIVE_BIN_DIR)
--	$(EMCC) @$(EMCC_DEFAULT_RSP) $(1) --js-library runtime/library_mono.js --js-library runtime/binding_support.js --js-library runtime/dotnet_support.js --js-library $(SYSTEM_NATIVE_LIBDIR)/pal_random.js $(BUILDS_OBJ_DIR)/driver.o $(BUILDS_OBJ_DIR)/pinvoke.o $(BUILDS_OBJ_DIR)/corebindings.o $(2) -o $(NATIVE_BIN_DIR)/dotnet.js $(3)
-+	$(EMCC) @$(EMCC_DEFAULT_RSP) $(1) -lidbfs.js --js-library runtime/library_mono.js --js-library runtime/binding_support.js --js-library runtime/dotnet_support.js --js-library $(SYSTEM_NATIVE_LIBDIR)/pal_random.js $(BUILDS_OBJ_DIR)/driver.o $(BUILDS_OBJ_DIR)/pinvoke.o $(BUILDS_OBJ_DIR)/corebindings.o $(2) -o $(NATIVE_BIN_DIR)/dotnet.js $(3)
- 
- $(BUILDS_OBJ_DIR)/pinvoke-table.h: $(PINVOKE_TABLE) | $(BUILDS_OBJ_DIR)
- 	if cmp -s $(PINVOKE_TABLE) $$@ ; then : ; else cp $(PINVOKE_TABLE) $$@ ; fi
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 3eacc3e1307..ce3691ae6a2 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -66,6 +66,7 @@
+       <_EmccCommonFlags Include="-s ALLOW_MEMORY_GROWTH=1" />
+       <_EmccCommonFlags Include="-s NO_EXIT_RUNTIME=1" />
+       <_EmccCommonFlags Include="-s FORCE_FILESYSTEM=1" />
++      <_EmccCommonFlags Include="-lidbfs.js" />
+       <_EmccCommonFlags Include="-s &quot;EXPORTED_RUNTIME_METHODS=['ccall', 'FS_createPath', 'FS_createDataFile', 'cwrap', 'setValue', 'getValue', 'UTF8ToString', 'UTF8ArrayToString', 'addFunction']&quot;" />
+       <_EmccCommonFlags Include="-s &quot;EXPORTED_FUNCTIONS=['_putchar']&quot;" />
+       <_EmccCommonFlags Include="--source-map-base http://example.com" />
 -- 
 2.17.1
+
