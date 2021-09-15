@@ -1,22 +1,21 @@
-From 6338be5ce4e0acc1a281ed4297f4ddd256bce183 Mon Sep 17 00:00:00 2001
+From bc8031a2641d7ab364699a7d2f637f5f3ecdebf0 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Mon, 5 Apr 2021 00:44:39 +0000
-Subject: [PATCH] feat: Restore net5.0 for debugger build
+Date: Wed, 15 Sep 2021 16:31:33 +0000
+Subject: [PATCH] fix: Build net5.0 browser debugger host
 
 ---
- .../wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj     | 3 ++-
- .../wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj   | 3 ++-
- 2 files changed, 4 insertions(+), 2 deletions(-)
+ .../wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 3 ++-
+ .../wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 +++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index 66d0b287f76..4d1b30539b4 100644
+index 66d0b287f76..2284653c8c2 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 @@ -1,9 +1,10 @@
  <Project Sdk="Microsoft.NET.Sdk.Web">
  
    <PropertyGroup>
-     <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
 -    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
 +    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
@@ -26,10 +25,10 @@ index 66d0b287f76..4d1b30539b4 100644
  
    <ItemGroup>
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index 169856bc091..2964e433b2c 100644
+index 169856bc091..311a88b899b 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -1,9 +1,10 @@
+@@ -1,9 +1,11 @@
  ﻿<Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
  
    <PropertyGroup>
@@ -38,6 +37,7 @@ index 169856bc091..2964e433b2c 100644
      <NoWarn>$(NoWarn),CA2007</NoWarn>
      <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 +    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net5.0'">true</AppendTargetFrameworkToOutputPath>
++    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
    </PropertyGroup>
  
    <ItemGroup>
