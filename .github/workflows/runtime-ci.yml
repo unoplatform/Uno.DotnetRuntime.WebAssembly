@@ -109,7 +109,7 @@ jobs:
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
         move src\* .
-        move System.Private.CoreLib.* ..\lib\net6.0
+        move System.Private.CoreLib.* ..\lib\net7.0
 
     - name: Copy mono/linker files
       run: |
@@ -122,9 +122,9 @@ jobs:
         $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
         mkdir -p $DEBUGGER_OUT\net5
         cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net5.0\* $DEBUGGER_OUT\net5
-        mkdir -p $DEBUGGER_OUT\net6.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net6.0
-        Remove-Item "$DEBUGGER_OUT\net6.0\net5.0" -Recurse # remove additional required for standard net6.0 packaging
+        mkdir -p $DEBUGGER_OUT\net7.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net7.0
+        Remove-Item "$DEBUGGER_OUT\net7.0\net5.0" -Recurse # remove additional required for standard net7.0 packaging
 
     - name: Copy ninja
       run: |
@@ -269,7 +269,7 @@ jobs:
         cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
         mv include/wasm/* .
         mv src/* .
-        mv System.Private.CoreLib.* ../lib/net6.0
+        mv System.Private.CoreLib.* ../lib/net7.0
 
     - name: Copy mono/linker files
       run: |
@@ -282,9 +282,9 @@ jobs:
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
         mkdir -p $DEBUGGER_OUT/net5
         cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
-        mkdir -p $DEBUGGER_OUT/net6.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net6.0
-        rm -fr $DEBUGGER_OUT/net6.0/net5.0 # remove additional required for standard net6.0 packaging
+        mkdir -p $DEBUGGER_OUT/net7.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net7.0
+        rm -fr $DEBUGGER_OUT/net7.0/net5.0 # remove additional required for standard net7.0 packaging
 
     - name: Zip Archive
       run: |
