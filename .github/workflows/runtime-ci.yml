@@ -75,12 +75,12 @@ jobs:
         echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
         echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
 
-        git apply ..\patches\enable-idbfs.patch
-        git apply ..\patches\dbg-proxy-net5.patch
-        git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
+        # git apply ..\patches\enable-idbfs.patch
+        # git apply ..\patches\dbg-proxy-net5.patch
+        # git config --global user.email "ci@platform.uno"
+        # git config --global user.name "Uno Platform CI"
+        # git add .
+        # git commit -m "apply patches"
 
         Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable PATCHED_DOTNET_SHORT_COMMIT
         echo dotnet/runtime patched SHA1: $PATCHED_DOTNET_SHORT_COMMIT
@@ -149,155 +149,155 @@ jobs:
         name: wasm
         path: ci-artifacts
 
-  ##
-  ## Build Job
-  ##
-  build_job:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
-    runs-on: ubuntu-latest
-    container: 'unoplatform/wasm-build:2.3'
-
-    strategy:
-      matrix:
-       include:
-         - BUILD_CONFIGURATION: Release
-         # - BUILD_CONFIGURATION: Debug
-
-    steps:
-    - name: Setup .NET Core SDK
-      uses: actions/setup-dotnet@v1.7.2
-      with:
-        dotnet-version: 5.0.103
-    
-    - name: Install dependencies
-      run: |
-        set -e
-        sudo apt-get update
-        sudo apt-get install -y python3-pip locales p7zip-full zip
-        sudo apt-get install -y unzip zip python python3.7 msbuild libc6 ninja-build
-        sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
-          libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
-          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
-          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
-        sudo locale-gen en_US.UTF-8
-        
-    - name: Update to Git 2.18 or later
-      run: |
-        set -e       
-        sudo apt install -y software-properties-common
-        sudo add-apt-repository ppa:git-core/ppa
-        sudo apt update;
-        sudo apt install -y git
-        
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
-        
-    - name: Set Variable from current Commit
-      run: |
-        set -e
-        CURRENT_COMMIT=`git rev-parse --short HEAD`
-        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $GITHUB_ENV
-        echo "CurrentCommit=$CURRENT_COMMIT"
-        echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
-
-    - name: Clone mono/linker
-      run: |
-        set -e
-        git clone --recursive https://github.com/mono/linker
-        cd linker
-        git reset --hard $LINKER_COMMIT
-
-    - name: Build mono/linker
-      run: |
-        set -e
-        cd linker/src/linker
-        dotnet msbuild /r /bl /p:Configuration=Release
-
-    - name: Clone dotnet/runtime
-      run: |
-        git clone --recursive https://github.com/dotnet/runtime
-
-    - name: Apply Patches
-      run: |
-        set -e
-        cd runtime
-        git reset --hard $DOTNETRUNTIME_COMMIT
-
-        echo dotnet/runtime base SHA1: `git rev-parse HEAD`
-        BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
-        echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $GITHUB_ENV
-
-        git apply ../patches/enable-idbfs.patch
-        git apply ../patches/dbg-proxy-net5.patch
-        git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
-        echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
-
-    - name: Install cmake 3.16 
-      run: |
-        set -e
-        wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
-        sudo tar --strip-components=1 -xz -C /usr/local
-
-    - name: 'Setup Emscripten'
-      run: |
-        set -e
-        cd ~
-        git clone --branch $EMSDK_VERSION https://github.com/emscripten-core/emsdk
-        cd emsdk
-        ./emsdk install $EMSDK_VERSION
-        ./emsdk activate $EMSDK_VERSION
-
-    - name: Build Wasm Runtime
-      run: |
-        set -e
-        export EMSDK_PATH=$HOME/emsdk
-        export MonoEnableAssertMessages=true # enable emsdk assert messages
-        cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
-
-        # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
-
-        # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/Browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-
-        # Move src and include files to locations compatible with mono's packager
-        cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-        mv include/wasm/* .
-        mv src/* .
-        mv System.Private.CoreLib.* ../lib/net6.0
-
-    - name: Copy mono/linker files
-      run: |
-        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
-        mkdir -p $LINKER_OUT
-        cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
-
-    - name: Copy Wasm Debugger files
-      run: |
-        DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
-        mkdir -p $DEBUGGER_OUT/net5
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
-        mkdir -p $DEBUGGER_OUT/net6.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net6.0
-        rm -fr $DEBUGGER_OUT/net6.0/net5.0 # remove additional required for standard net6.0 packaging
-
-    - name: Zip Archive
-      run: |
-        ARTIFACTS_FOLDER=`pwd`/ci-artifacts
-        mkdir -p $ARTIFACTS_FOLDER
-        cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
-
-    - uses: actions/upload-artifact@v2
-      if: ${{ always() }}
-      with:
-        name: wasm
-        path: ci-artifacts
+#  ##
+#  ## Build Job
+#  ##
+#  build_job:
+#    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+#    runs-on: ubuntu-latest
+#    container: 'unoplatform/wasm-build:2.3'
+#
+#    strategy:
+#      matrix:
+#       include:
+#         - BUILD_CONFIGURATION: Release
+#         # - BUILD_CONFIGURATION: Debug
+#
+#    steps:
+#    - name: Setup .NET Core SDK
+#      uses: actions/setup-dotnet@v1.7.2
+#      with:
+#        dotnet-version: 5.0.103
+#    
+#    - name: Install dependencies
+#      run: |
+#        set -e
+#        sudo apt-get update
+#        sudo apt-get install -y python3-pip locales p7zip-full zip
+#        sudo apt-get install -y unzip zip python python3.7 msbuild libc6 ninja-build
+#        sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
+#          libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
+#          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+#          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+#        sudo locale-gen en_US.UTF-8
+#        
+#    - name: Update to Git 2.18 or later
+#      run: |
+#        set -e       
+#        sudo apt install -y software-properties-common
+#        sudo add-apt-repository ppa:git-core/ppa
+#        sudo apt update;
+#        sudo apt install -y git
+#        
+#    - uses: actions/checkout@v2
+#      with:
+#        submodules: true
+#        
+#    - name: Set Variable from current Commit
+#      run: |
+#        set -e
+#        CURRENT_COMMIT=`git rev-parse --short HEAD`
+#        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $GITHUB_ENV
+#        echo "CurrentCommit=$CURRENT_COMMIT"
+#        echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
+#
+#    - name: Clone mono/linker
+#      run: |
+#        set -e
+#        git clone --recursive https://github.com/mono/linker
+#        cd linker
+#        git reset --hard $LINKER_COMMIT
+#
+#    - name: Build mono/linker
+#      run: |
+#        set -e
+#        cd linker/src/linker
+#        dotnet msbuild /r /bl /p:Configuration=Release
+#
+#    - name: Clone dotnet/runtime
+#      run: |
+#        git clone --recursive https://github.com/dotnet/runtime
+#
+#    - name: Apply Patches
+#      run: |
+#        set -e
+#        cd runtime
+#        git reset --hard $DOTNETRUNTIME_COMMIT
+#
+#        echo dotnet/runtime base SHA1: `git rev-parse HEAD`
+#        BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
+#        echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $GITHUB_ENV
+#
+#        git apply ../patches/enable-idbfs.patch
+#        git apply ../patches/dbg-proxy-net5.patch
+#        git config --global user.email "ci@platform.uno"
+#        git config --global user.name "Uno Platform CI"
+#        git add .
+#        git commit -m "apply patches"
+#        echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
+#
+#    - name: Install cmake 3.16 
+#      run: |
+#        set -e
+#        wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
+#        sudo tar --strip-components=1 -xz -C /usr/local
+#
+#    - name: 'Setup Emscripten'
+#      run: |
+#        set -e
+#        cd ~
+#        git clone --branch $EMSDK_VERSION https://github.com/emscripten-core/emsdk
+#        cd emsdk
+#        ./emsdk install $EMSDK_VERSION
+#        ./emsdk activate $EMSDK_VERSION
+#
+#    - name: Build Wasm Runtime
+#      run: |
+#        set -e
+#        export EMSDK_PATH=$HOME/emsdk
+#        export MonoEnableAssertMessages=true # enable emsdk assert messages
+#        cd runtime
+#        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
+#
+#        # Mark AOT generation binaries executable
+#        chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
+#
+#        # Move cross compiler to appropriate location
+#        mv ./artifacts/bin/mono/Browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
+#
+#        # Move src and include files to locations compatible with mono's packager
+#        cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
+#        mv include/wasm/* .
+#        mv src/* .
+#        mv System.Private.CoreLib.* ../lib/net6.0
+#
+#    - name: Copy mono/linker files
+#      run: |
+#        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
+#        mkdir -p $LINKER_OUT
+#        cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
+#
+#    - name: Copy Wasm Debugger files
+#      run: |
+#        DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
+#        mkdir -p $DEBUGGER_OUT/net5
+#        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
+#        mkdir -p $DEBUGGER_OUT/net6.0
+#        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net6.0
+#        rm -fr $DEBUGGER_OUT/net6.0/net5.0 # remove additional required for standard net6.0 packaging
+#
+#    - name: Zip Archive
+#      run: |
+#        ARTIFACTS_FOLDER=`pwd`/ci-artifacts
+#        mkdir -p $ARTIFACTS_FOLDER
+#        cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
+#        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
+#
+#    - uses: actions/upload-artifact@v2
+#      if: ${{ always() }}
+#      with:
+#        name: wasm
+#        path: ci-artifacts
         
   ##
   ## Release Job
