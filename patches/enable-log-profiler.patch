@@ -1,14 +1,15 @@
-From 3a14055dacc0a3f8c27c88bbbfb751104d9b395d Mon Sep 17 00:00:00 2001
+From c9b78117ef8c941580c4e54f6b564bc59dcf33d7 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 13 Jan 2022 18:48:27 +0000
+Date: Thu, 13 Jan 2022 19:55:55 +0000
 Subject: [PATCH] feat: Enable log profiler
 
 ---
  .../pkg/sfx/Microsoft.NETCore.App/Directory.Build.props     | 1 +
  src/mono/mono.proj                                          | 3 +++
  src/mono/mono/profiler/CMakeLists.txt                       | 6 ++++++
+ src/mono/mono/profiler/log.c                                | 2 +-
  src/mono/wasm/Makefile                                      | 1 +
- 4 files changed, 11 insertions(+)
+ 5 files changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 index 15d09343b05..d0736230c21 100644
@@ -53,6 +54,19 @@ index 784ceb0203d..902a5761371 100644
    add_library(mono-profiler-aot-static STATIC aot.c helper.c)
    set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
    install(TARGETS mono-profiler-aot-static LIBRARY)
+diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
+index efe7bbfb56d..a5d7eaf40bc 100644
+--- a/src/mono/mono/profiler/log.c
++++ b/src/mono/mono/profiler/log.c
+@@ -4128,7 +4128,7 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
+ 		}
+ 	}
+ 	if (*nf == '|') {
+-#if HAVE_API_SUPPORT_WIN32_PIPE_OPEN_CLOSE && !defined (HOST_WIN32)
++#if HAVE_API_SUPPORT_WIN32_PIPE_OPEN_CLOSE && !defined (HOST_WIN32) && !defined (HOST_WASM)
+ 		log_profiler.file = popen (nf + 1, "w");
+ 		log_profiler.pipe_output = 1;
+ #else
 diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
 index 52e5de9e302..c91a0f9095d 100644
 --- a/src/mono/wasm/Makefile
