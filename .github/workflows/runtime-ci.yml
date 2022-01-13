@@ -299,29 +299,29 @@ jobs:
 #        name: wasm
 #        path: ci-artifacts
         
-  ##
-  ## Release Job
-  ##
-  release_job:
-    if: github.event_name == 'push'
-    needs: [build_job,build_windows_job]
-    runs-on: ubuntu-latest
-    environment:
-        name: Release
-
-    steps:
-    - name: Download package
-      uses: actions/download-artifact@v2
-      with:
-          name: wasm
-
-    - uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_STORAGE_CREDENTIALS }}
-
-    - name: Upload to blob storage
-      uses: azure/CLI@v1
-      with:
-        inlineScript: |
-            az storage blob upload-batch --account-name unowasmbootstrap -d 'runtime' -s .
+#  ##
+#  ## Release Job
+#  ##
+#  release_job:
+#    if: github.event_name == 'push'
+#    needs: [build_job,build_windows_job]
+#    runs-on: ubuntu-latest
+#    environment:
+#        name: Release
+#
+#    steps:
+#    - name: Download package
+#      uses: actions/download-artifact@v2
+#      with:
+#          name: wasm
+#
+#    - uses: azure/login@v1
+#      with:
+#        creds: ${{ secrets.AZURE_STORAGE_CREDENTIALS }}
+#
+#    - name: Upload to blob storage
+#      uses: azure/CLI@v1
+#      with:
+#        inlineScript: |
+#            az storage blob upload-batch --account-name unowasmbootstrap -d 'runtime' -s .
 
