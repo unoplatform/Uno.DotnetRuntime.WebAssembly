@@ -1,0 +1,70 @@
+From 3a14055dacc0a3f8c27c88bbbfb751104d9b395d Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Thu, 13 Jan 2022 18:48:27 +0000
+Subject: [PATCH] feat: Enable log profiler
+
+---
+ .../pkg/sfx/Microsoft.NETCore.App/Directory.Build.props     | 1 +
+ src/mono/mono.proj                                          | 3 +++
+ src/mono/mono/profiler/CMakeLists.txt                       | 6 ++++++
+ src/mono/wasm/Makefile                                      | 1 +
+ 4 files changed, 11 insertions(+)
+
+diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
+index 15d09343b05..d0736230c21 100644
+--- a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
++++ b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
+@@ -207,6 +207,7 @@
+     <PlatformManifestFileEntry Include="libmono-icall-table.a" IsNative="true" />
+     <PlatformManifestFileEntry Include="libmono-ilgen.a" IsNative="true" />
+     <PlatformManifestFileEntry Include="libmono-profiler-aot.a" IsNative="true" />
++    <PlatformManifestFileEntry Include="libmono-profiler-log.a" IsNative="true" />
+     <PlatformManifestFileEntry Include="System.Private.Runtime.InteropServices.Javascript.dll" />
+     <PlatformManifestFileEntry Include="dotnet.js" IsNative="true" />
+     <PlatformManifestFileEntry Include="dotnet.wasm" IsNative="true" />
+diff --git a/src/mono/mono.proj b/src/mono/mono.proj
+index 9b4d254d425..3be480c37da 100644
+--- a/src/mono/mono.proj
++++ b/src/mono/mono.proj
+@@ -838,6 +838,9 @@
+       <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-aot.a">
+         <Destination>$(RuntimeBinDir)libmono-profiler-aot.a</Destination>
+       </_MonoRuntimeArtifacts>
++      <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-log.a">
++        <Destination>$(RuntimeBinDir)libmono-profiler-log.a</Destination>
++      </_MonoRuntimeArtifacts>
+       <_MonoICorDebugArtifacts Condition="'$(MonoMsCorDbi)' == 'true'" Include="$(MonoObjDir)out\lib\$(LibPrefix)dbgshim$(SharedLibExt)">
+         <Destination>$(RuntimeBinDir)$(LibPrefix)dbgshim$(SharedLibExt)</Destination>
+       </_MonoICorDebugArtifacts>
+diff --git a/src/mono/mono/profiler/CMakeLists.txt b/src/mono/mono/profiler/CMakeLists.txt
+index 784ceb0203d..902a5761371 100644
+--- a/src/mono/mono/profiler/CMakeLists.txt
++++ b/src/mono/mono/profiler/CMakeLists.txt
+@@ -24,6 +24,12 @@ if(NOT DISABLE_LIBS)
+     install(TARGETS mono-profiler-log-static LIBRARY)
+   endif()
+ 
++  if(HOST_WASM)
++    add_library(mono-profiler-log-static STATIC helper.c log.c log-args.c)
++    set_target_properties(mono-profiler-log-static PROPERTIES OUTPUT_NAME mono-profiler-log)
++    install(TARGETS mono-profiler-log-static LIBRARY)
++  endif()
++
+   add_library(mono-profiler-aot-static STATIC aot.c helper.c)
+   set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
+   install(TARGETS mono-profiler-aot-static LIBRARY)
+diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
+index 52e5de9e302..c91a0f9095d 100644
+--- a/src/mono/wasm/Makefile
++++ b/src/mono/wasm/Makefile
+@@ -66,6 +66,7 @@ MONO_LIBS = \
+ 	$(MONO_BIN_DIR)/libmono-ilgen.a \
+ 	$(MONO_BIN_DIR)/libmono-icall-table.a \
+ 	$(MONO_BIN_DIR)/libmono-profiler-aot.a \
++	$(MONO_BIN_DIR)/libmono-profiler-log.a \
+ 	${NATIVE_BIN_DIR}/libSystem.Native.a \
+ 	${NATIVE_BIN_DIR}/libSystem.IO.Compression.Native.a \
+ 	$(ICU_LIBDIR)/libicuuc.a \
+-- 
+2.25.1
+
