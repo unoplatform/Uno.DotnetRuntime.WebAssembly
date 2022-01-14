@@ -1,15 +1,16 @@
-From c9b78117ef8c941580c4e54f6b564bc59dcf33d7 Mon Sep 17 00:00:00 2001
+From dd08e7b6721390e137f49a0427cbf135c2d03aae Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Thu, 13 Jan 2022 19:55:55 +0000
 Subject: [PATCH] feat: Enable log profiler
 
 ---
- .../pkg/sfx/Microsoft.NETCore.App/Directory.Build.props     | 1 +
- src/mono/mono.proj                                          | 3 +++
- src/mono/mono/profiler/CMakeLists.txt                       | 6 ++++++
- src/mono/mono/profiler/log.c                                | 2 +-
- src/mono/wasm/Makefile                                      | 1 +
- 5 files changed, 12 insertions(+), 1 deletion(-)
+ .../Directory.Build.props                      |  1 +
+ src/mono/mono.proj                             |  3 +++
+ src/mono/mono/mini/mini-wasm.c                 |  1 -
+ src/mono/mono/profiler/CMakeLists.txt          |  6 ++++++
+ src/mono/mono/profiler/log.c                   | 18 +++++++++++++++++-
+ src/mono/wasm/Makefile                         |  1 +
+ 6 files changed, 28 insertions(+), 2 deletions(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 index 15d09343b05..d0736230c21 100644
@@ -37,6 +38,18 @@ index 9b4d254d425..3be480c37da 100644
        <_MonoICorDebugArtifacts Condition="'$(MonoMsCorDbi)' == 'true'" Include="$(MonoObjDir)out\lib\$(LibPrefix)dbgshim$(SharedLibExt)">
          <Destination>$(RuntimeBinDir)$(LibPrefix)dbgshim$(SharedLibExt)</Destination>
        </_MonoICorDebugArtifacts>
+diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
+index 56d58e1c6a0..ab75c672395 100644
+--- a/src/mono/mono/mini/mini-wasm.c
++++ b/src/mono/mono/mini/mini-wasm.c
+@@ -501,7 +501,6 @@ mono_arch_context_get_int_reg_address (MonoContext *ctx, int reg)
+ void
+ mono_runtime_setup_stat_profiler (void)
+ {
+-	g_error ("mono_runtime_setup_stat_profiler");
+ }
+ 
+ gboolean
 diff --git a/src/mono/mono/profiler/CMakeLists.txt b/src/mono/mono/profiler/CMakeLists.txt
 index 784ceb0203d..902a5761371 100644
 --- a/src/mono/mono/profiler/CMakeLists.txt
@@ -55,10 +68,28 @@ index 784ceb0203d..902a5761371 100644
    set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
    install(TARGETS mono-profiler-aot-static LIBRARY)
 diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
-index efe7bbfb56d..a5d7eaf40bc 100644
+index efe7bbfb56d..6812e360d42 100644
 --- a/src/mono/mono/profiler/log.c
 +++ b/src/mono/mono/profiler/log.c
-@@ -4128,7 +4128,7 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
+@@ -4037,6 +4037,7 @@ runtime_initialized (MonoProfiler *profiler)
+ 
+ 	mono_os_sem_init (&log_profiler.attach_threads_sem, 0);
+ 
++#if !defined (HOST_WASM)
+ 	/*
+ 	 * We must start the helper thread before the writer thread. This is
+ 	 * because start_helper_thread () sets up the command port which is written
+@@ -4045,6 +4046,9 @@ runtime_initialized (MonoProfiler *profiler)
+ 	start_helper_thread ();
+ 	start_writer_thread ();
+ 	start_dumper_thread ();
++#else
++	dump_header ();
++#endif
+ 
+ 	/*
+ 	 * Wait for all the internal threads to be started. If we don't do this, we
+@@ -4128,7 +4132,7 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
  		}
  	}
  	if (*nf == '|') {
@@ -67,6 +98,25 @@ index efe7bbfb56d..a5d7eaf40bc 100644
  		log_profiler.file = popen (nf + 1, "w");
  		log_profiler.pipe_output = 1;
  #else
+@@ -4176,6 +4180,18 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
+ 	log_profiler.startup_time = current_time ();
+ }
+ 
++#if defined (HOST_WASM)
++MONO_API void
++mono_profiler_flush_log ();
++
++void
++mono_profiler_flush_log ()
++{
++	while (handle_writer_queue_entry ());	
++	while (handle_dumper_queue_entry ());
++}
++#endif
++
+ MONO_API void
+ mono_profiler_init_log (const char *desc);
+ 
 diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
 index 52e5de9e302..c91a0f9095d 100644
 --- a/src/mono/wasm/Makefile
