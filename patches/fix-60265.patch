@@ -1,0 +1,25 @@
+From d4998a7503bbecad89051affb588ce2d55fc393b Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Fri, 14 Jan 2022 13:28:11 +0000
+Subject: [PATCH 2/2] fix: [mono/win] Increase stack size (reserve) to 8MB
+ (dotnet/runtime#60265)
+
+---
+ src/mono/CMakeLists.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/mono/CMakeLists.txt b/src/mono/CMakeLists.txt
+index bd636b92e28..fb9e4866846 100644
+--- a/src/mono/CMakeLists.txt
++++ b/src/mono/CMakeLists.txt
+@@ -244,6 +244,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+   add_compile_options(/W3)   # set warning level 3
+   add_compile_options(/EHsc) # set exception handling behavior
+   add_compile_options(/FC)   # use full pathnames in diagnostics
++  add_link_options(/STACK:0x800000)  # set stack size to 8MB (default is 1MB)
+   if(CMAKE_BUILD_TYPE STREQUAL "Release")
+     add_compile_options(/Oi) # enable intrinsics
+     add_compile_options(/GF) # enable string pooling
+-- 
+2.25.1
+
