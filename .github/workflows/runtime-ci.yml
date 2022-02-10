@@ -14,7 +14,7 @@ on:
             
 env:
   EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: e47728f7855c530a5779487058de8c1de7c77046
+  DOTNETRUNTIME_COMMIT: e0287b742e51010371b1ab2069df466abbc3fa80
 
   # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
   LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
@@ -101,7 +101,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -139,10 +139,6 @@ jobs:
         mkdir -p $ARTIFACTS_FOLDER
         cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
         Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -Path *
-
-    - name: Copy Logs
-      run: |
-        cp runtime\msbuild.binlog ci-artifacts
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
