@@ -19,6 +19,8 @@ env:
   # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
   LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
 
+  ADDITIONAL_BUILD_ARGS: '-p:MonoEnableAssertMessages=true -p:WasmEnableES6=true'
+
 jobs:
   ##
   ## Build Job
@@ -101,7 +103,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -252,9 +254,8 @@ jobs:
       run: |
         set -e
         export EMSDK_PATH=$HOME/emsdk
-        export MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
+        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
