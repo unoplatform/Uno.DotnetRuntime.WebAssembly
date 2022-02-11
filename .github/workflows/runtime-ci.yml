@@ -19,7 +19,7 @@ env:
   # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
   LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
 
-  ADDITIONAL_BUILD_ARGS: '-p:MonoEnableAssertMessages=true -p:WasmEnableES6=true'
+  ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true'
 
 jobs:
   ##
