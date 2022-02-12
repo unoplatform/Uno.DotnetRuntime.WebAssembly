@@ -13,11 +13,13 @@ on:
       - release/**
             
 env:
-  EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: c8a658ccadf808490b206d31d02c957f549d53a2
+  EMSDK_VERSION: 2.0.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+  DOTNETRUNTIME_COMMIT: a1f0147eb6cefaeff012879dbaf637297736ed3f
 
   # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
   LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
+
+  ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true'
 
 jobs:
   ##
@@ -77,6 +79,7 @@ jobs:
 
         git apply ..\patches\enable-idbfs.patch
         git apply ..\patches\dbg-proxy-net5.patch
+        git apply ..\patches\fix-adjust-windows-build.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -100,7 +103,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION /p:CrossBuild=false /bl
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -109,7 +112,7 @@ jobs:
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
         move src\* .
-        move System.Private.CoreLib.* ..\lib\net6.0
+        move System.Private.CoreLib.* ..\lib\net7.0
 
     - name: Copy mono/linker files
       run: |
@@ -122,9 +125,9 @@ jobs:
         $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
         mkdir -p $DEBUGGER_OUT\net5
         cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net5.0\* $DEBUGGER_OUT\net5
-        mkdir -p $DEBUGGER_OUT\net6.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net6.0
-        Remove-Item "$DEBUGGER_OUT\net6.0\net5.0" -Recurse # remove additional required for standard net6.0 packaging
+        mkdir -p $DEBUGGER_OUT\net7.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net7.0
+        Remove-Item "$DEBUGGER_OUT\net7.0\net5.0" -Recurse # remove additional required for standard net7.0 packaging
 
     - name: Copy ninja
       run: |
@@ -139,10 +142,6 @@ jobs:
         cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
         Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -Path *
 
-    - name: Copy Logs
-      run: |
-        cp runtime\msbuild.binlog ci-artifacts
-
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
@@ -152,7 +151,7 @@ jobs:
   ##
   ## Build Job
   ##
-  build_job:
+  build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     container: 'unoplatform/wasm-build:2.3'
@@ -255,9 +254,8 @@ jobs:
       run: |
         set -e
         export EMSDK_PATH=$HOME/emsdk
-        export MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION
+        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
@@ -269,7 +267,7 @@ jobs:
         cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
         mv include/wasm/* .
         mv src/* .
-        mv System.Private.CoreLib.* ../lib/net6.0
+        mv System.Private.CoreLib.* ../lib/net7.0
 
     - name: Copy mono/linker files
       run: |
@@ -282,9 +280,9 @@ jobs:
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
         mkdir -p $DEBUGGER_OUT/net5
         cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
-        mkdir -p $DEBUGGER_OUT/net6.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net6.0
-        rm -fr $DEBUGGER_OUT/net6.0/net5.0 # remove additional required for standard net6.0 packaging
+        mkdir -p $DEBUGGER_OUT/net7.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net7.0
+        rm -fr $DEBUGGER_OUT/net7.0/net5.0 # remove additional required for standard net7.0 packaging
 
     - name: Zip Archive
       run: |
@@ -304,7 +302,7 @@ jobs:
   ##
   release_job:
     if: github.event_name == 'push'
-    needs: [build_job,build_windows_job]
+    needs: [build_linux_job,build_windows_job]
     runs-on: ubuntu-latest
     environment:
         name: Release
