@@ -13,7 +13,7 @@ on:
       - release/**
             
 env:
-  EMSDK_VERSION: 2.0.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+  EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
   DOTNETRUNTIME_COMMIT: a1f0147eb6cefaeff012879dbaf637297736ed3f
 
   # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
