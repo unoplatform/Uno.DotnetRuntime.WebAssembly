@@ -119,7 +119,7 @@ jobs:
       run: |
         $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
         mkdir -p $LINKER_OUT
-        cp -r linker\artifacts\bin\Mono.Linker\Release\net5.0\* $LINKER_OUT
+        cp -r linker\artifacts\bin\Mono.Linker\Release\net6.0\* $LINKER_OUT
 
     - name: Copy Wasm Debugger files
       run: |
@@ -274,7 +274,7 @@ jobs:
       run: |
         LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
         mkdir -p $LINKER_OUT
-        cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
+        cp -r linker/artifacts/bin/Mono.Linker/Release/net6.0/* $LINKER_OUT
 
     - name: Copy Wasm Debugger files
       run: |
