@@ -15,6 +15,7 @@ on:
 env:
   EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
   DOTNETRUNTIME_COMMIT: a1f0147eb6cefaeff012879dbaf637297736ed3f
+  DOTNETSDK_VERSION: 6.0.100
 
   # Original location: https://github.com/dotnet/runtime/blob/e4fb7303f7be173f5434d711d42b4bba706d0ad0/eng/Version.Details.xml#L237
   LINKER_COMMIT: 24b988c6b1ca785f15745fb66a1adcb076b4d5e3
@@ -36,10 +37,10 @@ jobs:
          # - BUILD_CONFIGURATION: Debug # Not yet supported
 
     steps:
-    - name: Setup .NET Core SDK
+    - name: Setup .NET Core SDK ${{ env.DOTNETSDK_VERSION }}
       uses: actions/setup-dotnet@v1.7.2
       with:
-        dotnet-version: 5.0.103
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
 
     - uses: actions/checkout@v2
       with:
@@ -163,10 +164,10 @@ jobs:
          # - BUILD_CONFIGURATION: Debug
 
     steps:
-    - name: Setup .NET Core SDK
+    - name: Setup .NET Core SDK  ${{ env.DOTNETSDK_VERSION }}
       uses: actions/setup-dotnet@v1.7.2
       with:
-        dotnet-version: 5.0.103
+        dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
     - name: Install dependencies
       run: |
