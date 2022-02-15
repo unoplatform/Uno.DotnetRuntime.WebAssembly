@@ -1,7 +1,7 @@
-From dd08e7b6721390e137f49a0427cbf135c2d03aae Mon Sep 17 00:00:00 2001
+From f929450d71f0ef62243c4228bc27e0e48756d5bf Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 13 Jan 2022 19:55:55 +0000
-Subject: [PATCH] feat: Enable log profiler
+Date: Tue, 15 Feb 2022 10:21:20 -0500
+Subject: [PATCH] feat: Add log profiler support
 
 ---
  .../Directory.Build.props                      |  1 +
@@ -9,40 +9,40 @@ Subject: [PATCH] feat: Enable log profiler
  src/mono/mono/mini/mini-wasm.c                 |  1 -
  src/mono/mono/profiler/CMakeLists.txt          |  6 ++++++
  src/mono/mono/profiler/log.c                   | 18 +++++++++++++++++-
- src/mono/wasm/Makefile                         |  1 +
- 6 files changed, 28 insertions(+), 2 deletions(-)
+ src/mono/wasm/Makefile                         |  2 +-
+ 6 files changed, 28 insertions(+), 3 deletions(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
-index 15d09343b05..d0736230c21 100644
+index e94c73bb923..930818cf0fb 100644
 --- a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 +++ b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
-@@ -207,6 +207,7 @@
+@@ -208,6 +208,7 @@
      <PlatformManifestFileEntry Include="libmono-icall-table.a" IsNative="true" />
      <PlatformManifestFileEntry Include="libmono-ilgen.a" IsNative="true" />
      <PlatformManifestFileEntry Include="libmono-profiler-aot.a" IsNative="true" />
 +    <PlatformManifestFileEntry Include="libmono-profiler-log.a" IsNative="true" />
      <PlatformManifestFileEntry Include="System.Private.Runtime.InteropServices.Javascript.dll" />
      <PlatformManifestFileEntry Include="dotnet.js" IsNative="true" />
-     <PlatformManifestFileEntry Include="dotnet.wasm" IsNative="true" />
+     <PlatformManifestFileEntry Include="dotnet.d.ts" IsNative="true" />
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
-index 9b4d254d425..3be480c37da 100644
+index ed1945437a6..7e9ee4ecd41 100644
 --- a/src/mono/mono.proj
 +++ b/src/mono/mono.proj
-@@ -838,6 +838,9 @@
+@@ -861,6 +861,9 @@
        <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-aot.a">
          <Destination>$(RuntimeBinDir)libmono-profiler-aot.a</Destination>
        </_MonoRuntimeArtifacts>
 +      <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-log.a">
 +        <Destination>$(RuntimeBinDir)libmono-profiler-log.a</Destination>
 +      </_MonoRuntimeArtifacts>
-       <_MonoICorDebugArtifacts Condition="'$(MonoMsCorDbi)' == 'true'" Include="$(MonoObjDir)out\lib\$(LibPrefix)dbgshim$(SharedLibExt)">
-         <Destination>$(RuntimeBinDir)$(LibPrefix)dbgshim$(SharedLibExt)</Destination>
+       <_MonoICorDebugArtifacts Condition="'$(MonoMsCorDbi)' == 'true'" Include="$(MonoObjDir)out\lib\$(LibPrefix)dbgshim$(LibSuffix)">
+         <Destination>$(RuntimeBinDir)$(LibPrefix)dbgshim$(LibSuffix)</Destination>
        </_MonoICorDebugArtifacts>
 diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
-index 56d58e1c6a0..ab75c672395 100644
+index 4d1af4eeb52..26781cea2b1 100644
 --- a/src/mono/mono/mini/mini-wasm.c
 +++ b/src/mono/mono/mini/mini-wasm.c
-@@ -501,7 +501,6 @@ mono_arch_context_get_int_reg_address (MonoContext *ctx, int reg)
+@@ -527,7 +527,6 @@ mono_init_native_crash_info (void)
  void
  mono_runtime_setup_stat_profiler (void)
  {
@@ -51,11 +51,11 @@ index 56d58e1c6a0..ab75c672395 100644
  
  gboolean
 diff --git a/src/mono/mono/profiler/CMakeLists.txt b/src/mono/mono/profiler/CMakeLists.txt
-index 784ceb0203d..902a5761371 100644
+index b8092fe8825..dcc2edee9a1 100644
 --- a/src/mono/mono/profiler/CMakeLists.txt
 +++ b/src/mono/mono/profiler/CMakeLists.txt
-@@ -24,6 +24,12 @@ if(NOT DISABLE_LIBS)
-     install(TARGETS mono-profiler-log-static LIBRARY)
+@@ -28,6 +28,12 @@ if(NOT DISABLE_LIBS)
+     endif()
    endif()
  
 +  if(HOST_WASM)
@@ -64,14 +64,14 @@ index 784ceb0203d..902a5761371 100644
 +    install(TARGETS mono-profiler-log-static LIBRARY)
 +  endif()
 +
-   add_library(mono-profiler-aot-static STATIC aot.c helper.c)
-   set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
-   install(TARGETS mono-profiler-aot-static LIBRARY)
+   if(NOT HOST_WASI)
+     add_library(mono-profiler-aot-static STATIC aot.c helper.c)
+     set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
 diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
-index efe7bbfb56d..6812e360d42 100644
+index 7d9636a5130..f2ac1b76595 100644
 --- a/src/mono/mono/profiler/log.c
 +++ b/src/mono/mono/profiler/log.c
-@@ -4037,6 +4037,7 @@ runtime_initialized (MonoProfiler *profiler)
+@@ -4041,6 +4041,7 @@ runtime_initialized (MonoProfiler *profiler)
  
  	mono_os_sem_init (&log_profiler.attach_threads_sem, 0);
  
@@ -79,7 +79,7 @@ index efe7bbfb56d..6812e360d42 100644
  	/*
  	 * We must start the helper thread before the writer thread. This is
  	 * because start_helper_thread () sets up the command port which is written
-@@ -4045,6 +4046,9 @@ runtime_initialized (MonoProfiler *profiler)
+@@ -4049,6 +4050,9 @@ runtime_initialized (MonoProfiler *profiler)
  	start_helper_thread ();
  	start_writer_thread ();
  	start_dumper_thread ();
@@ -89,7 +89,7 @@ index efe7bbfb56d..6812e360d42 100644
  
  	/*
  	 * Wait for all the internal threads to be started. If we don't do this, we
-@@ -4128,7 +4132,7 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
+@@ -4132,7 +4136,7 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
  		}
  	}
  	if (*nf == '|') {
@@ -98,7 +98,7 @@ index efe7bbfb56d..6812e360d42 100644
  		log_profiler.file = popen (nf + 1, "w");
  		log_profiler.pipe_output = 1;
  #else
-@@ -4176,6 +4180,18 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
+@@ -4180,6 +4184,18 @@ create_profiler (const char *args, const char *filename, GPtrArray *filters)
  	log_profiler.startup_time = current_time ();
  }
  
@@ -118,17 +118,17 @@ index efe7bbfb56d..6812e360d42 100644
  mono_profiler_init_log (const char *desc);
  
 diff --git a/src/mono/wasm/Makefile b/src/mono/wasm/Makefile
-index 52e5de9e302..c91a0f9095d 100644
+index 6dabb5c5d28..823783611d5 100644
 --- a/src/mono/wasm/Makefile
 +++ b/src/mono/wasm/Makefile
-@@ -66,6 +66,7 @@ MONO_LIBS = \
- 	$(MONO_BIN_DIR)/libmono-ilgen.a \
- 	$(MONO_BIN_DIR)/libmono-icall-table.a \
- 	$(MONO_BIN_DIR)/libmono-profiler-aot.a \
-+	$(MONO_BIN_DIR)/libmono-profiler-log.a \
- 	${NATIVE_BIN_DIR}/libSystem.Native.a \
- 	${NATIVE_BIN_DIR}/libSystem.IO.Compression.Native.a \
- 	$(ICU_LIBDIR)/libicuuc.a \
+@@ -89,7 +89,7 @@ run-tests-v8-%:
+ 	EMSDK_PATH=$(EMSDK_PATH) PATH="$(JSVU):$(PATH)" $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) /p:JSEngine=V8 $(MSBUILD_ARGS)
+ run-tests-sm-%:
+ 	EMSDK_PATH=$(EMSDK_PATH) PATH="$(JSVU):$(PATH)" $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) /p:JSEngine=SpiderMonkey $(MSBUILD_ARGS)
+-run-tests-jsc-%:
++run-tests-jsc-%:f
+ 	EMSDK_PATH=$(EMSDK_PATH) PATH="$(JSVU):$(PATH)" $(DOTNET) build $(TOP)/src/libraries/$*/tests/ /t:Test $(_MSBUILD_WASM_BUILD_ARGS) /p:JSEngine=JavaScriptCore $(MSBUILD_ARGS)
+ 
+ run-tests-%:
 -- 
-2.25.1
-
+2.21.0.windows.1
