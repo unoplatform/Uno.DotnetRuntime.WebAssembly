@@ -82,6 +82,7 @@ jobs:
         git apply ..\patches\dbg-proxy-net5.patch
         git apply ..\patches\fix-adjust-windows-build.patch
         git apply ..\patches\restore-jsinterop-invokejsunmarshalled.patch
+        git apply ..\patches\fix-export-lengthBytesUTF8.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -232,6 +233,7 @@ jobs:
         git apply ../patches/enable-idbfs.patch
         git apply ../patches/dbg-proxy-net5.patch
         git apply ../patches/restore-jsinterop-invokejsunmarshalled.patch
+        git apply ../patches/fix-export-lengthBytesUTF8.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
