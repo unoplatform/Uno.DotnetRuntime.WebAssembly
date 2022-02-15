@@ -1,0 +1,25 @@
+From 28c0e6d4b37efea093c1e879edda1ce2736d14cb Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Mon, 14 Feb 2022 20:36:17 -0500
+Subject: [PATCH] fix: Export lengthBytesUTF8
+
+---
+ src/mono/wasm/wasm.proj | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 1874d88e957..10f03afbc94 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -70,7 +70,7 @@
+       <_EmccLinkFlags Include="-s ALLOW_MEMORY_GROWTH=1" />
+       <_EmccLinkFlags Include="-s NO_EXIT_RUNTIME=1" />
+       <_EmccLinkFlags Include="-s FORCE_FILESYSTEM=1" />
+-      <_EmccLinkFlags Include="-s EXPORTED_RUNTIME_METHODS=&quot;['FS','print','ccall','cwrap','setValue','getValue','UTF8ToString','UTF8ArrayToString','FS_createPath','FS_createDataFile','removeRunDependency','addRunDependency']&quot;" />
++      <_EmccLinkFlags Include="-s EXPORTED_RUNTIME_METHODS=&quot;['FS','print','ccall','cwrap','setValue','getValue','UTF8ToString','UTF8ArrayToString','FS_createPath','FS_createDataFile','removeRunDependency','addRunDependency','lengthBytesUTF8','stringToUTF8','addFunction','removeFunction']&quot;" />
+       <!-- _htons,_ntohs,__get_daylight,__get_timezone,__get_tzname are exported temporarily, until the issue is fixed in emscripten, https://github.com/dotnet/runtime/issues/64724  -->
+       <_EmccLinkFlags Include="-s EXPORTED_FUNCTIONS=_free,_malloc,_htons,_ntohs,__get_daylight,__get_timezone,__get_tzname" />
+       <_EmccLinkFlags Include="--source-map-base http://example.com" />
+-- 
+2.21.0.windows.1
+

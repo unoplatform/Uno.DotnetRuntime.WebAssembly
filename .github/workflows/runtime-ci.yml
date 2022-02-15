@@ -15,9 +15,10 @@ on:
 env:
   EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
   DOTNETRUNTIME_COMMIT: a1f0147eb6cefaeff012879dbaf637297736ed3f
+  DOTNETSDK_VERSION: 6.0.100
 
-  # Original location: https://github.com/dotnet/runtime/blob/c8a658ccadf808490b206d31d02c957f549d53a2/eng/Version.Details.xml#L191
-  LINKER_COMMIT: e21bb44ca909d33c18acf3ed0b68f94a413351a5
+  # Original location: https://github.com/dotnet/runtime/blob/e4fb7303f7be173f5434d711d42b4bba706d0ad0/eng/Version.Details.xml#L237
+  LINKER_COMMIT: 24b988c6b1ca785f15745fb66a1adcb076b4d5e3
 
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true'
 
@@ -36,10 +37,10 @@ jobs:
          # - BUILD_CONFIGURATION: Debug # Not yet supported
 
     steps:
-    - name: Setup .NET Core SDK
+    - name: Setup .NET SDK
       uses: actions/setup-dotnet@v1.7.2
       with:
-        dotnet-version: 5.0.103
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
 
     - uses: actions/checkout@v2
       with:
@@ -80,6 +81,8 @@ jobs:
         git apply ..\patches\enable-idbfs.patch
         git apply ..\patches\dbg-proxy-net5.patch
         git apply ..\patches\fix-adjust-windows-build.patch
+        git apply ..\patches\restore-jsinterop-invokejsunmarshalled.patch
+        git apply ..\patches\fix-additional-emscripten-exports.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -118,7 +121,7 @@ jobs:
       run: |
         $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
         mkdir -p $LINKER_OUT
-        cp -r linker\artifacts\bin\Mono.Linker\Release\net5.0\* $LINKER_OUT
+        cp -r linker\artifacts\bin\Mono.Linker\Release\net6.0\* $LINKER_OUT
 
     - name: Copy Wasm Debugger files
       run: |
@@ -163,10 +166,10 @@ jobs:
          # - BUILD_CONFIGURATION: Debug
 
     steps:
-    - name: Setup .NET Core SDK
+    - name: Setup .NET SDK
       uses: actions/setup-dotnet@v1.7.2
       with:
-        dotnet-version: 5.0.103
+        dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
     - name: Install dependencies
       run: |
@@ -229,6 +232,8 @@ jobs:
 
         git apply ../patches/enable-idbfs.patch
         git apply ../patches/dbg-proxy-net5.patch
+        git apply ../patches/restore-jsinterop-invokejsunmarshalled.patch
+        git apply ../patches/fix-additional-emscripten-exports.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -273,7 +278,7 @@ jobs:
       run: |
         LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
         mkdir -p $LINKER_OUT
-        cp -r linker/artifacts/bin/Mono.Linker/Release/net5.0/* $LINKER_OUT
+        cp -r linker/artifacts/bin/Mono.Linker/Release/net6.0/* $LINKER_OUT
 
     - name: Copy Wasm Debugger files
       run: |

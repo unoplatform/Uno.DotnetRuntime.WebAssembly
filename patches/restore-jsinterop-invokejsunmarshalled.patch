@@ -1,0 +1,108 @@
+From dc75594b0023ad392e963ddb93b08ae46bb117d3 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Mon, 14 Feb 2022 14:25:09 -0500
+Subject: [PATCH] feat: Restore JSInterop InternalCalls::InvokeJSUnmarshalled
+
+---
+ src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js |  3 +++
+ src/mono/wasm/runtime/driver.c              |  6 ++++++
+ src/mono/wasm/runtime/exports.ts            |  5 +++++
+ src/mono/wasm/runtime/method-calls.ts       | 21 +++++++++++++++++++++
+ 4 files changed, 35 insertions(+)
+
+diff --git a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
+index 93edd268995..cf48f0196ef 100644
+--- a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
++++ b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
+@@ -42,6 +42,9 @@ const linked_functions = [
+     "mono_wasm_invoke_js_blazor",
+     "mono_wasm_trace_logger",
+ 
++    // Uno-platform specifc interop
++    "mono_wasm_invoke_js_unmarshalled",
++
+     // corebindings.c
+     "mono_wasm_invoke_js_with_args",
+     "mono_wasm_get_object_property",
+diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
+index a84d1d9b0ec..5fc448415d6 100644
+--- a/src/mono/wasm/runtime/driver.c
++++ b/src/mono/wasm/runtime/driver.c
+@@ -35,6 +35,9 @@ extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
+ // Blazor specific custom routines - see dotnet_support.js for backing code
+ extern void* mono_wasm_invoke_js_blazor (MonoString **exceptionMessage, void *callInfo, void* arg0, void* arg1, void* arg2);
+ 
++// Uno specific interop
++extern void* mono_wasm_invoke_js_unmarshalled (MonoString **exceptionMessage, MonoString *funcName, void* arg0, void* arg1, void* arg2);
++
+ void mono_wasm_enable_debugging (int);
+ 
+ int mono_wasm_marshal_type_from_mono_type (int mono_type, MonoClass *klass, MonoType *type);
+@@ -408,6 +411,9 @@ void mono_initialize_internals ()
+ 	// Blazor specific custom routines - see dotnet_support.js for backing code
+ 	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
+ 
++	// Uno Platform specific interop
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
++
+ #ifdef CORE_BINDINGS
+ 	core_initialize_internals();
+ #endif
+diff --git a/src/mono/wasm/runtime/exports.ts b/src/mono/wasm/runtime/exports.ts
+index 5dc4d847db6..5c4108736cd 100644
+--- a/src/mono/wasm/runtime/exports.ts
++++ b/src/mono/wasm/runtime/exports.ts
+@@ -48,6 +48,8 @@ import {
+     mono_wasm_get_by_index, mono_wasm_get_global_object, mono_wasm_get_object_property,
+     mono_wasm_invoke_js,
+     mono_wasm_invoke_js_blazor,
++    // Uno Platform specific interop
++    mono_wasm_invoke_js_unmarshalled,
+     mono_wasm_invoke_js_with_args, mono_wasm_set_by_index, mono_wasm_set_object_property
+ } from "./method-calls";
+ import { mono_wasm_typed_array_copy_to, mono_wasm_typed_array_from, mono_wasm_typed_array_copy_from, mono_wasm_load_bytes_into_heap } from "./buffers";
+@@ -278,6 +280,9 @@ export const __linker_exports: any = {
+     mono_wasm_invoke_js_blazor,
+     mono_wasm_trace_logger,
+ 
++    // Uno-platform specific interop
++    mono_wasm_invoke_js_unmarshalled,
++
+     // also keep in sync with corebindings.c
+     mono_wasm_invoke_js_with_args,
+     mono_wasm_get_object_property,
+diff --git a/src/mono/wasm/runtime/method-calls.ts b/src/mono/wasm/runtime/method-calls.ts
+index 3bd1057c1c1..9fe6f47ef3d 100644
+--- a/src/mono/wasm/runtime/method-calls.ts
++++ b/src/mono/wasm/runtime/method-calls.ts
+@@ -534,6 +534,27 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
+     }
+ }
+ 
++// Uno Platform specific interop
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++export function mono_wasm_invoke_js_unmarshalled(exceptionMessage: Int32Ptr, funcName: MonoString, arg0: any, arg1: any, arg2: any): void | number {
++    try {
++        // Get the function you're trying to invoke
++        const funcNameJsString = conv_string(funcName);
++        const dotNetExports = (<any>globalThis).DotNet;
++        if (!dotNetExports) {
++            throw new Error("The Microsoft.JSInterop.js library is not loaded.");
++        }
++        const funcInstance = dotNetExports.jsCallDispatcher.findJSFunction(funcNameJsString);
++
++        return funcInstance.call(null, arg0, arg1, arg2);
++    } catch (ex: any) {
++        const exceptionJsString = ex.message + "\n" + ex.stack;
++        const exceptionSystemString = cwraps.mono_wasm_string_from_js(exceptionJsString);
++        Module.setValue(exceptionMessage, <any>exceptionSystemString, "i32"); // *exceptionMessage = exceptionSystemString;
++        return 0;
++    }
++}
++
+ // code like `App.call_test_method();`
+ export function mono_wasm_invoke_js(code: MonoString, is_exception: Int32Ptr): MonoString | null {
+     if (code === MonoStringNull)
+-- 
+2.21.0.windows.1
+
