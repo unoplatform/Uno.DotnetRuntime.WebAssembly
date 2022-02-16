@@ -1,14 +1,15 @@
-From dc75594b0023ad392e963ddb93b08ae46bb117d3 Mon Sep 17 00:00:00 2001
+From 5b2ecab4f34ab05f3be1c1fb2747c3344b101dde Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Mon, 14 Feb 2022 14:25:09 -0500
-Subject: [PATCH] feat: Restore JSInterop InternalCalls::InvokeJSUnmarshalled
+Date: Tue, 15 Feb 2022 17:01:44 -0500
+Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
  src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js |  3 +++
  src/mono/wasm/runtime/driver.c              |  6 ++++++
+ src/mono/wasm/runtime/es6/dotnet.es6.lib.js |  3 +++
  src/mono/wasm/runtime/exports.ts            |  5 +++++
  src/mono/wasm/runtime/method-calls.ts       | 21 +++++++++++++++++++++
- 4 files changed, 35 insertions(+)
+ 5 files changed, 38 insertions(+)
 
 diff --git a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
 index 93edd268995..cf48f0196ef 100644
@@ -48,6 +49,20 @@ index a84d1d9b0ec..5fc448415d6 100644
  #ifdef CORE_BINDINGS
  	core_initialize_internals();
  #endif
+diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
+index 98c6238cd3f..6ce5164f69e 100644
+--- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
++++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
+@@ -79,6 +79,9 @@ const linked_functions = [
+     "mono_wasm_invoke_js_blazor",
+     "mono_wasm_trace_logger",
+ 
++    // Uno-platform specifc interop
++    "mono_wasm_invoke_js_unmarshalled",
++
+     // corebindings.c
+     "mono_wasm_invoke_js_with_args",
+     "mono_wasm_get_object_property",
 diff --git a/src/mono/wasm/runtime/exports.ts b/src/mono/wasm/runtime/exports.ts
 index 5dc4d847db6..5c4108736cd 100644
 --- a/src/mono/wasm/runtime/exports.ts
