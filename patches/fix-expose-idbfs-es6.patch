@@ -1,14 +1,28 @@
-From be9361a14f670d7d55b3aa23a7f47610d72e28c9 Mon Sep 17 00:00:00 2001
+From b5a4d2c3e53c14b22191d34eccd024b288cfae87 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Wed, 16 Feb 2022 08:08:18 -0500
 Subject: [PATCH] fix: Expose IDBFS in ES6 createDotnetRuntime
 
 ---
+ src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js | 2 +-
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js | 2 +-
  src/mono/wasm/runtime/es6/dotnet.es6.pre.js | 2 +-
  src/mono/wasm/runtime/exports.ts            | 4 +++-
- 3 files changed, 5 insertions(+), 3 deletions(-)
+ 4 files changed, 6 insertions(+), 4 deletions(-)
 
+diff --git a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
+index cf48f0196ef..33b3b8d7aa8 100644
+--- a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
++++ b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
+@@ -13,7 +13,7 @@ const DotnetSupportLib = {
+ let __dotnet_replacements = {readAsync, fetch: globalThis.fetch, require};
+ let __dotnet_exportedAPI = __dotnet_runtime.__initializeImportsAndExports(
+     { isESM:false, isGlobal:ENVIRONMENT_IS_GLOBAL, isNode:ENVIRONMENT_IS_NODE, isShell:ENVIRONMENT_IS_SHELL, isWeb:ENVIRONMENT_IS_WEB, locateFile, quit_, ExitStatus, requirePromise:Promise.resolve(require)}, 
+-    { mono:MONO, binding:BINDING, internal:INTERNAL, module:Module },
++    { mono:MONO, binding:BINDING, internal:INTERNAL, module:Module, idbfs:IDBFS },
+     __dotnet_replacements);
+ readAsync = __dotnet_replacements.readAsync;
+ var fetch = __dotnet_replacements.fetch;
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 index 6ce5164f69e..4f0f651faa7 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
