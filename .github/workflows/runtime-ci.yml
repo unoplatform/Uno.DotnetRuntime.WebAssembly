@@ -52,9 +52,10 @@ jobs:
 
     - name: Clone mono/linker
       run: |
-        git clone --recursive https://github.com/mono/linker
+        git clone -n --recursive https://github.com/mono/linker
         cd linker
         git reset --hard $env:LINKER_COMMIT
+        git submodule update --recursive
 
     - name: Build mono/linker
       run: |
@@ -205,9 +206,10 @@ jobs:
     - name: Clone mono/linker
       run: |
         set -e
-        git clone --recursive https://github.com/mono/linker
+        git clone -n --recursive https://github.com/mono/linker
         cd linker
         git reset --hard $LINKER_COMMIT
+        git submodule update --recursive
 
     - name: Build mono/linker
       run: |
