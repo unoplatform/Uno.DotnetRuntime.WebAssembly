@@ -14,11 +14,11 @@ on:
             
 env:
   EMSDK_VERSION: 2.0.23 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: a1f0147eb6cefaeff012879dbaf637297736ed3f
-  DOTNETSDK_VERSION: 6.0.100
+  DOTNETRUNTIME_COMMIT: 942430c5253fe58c11e32fda265bf816a13cb2b4
+  DOTNETSDK_VERSION: 6.0.200
 
-  # Original location: https://github.com/dotnet/runtime/blob/e4fb7303f7be173f5434d711d42b4bba706d0ad0/eng/Version.Details.xml#L237
-  LINKER_COMMIT: 24b988c6b1ca785f15745fb66a1adcb076b4d5e3
+  # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
+  LINKER_COMMIT: a709836737bf8ccc58d9b8c7d5e4bbabc8e28985
 
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true'
 
@@ -55,6 +55,7 @@ jobs:
 
     - name: Clone mono/linker
       run: |
+        git config --system core.longpaths true # required for linker tree after 2022-01
         git clone -n --recursive https://github.com/mono/linker
         cd linker
         git reset --hard $env:LINKER_COMMIT
