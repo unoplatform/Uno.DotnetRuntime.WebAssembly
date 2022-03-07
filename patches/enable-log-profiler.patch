@@ -23,7 +23,7 @@ index e94c73bb923..930818cf0fb 100644
 +    <PlatformManifestFileEntry Include="libmono-profiler-log.a" IsNative="true" />
      <PlatformManifestFileEntry Include="System.Private.Runtime.InteropServices.Javascript.dll" />
      <PlatformManifestFileEntry Include="dotnet.js" IsNative="true" />
-     <PlatformManifestFileEntry Include="dotnet.d.ts" IsNative="true" />
+     <PlatformManifestFileEntry Include="dotnet.js.symbols" IsNative="true" />
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
 index ed1945437a6..7e9ee4ecd41 100644
 --- a/src/mono/mono.proj
@@ -66,7 +66,7 @@ index b8092fe8825..dcc2edee9a1 100644
 +
    if(NOT HOST_WASI)
      add_library(mono-profiler-aot-static STATIC aot.c helper.c)
-     set_target_properties(mono-profiler-aot-static PROPERTIES OUTPUT_NAME mono-profiler-aot)
+     target_link_libraries(mono-profiler-aot-static monoapi)
 diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
 index 7d9636a5130..f2ac1b76595 100644
 --- a/src/mono/mono/profiler/log.c
