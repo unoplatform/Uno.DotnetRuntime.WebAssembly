@@ -1,4 +1,4 @@
-From e8e2d74b4477633e63493d7e8cbdbddb0b0cd1d5 Mon Sep 17 00:00:00 2001
+From 2b7d70bfbaacfda4def892dd909463e9b0a38ede Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Mon, 7 Mar 2022 13:11:06 -0500
 Subject: [PATCH] feat: Add log profiler support
@@ -7,10 +7,10 @@ Subject: [PATCH] feat: Add log profiler support
  .../Directory.Build.props                      |  1 +
  src/mono/mono.proj                             |  3 +++
  src/mono/mono/mini/mini-wasm.c                 |  1 -
- src/mono/mono/profiler/CMakeLists.txt          |  6 ++++++
+ src/mono/mono/profiler/CMakeLists.txt          |  7 +++++++
  src/mono/mono/profiler/helper.c                |  6 ++++++
  src/mono/mono/profiler/log.c                   | 18 +++++++++++++++++-
- 6 files changed, 33 insertions(+), 2 deletions(-)
+ 6 files changed, 34 insertions(+), 2 deletions(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 index 25f85539d73..9e5f2e7d73c 100644
@@ -51,10 +51,18 @@ index 4d1af4eeb52..26781cea2b1 100644
  
  gboolean
 diff --git a/src/mono/mono/profiler/CMakeLists.txt b/src/mono/mono/profiler/CMakeLists.txt
-index 4f860a1c826..d89a75fec70 100644
+index 4f860a1c826..6c40d4d7a11 100644
 --- a/src/mono/mono/profiler/CMakeLists.txt
 +++ b/src/mono/mono/profiler/CMakeLists.txt
-@@ -29,6 +29,12 @@ if(NOT DISABLE_LIBS)
+@@ -6,6 +6,7 @@ include_directories(
+   ${PROJECT_BINARY_DIR}/../../mono/eglib
+   ${CMAKE_CURRENT_SOURCE_DIR}/../..
+   ${PROJECT_SOURCE_DIR}/../
++  ${PROJECT_SOURCE_DIR}/../../../native/public
+   ${PROJECT_SOURCE_DIR}/../eglib
+   ${PROJECT_SOURCE_DIR}/../sgen)
+ 
+@@ -29,6 +30,12 @@ if(NOT DISABLE_LIBS)
      endif()
    endif()
  
