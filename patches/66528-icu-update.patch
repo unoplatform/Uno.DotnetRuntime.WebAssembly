@@ -1,0 +1,94 @@
+From f50de80260a569a46939786cb75db57e90760f44 Mon Sep 17 00:00:00 2001
+From: Larry Ewing <lewing@microsoft.com>
+Date: Fri, 11 Mar 2022 16:03:59 -0600
+Subject: [PATCH] try this with icu updated
+
+---
+ eng/Version.Details.xml                        | 8 ++++----
+ eng/Versions.props                             | 4 ++--
+ eng/pipelines/common/platform-matrix.yml       | 2 +-
+ eng/pipelines/libraries/helix-queues-setup.yml | 2 +-
+ src/mono/wasm/emscripten-version.txt           | 2 +-
+ 5 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
+index 1eed349b060dd..61ffae34c447a 100644
+--- a/eng/Version.Details.xml
++++ b/eng/Version.Details.xml
+@@ -1,16 +1,16 @@
+ <Dependencies>
+   <ProductDependencies>
+-    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.3.22157.1">
++    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.3.22116.2">
+       <Uri>https://github.com/dotnet/icu</Uri>
+-      <Sha>5416401e2e54d6ce9bef7f0c4a5fe25088c42652</Sha>
++      <Sha>c0aa3e0092d5264447e846f88db1d081d7f63205</Sha>
+     </Dependency>
+     <Dependency Name="System.Net.MsQuic.Transport" Version="7.0.0-alpha.1.22160.2">
+       <Uri>https://github.com/dotnet/msquic</Uri>
+       <Sha>4fe73fcad4b0af91cc49fd1f5576f0111f15f6fd</Sha>
+     </Dependency>
+-    <Dependency Name="Microsoft.NET.Workload.Emscripten.Manifest-7.0.100" Version="7.0.0-preview.3.22128.1">
++    <Dependency Name="Microsoft.NET.Workload.Emscripten.Manifest-7.0.100" Version="7.0.0-preview.3.22121.1">
+       <Uri>https://github.com/dotnet/emsdk</Uri>
+-      <Sha>0589b22424ef2046b3fa0f96da4ffe261ffdf7c8</Sha>
++      <Sha>b8e71431b3eaa024afad7886699f8ac6bca2ba01</Sha>
+     </Dependency>
+     <Dependency Name="System.ServiceModel.Primitives" Version="4.9.0-rc2.21473.1">
+       <Uri>https://github.com/dotnet/wcf</Uri>
+diff --git a/eng/Versions.props b/eng/Versions.props
+index bdeb8db1a137c..31414e4472370 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -172,7 +172,7 @@
+     <MicrosoftNETILLinkTasksVersion>7.0.100-1.22160.1</MicrosoftNETILLinkTasksVersion>
+     <MicrosoftNETILLinkAnalyzerPackageVersion>$(MicrosoftNETILLinkTasksVersion)</MicrosoftNETILLinkAnalyzerPackageVersion>
+     <!-- ICU -->
+-    <MicrosoftNETCoreRuntimeICUTransportVersion>7.0.0-preview.3.22157.1</MicrosoftNETCoreRuntimeICUTransportVersion>
++    <MicrosoftNETCoreRuntimeICUTransportVersion>7.0.0-preview.3.22116.2</MicrosoftNETCoreRuntimeICUTransportVersion>
+     <!-- MsQuic -->
+     <SystemNetMsQuicTransportVersion>7.0.0-alpha.1.22160.2</SystemNetMsQuicTransportVersion>
+     <!-- Mono LLVM -->
+@@ -185,7 +185,7 @@
+     <runtimeosx1012x64MicrosoftNETCoreRuntimeMonoLLVMSdkVersion>11.1.0-alpha.1.22121.2</runtimeosx1012x64MicrosoftNETCoreRuntimeMonoLLVMSdkVersion>
+     <runtimeosx1012x64MicrosoftNETCoreRuntimeMonoLLVMToolsVersion>11.1.0-alpha.1.22121.2</runtimeosx1012x64MicrosoftNETCoreRuntimeMonoLLVMToolsVersion>
+     <!-- emscripten / Node -->
+-    <MicrosoftNETWorkloadEmscriptenManifest70100Version>7.0.0-preview.3.22128.1</MicrosoftNETWorkloadEmscriptenManifest70100Version>
++    <MicrosoftNETWorkloadEmscriptenManifest70100Version>7.0.0-preview.3.22121.1</MicrosoftNETWorkloadEmscriptenManifest70100Version>
+     <MicrosoftNETRuntimeEmscriptenVersion>$(MicrosoftNETWorkloadEmscriptenManifest70100Version)</MicrosoftNETRuntimeEmscriptenVersion>
+     <!-- workloads -->
+     <SwixPackageVersion>1.1.87-gba258badda</SwixPackageVersion>
+diff --git a/eng/pipelines/common/platform-matrix.yml b/eng/pipelines/common/platform-matrix.yml
+index 22fa0be43584d..a31f595580cf5 100644
+--- a/eng/pipelines/common/platform-matrix.yml
++++ b/eng/pipelines/common/platform-matrix.yml
+@@ -303,7 +303,7 @@ jobs:
+       targetRid: browser-wasm
+       platform: Browser_wasm
+       container:
+-        image: ubuntu-18.04-webassembly-20210707133424-12f133e
++        image: ubuntu-18.04-webassembly-20220118141522-180197c
+         registry: mcr
+       jobParameters:
+         hostedOs: Linux
+diff --git a/eng/pipelines/libraries/helix-queues-setup.yml b/eng/pipelines/libraries/helix-queues-setup.yml
+index ef1cdc9ebab0d..c532f1ab89189 100644
+--- a/eng/pipelines/libraries/helix-queues-setup.yml
++++ b/eng/pipelines/libraries/helix-queues-setup.yml
+@@ -182,6 +182,6 @@ jobs:
+ 
+     # WebAssembly windows
+     - ${{ if eq(parameters.platform, 'Browser_wasm_win') }}:
+-      - (Windows.Server.Core.1909.Amd64.Open)windows.10.amd64.server20h2.open@mcr.microsoft.com/dotnet-buildtools/prereqs:windowsservercore-2004-helix-webassembly-amd64-20210702131541-6837048
++      - (Windows.Server.Core.1909.Amd64.Open)windows.10.amd64.server20h2.open@mcr.microsoft.com/dotnet-buildtools/prereqs:windowsservercore-ltsc2022-helix-webassembly-20220118164817-dc6e6f1
+ 
+     ${{ insert }}: ${{ parameters.jobParameters }}
+diff --git a/src/mono/wasm/emscripten-version.txt b/src/mono/wasm/emscripten-version.txt
+index 8fe1046e01fc8..50e47c89cafc3 100644
+--- a/src/mono/wasm/emscripten-version.txt
++++ b/src/mono/wasm/emscripten-version.txt
+@@ -1 +1 @@
+-2.0.23
+\ No newline at end of file
++3.1.1
+\ No newline at end of file
