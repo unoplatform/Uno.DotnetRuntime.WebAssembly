@@ -35,9 +35,9 @@ index c0122578a9b..36e84b77356 100644
 +      <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-log.a">
 +        <Destination>$(RuntimeBinDir)libmono-profiler-log.a</Destination>
 +      </_MonoRuntimeArtifacts>
-       <_MonoICorDebugArtifacts Condition="'$(MonoMsCorDbi)' == 'true'" Include="$(MonoObjDir)out\lib\$(LibPrefix)dbgshim$(LibSuffix)">
-         <Destination>$(RuntimeBinDir)$(LibPrefix)dbgshim$(LibSuffix)</Destination>
-       </_MonoICorDebugArtifacts>
+       <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-wasm-eh-js.a">
+         <Destination>$(RuntimeBinDir)libmono-wasm-eh-js.a</Destination>
+       </_MonoRuntimeArtifacts>
 diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
 index 4d1af4eeb52..26781cea2b1 100644
 --- a/src/mono/mono/mini/mini-wasm.c
