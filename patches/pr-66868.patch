@@ -10,7 +10,7 @@ Subject: [PATCH] feat: Add support for emscripten module exports
  3 files changed, 21 insertions(+)
 
 diff --git a/src/mono/wasm/runtime/dotnet.d.ts b/src/mono/wasm/runtime/dotnet.d.ts
-index d6a86af0a327..617b572e7574 100644
+index d6a86af0a3278..617b572e75742 100644
 --- a/src/mono/wasm/runtime/dotnet.d.ts
 +++ b/src/mono/wasm/runtime/dotnet.d.ts
 @@ -197,6 +197,7 @@ declare type DotnetModuleConfig = {
@@ -22,7 +22,7 @@ index d6a86af0a327..617b572e7574 100644
  declare type DotnetModuleConfigImports = {
      require?: (name: string) => any;
 diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
-index 8801ac704b0e..8ffd93a15451 100644
+index 8801ac704b0eb..8ffd93a15451c 100644
 --- a/src/mono/wasm/runtime/startup.ts
 +++ b/src/mono/wasm/runtime/startup.ts
 @@ -251,6 +251,8 @@ function _apply_configuration_from_args(config: MonoConfig) {
@@ -59,7 +59,7 @@ index 8801ac704b0e..8ffd93a15451 100644
              _apply_configuration_from_args(config);
  
 diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types.ts
-index cc0d1b24583e..aa7481fa076d 100644
+index cc0d1b24583e3..aa7481fa076d4 100644
 --- a/src/mono/wasm/runtime/types.ts
 +++ b/src/mono/wasm/runtime/types.ts
 @@ -166,6 +166,7 @@ export type DotnetModuleConfig = {
@@ -70,4 +70,3 @@ index cc0d1b24583e..aa7481fa076d 100644
  } & Partial<EmscriptenModule>
  
  export type DotnetModuleConfigImports = {
-
