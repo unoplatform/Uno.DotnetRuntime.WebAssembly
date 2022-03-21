@@ -1,0 +1,73 @@
+From 964ab51a4ee5080158bbfc87d447203084cdb887 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Sat, 19 Mar 2022 00:43:09 +0000
+Subject: [PATCH] feat: Add support for emscripten module exports
+
+---
+ src/mono/wasm/runtime/dotnet.d.ts |  1 +
+ src/mono/wasm/runtime/startup.ts  | 19 +++++++++++++++++++
+ src/mono/wasm/runtime/types.ts    |  1 +
+ 3 files changed, 21 insertions(+)
+
+diff --git a/src/mono/wasm/runtime/dotnet.d.ts b/src/mono/wasm/runtime/dotnet.d.ts
+index d6a86af0a327..617b572e7574 100644
+--- a/src/mono/wasm/runtime/dotnet.d.ts
++++ b/src/mono/wasm/runtime/dotnet.d.ts
+@@ -197,6 +197,7 @@ declare type DotnetModuleConfig = {
+     onConfigLoaded?: (config: MonoConfig) => Promise<void>;
+     onDotnetReady?: () => void;
+     imports?: DotnetModuleConfigImports;
++    exports?: string[];
+ } & Partial<EmscriptenModule>;
+ declare type DotnetModuleConfigImports = {
+     require?: (name: string) => any;
+diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
+index 8801ac704b0e..8ffd93a15451 100644
+--- a/src/mono/wasm/runtime/startup.ts
++++ b/src/mono/wasm/runtime/startup.ts
+@@ -251,6 +251,8 @@ function _apply_configuration_from_args(config: MonoConfig) {
+ }
+ 
+ function finalize_startup(config: MonoConfig | MonoConfigError | undefined): void {
++    const globalThisAny = globalThis as any;
++
+     try {
+         if (!config || config.isError) {
+             return;
+@@ -261,6 +263,23 @@ function finalize_startup(config: MonoConfig | MonoConfigError | undefined): voi
+ 
+         const moduleExt = Module as DotnetModule;
+ 
++        if(!Module.disableDotnet6Compatibility && Module.exports){
++            // Export emscripten defined in module through EXPORTED_RUNTIME_METHODS
++            // Useful to export IDBFS or other similar types generally exposed as 
++            // global types when emscripten is not modularized.
++            for (let i = 0; i < Module.exports.length; ++i) {
++                const exportName = Module.exports[i];
++                const exportValue = (<any>Module)[exportName];
++
++                if(exportValue) {
++                    globalThisAny[exportName] = exportValue;
++                }
++                else{
++                    console.warn(`MONO_WASM: The exported symbol ${exportName} could not be found in the emscripten module`);
++                }
++            }
++        }
++
+         try {
+             _apply_configuration_from_args(config);
+ 
+diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types.ts
+index cc0d1b24583e..aa7481fa076d 100644
+--- a/src/mono/wasm/runtime/types.ts
++++ b/src/mono/wasm/runtime/types.ts
+@@ -166,6 +166,7 @@ export type DotnetModuleConfig = {
+     onDotnetReady?: () => void;
+ 
+     imports?: DotnetModuleConfigImports;
++    exports?: string[];
+ } & Partial<EmscriptenModule>
+ 
+ export type DotnetModuleConfigImports = {
+
