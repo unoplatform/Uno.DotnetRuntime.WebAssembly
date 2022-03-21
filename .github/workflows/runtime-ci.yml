@@ -87,7 +87,6 @@ jobs:
         git apply ..\patches\fix-additional-emscripten-exports.patch
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\fix-expose-idbfs-es6.patch
-        git apply ..\patches\issue-66319.patch
         git apply ..\patches\pr-66868.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
@@ -243,7 +242,6 @@ jobs:
         git apply ../patches/fix-additional-emscripten-exports.patch
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/fix-expose-idbfs-es6.patch
-        git apply ../patches/issue-66319.patch
         git apply ../patches/pr-66868.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
