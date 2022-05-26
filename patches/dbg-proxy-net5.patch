@@ -35,7 +35,7 @@ index dc945e6de1e..77086e1e9e5 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 @@ -1,7 +1,6 @@
- ﻿<Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
+ <Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
  
    <PropertyGroup>
 -    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
