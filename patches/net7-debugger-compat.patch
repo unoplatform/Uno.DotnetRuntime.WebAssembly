@@ -1,0 +1,116 @@
+From 450fec40fab9ec5c1fd90430a9a12ddc27487eb3 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Thu, 26 May 2022 18:41:18 +0000
+Subject: [PATCH] chore: Adjust debugger net7
+
+---
+ .../Common/DevToolsDebuggerConnection.cs               |  5 +++++
+ .../Common/FirefoxDebuggerConnection.cs                |  5 +++++
+ .../BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs  | 10 ++++++++++
+ .../BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs      |  5 +++++
+ src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs  |  5 +++++
+ 5 files changed, 30 insertions(+)
+
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs
+index d6a658af441..dc45820618a 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs
+@@ -21,8 +21,13 @@ internal sealed class DevToolsDebuggerConnection : WasmDebuggerConnection
+     public DevToolsDebuggerConnection(WebSocket webSocket, string id, ILogger logger)
+             : base(id)
+     {
++#if NET7_0_OR_GREATER
+         ArgumentNullException.ThrowIfNull(webSocket);
+         ArgumentNullException.ThrowIfNull(logger);
++#else
++        webSocket = webSocket ?? throw new ArgumentNullException(nameof(webSocket));
++        logger = logger ?? throw new ArgumentNullException(nameof(logger));
++#endif
+         WebSocket = webSocket;
+         _logger = logger;
+     }
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Common/FirefoxDebuggerConnection.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Common/FirefoxDebuggerConnection.cs
+index 2664cadb0cb..de0902de6eb 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/Common/FirefoxDebuggerConnection.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/Common/FirefoxDebuggerConnection.cs
+@@ -23,8 +23,13 @@ internal sealed class FirefoxDebuggerConnection : WasmDebuggerConnection
+     public FirefoxDebuggerConnection(TcpClient tcpClient, string id, ILogger logger)
+             : base(id)
+     {
++#if NET7_0_OR_GREATER
+         ArgumentNullException.ThrowIfNull(tcpClient);
+         ArgumentNullException.ThrowIfNull(logger);
++#else
++        tcpClient = tcpClient ?? throw new ArgumentNullException(nameof(tcpClient));
++        logger = logger ?? throw new ArgumentNullException(nameof(tcpClient));
++#endif
+         TcpClient = tcpClient;
+         _logger = logger;
+         _lengthBuffer = new byte[10];
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
+index 6824ff38110..4670087d7c8 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
+@@ -38,7 +38,12 @@ public static async Task RunServerLoopAsync(int browserPort, int proxyPort, ILog
+         StartListener(proxyPort, logger, browserPort);
+         while (!token.IsCancellationRequested)
+         {
++            #if NET7_0_OR_GREATER
+             TcpClient ideClient = await s_tcpListener.AcceptTcpClientAsync(token);
++            #else
++            await System.Threading.Tasks.Task.Yield();
++            TcpClient ideClient = s_tcpListener.AcceptTcpClient();
++            #endif
+             _ = Task.Run(async () =>
+                         {
+                             CancellationTokenSource cts = new();
+@@ -66,7 +71,12 @@ public async Task RunForTests(int browserPort, int proxyPort, string testId, ILo
+     {
+         StartListener(proxyPort, logger, browserPort);
+ 
++        #if NET7_0_OR_GREATER
+         TcpClient ideClient = await s_tcpListener.AcceptTcpClientAsync(cts.Token);
++        #else
++        await System.Threading.Tasks.Task.Yield();
++        TcpClient ideClient = s_tcpListener.AcceptTcpClient();
++        #endif
+         FirefoxMonoProxy = new FirefoxMonoProxy(loggerFactory.CreateLogger($"FirefoxMonoProxy-{testId}"), testId);
+         FirefoxMonoProxy.RunLoopStopped += (_, args) => ExitState = args;
+         await FirefoxMonoProxy.RunForFirefox(ideClient: ideClient, browserPort, cts);
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
+index ba8cdf740ef..682e0d1c328 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
+@@ -984,7 +984,12 @@ internal override async Task<bool> OnGetScriptSource(MessageId msg_id, string sc
+                     return false;
+ 
+                 using (var reader = new StreamReader(data))
++#if NET7_0_OR_GREATER
+                     source = await reader.ReadToEndAsync(token);
++#else
++                    { await System.Threading.Tasks.Task.Yield();
++                    source = reader.ReadToEnd(); }
++#endif
+             }
+             await SendEvent(msg_id, "", JObject.FromObject(new { source, from = script_id }), token);
+         }
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
+index c7ba8454716..e9a582b9d55 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
+@@ -1708,7 +1708,12 @@ internal virtual async Task<bool> OnGetScriptSource(MessageId msg_id, string scr
+                         return false;
+ 
+                     using (var reader = new StreamReader(data))
++#if NET7_0_OR_GREATER
+                         source = await reader.ReadToEndAsync(token);
++#else
++                        { await System.Threading.Tasks.Task.Yield();
++                        source = reader.ReadToEnd(); }
++#endif
+                 }
+                 SendResponse(msg_id, Result.OkFromObject(new { scriptSource = source }), token);
+             }
+-- 
+2.35.1
+

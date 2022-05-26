@@ -1,15 +1,15 @@
-From 290676c095e5e696b8e9678c5c00ca6f41c2e813 Mon Sep 17 00:00:00 2001
+From 98c6d7aaceead2dcc2ed7b4b1d13fdeff14f558e Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Mon, 21 Feb 2022 10:45:05 -0500
-Subject: [PATCH] fix: Build net5.0 browser debugger host
+Date: Thu, 26 May 2022 18:01:36 +0000
+Subject: [PATCH] adjust debugger tfm
 
 ---
  .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
- .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 +++-
- 2 files changed, 11 insertions(+), 2 deletions(-)
+ .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 ++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index 66d0b287f76..7ed1364f856 100644
+index a397c207453..63d75932904 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 @@ -1,9 +1,16 @@
@@ -31,22 +31,18 @@ index 66d0b287f76..7ed1364f856 100644
  
    <ItemGroup>
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index 169856bc091..311a88b899b 100644
+index dc945e6de1e..c17811bc612 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -1,9 +1,11 @@
- ﻿<Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
+@@ -14,4 +14,8 @@
+     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="3.7.0" />
+   </ItemGroup>
  
-   <PropertyGroup>
--    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
++  <PropertyGroup>
++    <TargetFramework> </TargetFramework>
 +    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
-     <NoWarn>$(NoWarn),CA2007</NoWarn>
-     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-+    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net5.0'">true</AppendTargetFrameworkToOutputPath>
-+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-   </PropertyGroup>
- 
-   <ItemGroup>
++  </PropertyGroup>
+ </Project>
 -- 
-2.21.0.windows.1
+2.35.1
 

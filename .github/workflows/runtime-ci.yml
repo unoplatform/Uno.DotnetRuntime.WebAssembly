@@ -14,7 +14,7 @@ on:
             
 env:
   EMSDK_VERSION: 3.1.7 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 07d8b82d54b6b8db16f5fbb531efcb1e276dc264
+  DOTNETRUNTIME_COMMIT: e96642078cfa9c68305ced1ee6accc1b0e0a9a9e
   DOTNETSDK_VERSION: 6.0.200
 
   # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
@@ -86,6 +86,7 @@ jobs:
         git apply ..\patches\restore-jsinterop-invokejsunmarshalled.patch
         git apply ..\patches\fix-additional-emscripten-exports.patch
         git apply ..\patches\enable-log-profiler.patch
+        git apply ..\patches\net7-debugger-compat.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -117,7 +118,7 @@ jobs:
         # Move src and include files to locations compatible with mono's packager
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
-        move src\* .
+        move src\* . -Force
         move System.Private.CoreLib.* ..\lib\net7.0
 
     - name: Copy mono/linker files
@@ -193,6 +194,9 @@ jobs:
         sudo add-apt-repository ppa:git-core/ppa
         sudo apt update;
         sudo apt install -y git
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
         
     - uses: actions/checkout@v2
       with:
@@ -239,6 +243,7 @@ jobs:
         git apply ../patches/restore-jsinterop-invokejsunmarshalled.patch
         git apply ../patches/fix-additional-emscripten-exports.patch
         git apply ../patches/enable-log-profiler.patch
+        git apply ../patches/net7-debugger-compat.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
