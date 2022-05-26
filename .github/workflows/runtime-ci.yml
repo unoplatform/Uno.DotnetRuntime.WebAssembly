@@ -196,7 +196,7 @@ jobs:
         sudo apt install -y git
 
     - name: Trust My Directory
-      run: export GIT_CEILING_DIRECTORIES=/__w
+      run: git config --global --add safe.directory /__w
         
     - uses: actions/checkout@v2
       with:
