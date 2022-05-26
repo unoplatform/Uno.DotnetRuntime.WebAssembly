@@ -1,12 +1,12 @@
-From ce52d5bab7615383e7bd74b34d537101f06f9911 Mon Sep 17 00:00:00 2001
+From 98c6d7aaceead2dcc2ed7b4b1d13fdeff14f558e Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 26 May 2022 17:07:07 +0000
-Subject: [PATCH] chore: Adjust debugger proxy
+Date: Thu, 26 May 2022 18:01:36 +0000
+Subject: [PATCH] adjust debugger tfm
 
 ---
  .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
- .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 +++-
- 2 files changed, 11 insertions(+), 2 deletions(-)
+ .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 ++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 index a397c207453..63d75932904 100644
@@ -31,22 +31,15 @@ index a397c207453..63d75932904 100644
  
    <ItemGroup>
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index dc945e6de1e..77086e1e9e5 100644
+index dc945e6de1e..c17811bc612 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -1,7 +1,6 @@
- <Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
- 
-   <PropertyGroup>
--    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
-     <NoWarn>$(NoWarn),CA2007</NoWarn>
-     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-@@ -14,4 +13,7 @@
+@@ -14,4 +14,8 @@
      <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="3.7.0" />
    </ItemGroup>
  
 +  <PropertyGroup>
++    <TargetFramework> </TargetFramework>
 +    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
 +  </PropertyGroup>
  </Project>
