@@ -39,7 +39,7 @@ index dc945e6de1e..a8915ea9ff5 100644
    </ItemGroup>
  
 +  <PropertyGroup>
-+    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(TargetFrameworks);net5.0</TargetFrameworks>
 +  </PropertyGroup>
  </Project>
 -- 
