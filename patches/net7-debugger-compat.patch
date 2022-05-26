@@ -1,15 +1,15 @@
-From a0274f73915c6a585c781185902e354ff7bb5bc1 Mon Sep 17 00:00:00 2001
+From 450fec40fab9ec5c1fd90430a9a12ddc27487eb3 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 26 May 2022 13:13:30 +0000
-Subject: [PATCH] fix: Adjust debugger proxy for net7-only methods
+Date: Thu, 26 May 2022 18:41:18 +0000
+Subject: [PATCH] chore: Adjust debugger net7
 
 ---
- .../Common/DevToolsDebuggerConnection.cs                  | 5 +++++
- .../BrowserDebugProxy/Common/FirefoxDebuggerConnection.cs | 5 +++++
- .../BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs     | 8 ++++++++
- .../BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs         | 4 ++++
- src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs     | 4 ++++
- 5 files changed, 26 insertions(+)
+ .../Common/DevToolsDebuggerConnection.cs               |  5 +++++
+ .../Common/FirefoxDebuggerConnection.cs                |  5 +++++
+ .../BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs  | 10 ++++++++++
+ .../BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs      |  5 +++++
+ src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs  |  5 +++++
+ 5 files changed, 30 insertions(+)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs
 index d6a658af441..dc45820618a 100644
@@ -48,10 +48,10 @@ index 2664cadb0cb..de0902de6eb 100644
          _logger = logger;
          _lengthBuffer = new byte[10];
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
-index 6824ff38110..fdda73e996e 100644
+index 6824ff38110..4670087d7c8 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
-@@ -38,7 +38,11 @@ public static async Task RunServerLoopAsync(int browserPort, int proxyPort, ILog
+@@ -38,7 +38,12 @@ public static async Task RunServerLoopAsync(int browserPort, int proxyPort, ILog
          StartListener(proxyPort, logger, browserPort);
          while (!token.IsCancellationRequested)
          {
@@ -64,7 +64,7 @@ index 6824ff38110..fdda73e996e 100644
              _ = Task.Run(async () =>
                          {
                              CancellationTokenSource cts = new();
-@@ -66,7 +70,11 @@ public async Task RunForTests(int browserPort, int proxyPort, string testId, ILo
+@@ -66,7 +71,12 @@ public async Task RunForTests(int browserPort, int proxyPort, string testId, ILo
      {
          StartListener(proxyPort, logger, browserPort);
  
@@ -78,10 +78,10 @@ index 6824ff38110..fdda73e996e 100644
          FirefoxMonoProxy.RunLoopStopped += (_, args) => ExitState = args;
          await FirefoxMonoProxy.RunForFirefox(ideClient: ideClient, browserPort, cts);
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
-index ba8cdf740ef..f51fc5c6296 100644
+index ba8cdf740ef..682e0d1c328 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
-@@ -984,7 +984,11 @@ internal override async Task<bool> OnGetScriptSource(MessageId msg_id, string sc
+@@ -984,7 +984,12 @@ internal override async Task<bool> OnGetScriptSource(MessageId msg_id, string sc
                      return false;
  
                  using (var reader = new StreamReader(data))
@@ -95,16 +95,17 @@ index ba8cdf740ef..f51fc5c6296 100644
              await SendEvent(msg_id, "", JObject.FromObject(new { source, from = script_id }), token);
          }
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
-index c7ba8454716..fadcd0e210b 100644
+index c7ba8454716..e9a582b9d55 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
-@@ -1708,7 +1708,11 @@ internal virtual async Task<bool> OnGetScriptSource(MessageId msg_id, string scr
+@@ -1708,7 +1708,12 @@ internal virtual async Task<bool> OnGetScriptSource(MessageId msg_id, string scr
                          return false;
  
                      using (var reader = new StreamReader(data))
 +#if NET7_0_OR_GREATER
                          source = await reader.ReadToEndAsync(token);
 +#else
++                        await System.Threading.Tasks.Task.Yield();
 +                        source = reader.ReadToEnd();
 +#endif
                  }
