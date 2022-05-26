@@ -31,15 +31,23 @@ index 66d0b287f76..7ed1364f856 100644
  
    <ItemGroup>
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index dc945e6de1e..a8915ea9ff5 100644
+index dc945e6de1e..77086e1e9e5 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -14,4 +14,7 @@
+@@ -1,7 +1,6 @@
+ ﻿<Project Sdk="Microsoft.NET.Sdk" ToolsVersion="15.0">
+ 
+   <PropertyGroup>
+-    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
+     <NoWarn>$(NoWarn),CA2007</NoWarn>
+     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+@@ -14,4 +13,7 @@
      <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="3.7.0" />
    </ItemGroup>
  
 +  <PropertyGroup>
-+    <TargetFrameworks>$(TargetFrameworks);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
 +  </PropertyGroup>
  </Project>
 -- 
