@@ -1,7 +1,7 @@
-From 290676c095e5e696b8e9678c5c00ca6f41c2e813 Mon Sep 17 00:00:00 2001
+From ce52d5bab7615383e7bd74b34d537101f06f9911 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Mon, 21 Feb 2022 10:45:05 -0500
-Subject: [PATCH] fix: Build net5.0 browser debugger host
+Date: Thu, 26 May 2022 17:07:07 +0000
+Subject: [PATCH] chore: Adjust debugger proxy
 
 ---
  .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
@@ -9,7 +9,7 @@ Subject: [PATCH] fix: Build net5.0 browser debugger host
  2 files changed, 11 insertions(+), 2 deletions(-)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index 66d0b287f76..7ed1364f856 100644
+index a397c207453..63d75932904 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 @@ -1,9 +1,16 @@
@@ -52,3 +52,4 @@ index dc945e6de1e..77086e1e9e5 100644
  </Project>
 -- 
 2.35.1
+
