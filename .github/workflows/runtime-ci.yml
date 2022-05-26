@@ -196,7 +196,7 @@ jobs:
         sudo apt install -y git
 
     - name: Trust My Directory
-      run: git config --global --add safe.directory /__w
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
         
     - uses: actions/checkout@v2
       with:
