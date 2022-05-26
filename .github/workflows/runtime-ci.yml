@@ -118,7 +118,7 @@ jobs:
         # Move src and include files to locations compatible with mono's packager
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
-        move src\* .
+        move src\* . -Force
         move System.Private.CoreLib.* ..\lib\net7.0
 
     - name: Copy mono/linker files
