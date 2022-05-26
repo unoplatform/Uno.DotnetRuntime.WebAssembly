@@ -58,8 +58,9 @@ index 6824ff38110..fdda73e996e 100644
 +            #if NET7_0_OR_GREATER
              TcpClient ideClient = await s_tcpListener.AcceptTcpClientAsync(token);
 +            #else
++            await System.Threading.Tasks.Task.Yield();
 +            TcpClient ideClient = s_tcpListener.AcceptTcpClient();
-+            #endif            
++            #endif
              _ = Task.Run(async () =>
                          {
                              CancellationTokenSource cts = new();
@@ -70,6 +71,7 @@ index 6824ff38110..fdda73e996e 100644
 +        #if NET7_0_OR_GREATER
          TcpClient ideClient = await s_tcpListener.AcceptTcpClientAsync(cts.Token);
 +        #else
++        await System.Threading.Tasks.Task.Yield();
 +        TcpClient ideClient = s_tcpListener.AcceptTcpClient();
 +        #endif
          FirefoxMonoProxy = new FirefoxMonoProxy(loggerFactory.CreateLogger($"FirefoxMonoProxy-{testId}"), testId);
@@ -86,6 +88,7 @@ index ba8cdf740ef..f51fc5c6296 100644
 +#if NET7_0_OR_GREATER
                      source = await reader.ReadToEndAsync(token);
 +#else
++                    await System.Threading.Tasks.Task.Yield();
 +                    source = reader.ReadToEnd();
 +#endif
              }
