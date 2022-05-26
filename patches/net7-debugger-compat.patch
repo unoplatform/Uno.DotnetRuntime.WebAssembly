@@ -88,8 +88,8 @@ index ba8cdf740ef..682e0d1c328 100644
 +#if NET7_0_OR_GREATER
                      source = await reader.ReadToEndAsync(token);
 +#else
-+                    await System.Threading.Tasks.Task.Yield();
-+                    source = reader.ReadToEnd();
++                    { await System.Threading.Tasks.Task.Yield();
++                    source = reader.ReadToEnd(); }
 +#endif
              }
              await SendEvent(msg_id, "", JObject.FromObject(new { source, from = script_id }), token);
@@ -105,8 +105,8 @@ index c7ba8454716..e9a582b9d55 100644
 +#if NET7_0_OR_GREATER
                          source = await reader.ReadToEndAsync(token);
 +#else
-+                        await System.Threading.Tasks.Task.Yield();
-+                        source = reader.ReadToEnd();
++                        { await System.Threading.Tasks.Task.Yield();
++                        source = reader.ReadToEnd(); }
 +#endif
                  }
                  SendResponse(msg_id, Result.OkFromObject(new { scriptSource = source }), token);
