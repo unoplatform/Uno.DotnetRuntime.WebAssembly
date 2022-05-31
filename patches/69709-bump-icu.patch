@@ -1,20 +1,22 @@
-From 06698c0897d82f2a9f016048cf5a1f0fbae7d0e4 Mon Sep 17 00:00:00 2001
+From cfbfbbd16e45040cadb4f1495b2653d001c77a15 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Tue, 31 May 2022 13:05:03 +0000
-Subject: [PATCH] chore: Bump ICU
+Date: Tue, 31 May 2022 13:11:17 +0000
+Subject: [PATCH] chore: Update icu transport
 
 ---
- eng/Version.Details.xml | 2 +-
+ eng/Version.Details.xml | 4 ++--
  eng/Versions.props      | 2 +-
- 2 files changed, 2 insertions(+), 2 deletions(-)
+ 2 files changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
-index 2eae8221da9..76e5a11060e 100644
+index 2eae8221da9..2088b6ed22c 100644
 --- a/eng/Version.Details.xml
 +++ b/eng/Version.Details.xml
-@@ -2,7 +2,7 @@
+@@ -1,8 +1,8 @@
+ <Dependencies>
    <ProductDependencies>
-     <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.5.22269.3">
+-    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.5.22269.3">
++    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.6.22280.2">
        <Uri>https://github.com/dotnet/icu</Uri>
 -      <Sha>769d436d511fc775473f2cd9dff15afbe5566010</Sha>
 +      <Sha>b05bfe5cc47b96705a4bbca5528adbba42dc7e50</Sha>
