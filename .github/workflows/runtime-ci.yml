@@ -87,6 +87,7 @@ jobs:
         git apply ..\patches\fix-additional-emscripten-exports.patch
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\net7-debugger-compat.patch
+        git apply ..\patches\69709-bump-icu.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -244,6 +245,7 @@ jobs:
         git apply ../patches/fix-additional-emscripten-exports.patch
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/net7-debugger-compat.patch
+        git apply ../patches/69709-bump-icu.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .

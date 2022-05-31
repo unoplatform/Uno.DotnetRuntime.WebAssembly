@@ -1,0 +1,56 @@
+From a1264af4f89261f3ada3a71cb3207af40fd99a12 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Tue, 31 May 2022 13:11:17 +0000
+Subject: [PATCH] chore: Update icu transport
+
+---
+ eng/Version.Details.xml | 4 ++--
+ eng/Versions.props      | 2 +-
+ src/mono/wasm/wasm.proj | 3 ++-
+ 3 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
+index 2eae8221da9..2088b6ed22c 100644
+--- a/eng/Version.Details.xml
++++ b/eng/Version.Details.xml
+@@ -1,8 +1,8 @@
+ <Dependencies>
+   <ProductDependencies>
+-    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.5.22269.3">
++    <Dependency Name="Microsoft.NETCore.Runtime.ICU.Transport" Version="7.0.0-preview.6.22280.2">
+       <Uri>https://github.com/dotnet/icu</Uri>
+-      <Sha>769d436d511fc775473f2cd9dff15afbe5566010</Sha>
++      <Sha>b05bfe5cc47b96705a4bbca5528adbba42dc7e50</Sha>
+     </Dependency>
+     <Dependency Name="System.Net.MsQuic.Transport" Version="7.0.0-alpha.1.22273.1">
+       <Uri>https://github.com/dotnet/msquic</Uri>
+diff --git a/eng/Versions.props b/eng/Versions.props
+index 53f4052e9f3..8380e016920 100644
+--- a/eng/Versions.props
++++ b/eng/Versions.props
+@@ -171,7 +171,7 @@
+     <MicrosoftNETILLinkTasksVersion>7.0.100-1.22270.1</MicrosoftNETILLinkTasksVersion>
+     <MicrosoftNETILLinkAnalyzerPackageVersion>$(MicrosoftNETILLinkTasksVersion)</MicrosoftNETILLinkAnalyzerPackageVersion>
+     <!-- ICU -->
+-    <MicrosoftNETCoreRuntimeICUTransportVersion>7.0.0-preview.5.22269.3</MicrosoftNETCoreRuntimeICUTransportVersion>
++    <MicrosoftNETCoreRuntimeICUTransportVersion>7.0.0-preview.6.22280.2</MicrosoftNETCoreRuntimeICUTransportVersion>
+     <!-- MsQuic -->
+     <SystemNetMsQuicTransportVersion>7.0.0-alpha.1.22273.1</SystemNetMsQuicTransportVersion>
+     <!-- Mono LLVM -->
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 1f08bf6d9c7..dc9b6fc8246 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -188,7 +188,8 @@
+ 
+     <ItemGroup>
+       <ICULibNativeFiles Include="$(ICULibDir)/libicuuc.a;
+-                                  $(ICULibDir)/libicui18n.a" />
++                                  $(ICULibDir)/libicui18n.a;
++                                  $(ICULibDir)/libicudata.a" />
+       <ICULibFiles Include="$(ICULibDir)/*.dat" />
+     </ItemGroup>
+     <PropertyGroup>
+-- 
+2.35.1
+
