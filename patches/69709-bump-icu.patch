@@ -1,4 +1,4 @@
-From cfbfbbd16e45040cadb4f1495b2653d001c77a15 Mon Sep 17 00:00:00 2001
+From a1264af4f89261f3ada3a71cb3207af40fd99a12 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
 Date: Tue, 31 May 2022 13:11:17 +0000
 Subject: [PATCH] chore: Update icu transport
@@ -6,7 +6,8 @@ Subject: [PATCH] chore: Update icu transport
 ---
  eng/Version.Details.xml | 4 ++--
  eng/Versions.props      | 2 +-
- 2 files changed, 3 insertions(+), 3 deletions(-)
+ src/mono/wasm/wasm.proj | 3 ++-
+ 3 files changed, 5 insertions(+), 4 deletions(-)
 
 diff --git a/eng/Version.Details.xml b/eng/Version.Details.xml
 index 2eae8221da9..2088b6ed22c 100644
@@ -36,6 +37,20 @@ index 53f4052e9f3..8380e016920 100644
      <!-- MsQuic -->
      <SystemNetMsQuicTransportVersion>7.0.0-alpha.1.22273.1</SystemNetMsQuicTransportVersion>
      <!-- Mono LLVM -->
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 1f08bf6d9c7..dc9b6fc8246 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -188,7 +188,8 @@
+ 
+     <ItemGroup>
+       <ICULibNativeFiles Include="$(ICULibDir)/libicuuc.a;
+-                                  $(ICULibDir)/libicui18n.a" />
++                                  $(ICULibDir)/libicui18n.a;
++                                  $(ICULibDir)/libicudata.a" />
+       <ICULibFiles Include="$(ICULibDir)/*.dat" />
+     </ItemGroup>
+     <PropertyGroup>
 -- 
 2.35.1
 
