@@ -88,7 +88,7 @@ jobs:
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\net7-debugger-compat.patch
         git apply ..\patches\69709-bump-icu.patch
-        git apply ..\patches\threading-atomics.patch
+        # git apply ..\patches\threading-atomics.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -112,7 +112,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -251,7 +251,7 @@ jobs:
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/net7-debugger-compat.patch
         git apply ../patches/69709-bump-icu.patch
-        git apply ../patches/threading-atomics.patch
+        # git apply ../patches/threading-atomics.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -278,7 +278,7 @@ jobs:
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$MONO_WASM_THREADS"
+        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$MONO_WASM_THREADS"
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
