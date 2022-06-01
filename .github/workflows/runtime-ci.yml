@@ -32,9 +32,8 @@ jobs:
 
     strategy:
       matrix:
-       include:
-         - BUILD_CONFIGURATION: Release
-         # - BUILD_CONFIGURATION: Debug # Not yet supported
+       BUILD_CONFIGURATION: [Release]
+       MONO_WASM_THREADS: ['true', '']
 
     steps:
     - name: Setup .NET SDK
@@ -52,6 +51,7 @@ jobs:
         echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $env:GITHUB_ENV
         echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
+        echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
 
     - name: Clone mono/linker
       run: |
@@ -111,7 +111,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -144,11 +144,15 @@ jobs:
 
     - name: Zip Archive
       run: |
+        if('${{ matrix.MONO_WASM_THREADS }}' -ne '') {
+            $archiveConfiguration="-threads";
+        }
+
         Invoke-Expression "Get-Location | select -ExpandProperty Path" | Out-String -NoNewLine -OutVariable Current_Path
         $ARTIFACTS_FOLDER="$Current_Path\ci-artifacts"
         mkdir -p $ARTIFACTS_FOLDER
         cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
-        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION.zip -Path *
+        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION$archiveConfiguration.zip -Path *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
@@ -166,9 +170,8 @@ jobs:
 
     strategy:
       matrix:
-       include:
-         - BUILD_CONFIGURATION: Release
-         # - BUILD_CONFIGURATION: Debug
+       BUILD_CONFIGURATION: [Release]
+       MONO_WASM_THREADS: ['true', '']
 
     steps:
     - name: Setup .NET SDK
@@ -210,6 +213,7 @@ jobs:
         echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $GITHUB_ENV
         echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
+        echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $GITHUB_ENV
 
     - name: Clone mono/linker
       run: |
@@ -272,7 +276,7 @@ jobs:
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS
+        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$MONO_WASM_THREADS"
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
@@ -303,10 +307,14 @@ jobs:
 
     - name: Zip Archive
       run: |
+        if [ '${{ matrix.MONO_WASM_THREADS }}' -ne '' ]; then
+            ARCHIVE_CONFIGURATION="-threads";
+        fi
+
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
         cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION.zip *
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
