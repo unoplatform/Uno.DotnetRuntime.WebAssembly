@@ -1,0 +1,24 @@
+From ec542cbdbcb1c6a31e0d8bb6cf9d7cfe496e272a Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Wed, 1 Jun 2022 15:03:30 +0000
+Subject: [PATCH] fix: Adjust for atomics support
+
+---
+ src/mono/wasm/wasm.proj | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index dc9b6fc8246..5353ab200de 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -149,6 +149,7 @@
+       <_EmccCommonFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-s USE_PTHREADS=1" />
+       <_EmccLinkFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-Wno-pthreads-mem-growth" />
+       <_EmccLinkFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE=2" />
++      <_EmccLinkFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-matomics" />
+       <_EmccLinkFlags Include="-s EXPORTED_FUNCTIONS=$(_DefaultExportedFunctions)" Condition="'$(_DefaultExportedFunctions)' != ''" />
+       <_EmccLinkFlags Include="--source-map-base http://example.com" />
+       <_EmccLinkFlags Include="-s STRICT_JS=1" />
+-- 
+2.35.1
+
