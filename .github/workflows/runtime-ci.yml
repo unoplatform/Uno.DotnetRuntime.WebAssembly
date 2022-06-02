@@ -11,7 +11,7 @@ on:
     branches:
       - master
       - release/**
-            
+
 env:
   EMSDK_VERSION: 3.1.7 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
   DOTNETRUNTIME_COMMIT: e96642078cfa9c68305ced1ee6accc1b0e0a9a9e
@@ -20,7 +20,7 @@ env:
   # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
   LINKER_COMMIT: da3c743a606b300c245c312c8cd9b3238d110d65
 
-  ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true'
+  ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
 jobs:
   ##
