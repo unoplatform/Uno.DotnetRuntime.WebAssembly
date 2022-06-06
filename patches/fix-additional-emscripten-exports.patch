@@ -8,18 +8,18 @@ Subject: [PATCH] fix: Export lengthBytesUTF8
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
-index 1874d88e957..10f03afbc94 100644
+index 8b309cd75c6..40391662d9e 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
-@@ -70,7 +70,7 @@
+@@ -150,7 +150,7 @@
        <_EmccLinkFlags Include="-s ALLOW_MEMORY_GROWTH=1" />
        <_EmccLinkFlags Include="-s NO_EXIT_RUNTIME=1" />
        <_EmccLinkFlags Include="-s FORCE_FILESYSTEM=1" />
 -      <_EmccLinkFlags Include="-s EXPORTED_RUNTIME_METHODS=&quot;['FS','print','ccall','cwrap','setValue','getValue','UTF8ToString','UTF8ArrayToString','FS_createPath','FS_createDataFile','removeRunDependency','addRunDependency', 'FS_readFile']&quot;"  />
 +      <_EmccLinkFlags Include="-s EXPORTED_RUNTIME_METHODS=&quot;['FS','print','ccall','cwrap','setValue','getValue','UTF8ToString','UTF8ArrayToString','FS_createPath','FS_createDataFile','removeRunDependency','addRunDependency', 'FS_readFile','lengthBytesUTF8','stringToUTF8','addFunction','removeFunction','IDBFS']&quot;" />
-       <_EmccCommonFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-s USE_PTHREADS=1" />
-       <_EmccLinkFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-Wno-pthreads-mem-growth" />
-       <_EmccLinkFlags Condition="'$(MonoWasmThreads)' == 'true'" Include="-s PTHREAD_POOL_SIZE=2" />
+       <_EmccLinkFlags Include="-s EXPORTED_FUNCTIONS=$(_DefaultExportedFunctions)" Condition="'$(_DefaultExportedFunctions)' != ''" />
+       <_EmccLinkFlags Include="--source-map-base http://example.com" />
+       <_EmccLinkFlags Include="-s STRICT_JS=1" />
 -- 
-2.21.0.windows.1
+2.35.1
 

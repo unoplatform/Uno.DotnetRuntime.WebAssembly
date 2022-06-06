@@ -1,6 +1,6 @@
-From 450fec40fab9ec5c1fd90430a9a12ddc27487eb3 Mon Sep 17 00:00:00 2001
+From 1a480197aeff8a8e7b2dc38a68e212d7b12869cb Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 26 May 2022 18:41:18 +0000
+Date: Mon, 6 Jun 2022 15:44:56 +0000
 Subject: [PATCH] chore: Adjust debugger net7
 
 ---
@@ -8,8 +8,9 @@ Subject: [PATCH] chore: Adjust debugger net7
  .../Common/FirefoxDebuggerConnection.cs                |  5 +++++
  .../BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs  | 10 ++++++++++
  .../BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs      |  5 +++++
+ .../debugger/BrowserDebugProxy/JObjectValueCreator.cs  |  4 ++++
  src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs  |  5 +++++
- 5 files changed, 30 insertions(+)
+ 6 files changed, 34 insertions(+)
 
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Common/DevToolsDebuggerConnection.cs
 index d6a658af441..dc45820618a 100644
@@ -78,7 +79,7 @@ index 6824ff38110..4670087d7c8 100644
          FirefoxMonoProxy.RunLoopStopped += (_, args) => ExitState = args;
          await FirefoxMonoProxy.RunForFirefox(ideClient: ideClient, browserPort, cts);
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
-index ba8cdf740ef..682e0d1c328 100644
+index ba8cdf740ef..2d477dbbc04 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs
 @@ -984,7 +984,12 @@ internal override async Task<bool> OnGetScriptSource(MessageId msg_id, string sc
@@ -94,11 +95,27 @@ index ba8cdf740ef..682e0d1c328 100644
              }
              await SendEvent(msg_id, "", JObject.FromObject(new { source, from = script_id }), token);
          }
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/JObjectValueCreator.cs b/src/mono/wasm/debugger/BrowserDebugProxy/JObjectValueCreator.cs
+index 523204d6ea8..d28b127e722 100644
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/JObjectValueCreator.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/JObjectValueCreator.cs
+@@ -77,7 +77,11 @@ public static JObject CreateFromPrimitiveType(object v)
+ 
+     public static JObject CreateNull(string className)
+     {
++#if NET7_0_OR_GREATER
+         ArgumentNullException.ThrowIfNull(className);
++#else
++        className = className ?? throw new ArgumentNullException(nameof(className));
++#endif
+         return Create<object>(value: null,
+                           type: "object",
+                           description: className,
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
-index c7ba8454716..e9a582b9d55 100644
+index 483b33025ef..cbbd70c01b9 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs
-@@ -1708,7 +1708,12 @@ internal virtual async Task<bool> OnGetScriptSource(MessageId msg_id, string scr
+@@ -1709,7 +1709,12 @@ internal virtual async Task<bool> OnGetScriptSource(MessageId msg_id, string scr
                          return false;
  
                      using (var reader = new StreamReader(data))
