@@ -105,16 +105,16 @@ index 0283672e7b3..4b07631d3b5 100644
  }
  
  void
- mono_profhelper_add_to_fd_set (fd_set *set, int fd, int *max_fd)
+ mono_profhelper_add_to_fd_set (fd_set *set, SOCKET fd, int *max_fd)
  {
 +#if !defined (HOST_WASM)
  	/*
  	 * This should only trigger for the basic FDs (server socket, pipes) at
  	 * startup if for some mysterious reason they're too large. In this case,
-@@ -99,4 +104,5 @@ mono_profhelper_add_to_fd_set (fd_set *set, int fd, int *max_fd)
+@@ -99,4 +104,5 @@ mono_profhelper_add_to_fd_set (fd_set *set, SOCKET fd, int *max_fd)
  
  	if (*max_fd < fd)
- 		*max_fd = fd;
+ 		*max_fd = (int)fd;
 +#endif
  }
 diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
