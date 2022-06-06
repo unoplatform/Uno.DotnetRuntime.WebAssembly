@@ -85,7 +85,6 @@ jobs:
         git apply ..\patches\fix-adjust-windows-build.patch
         git apply ..\patches\restore-jsinterop-invokejsunmarshalled.patch
         git apply ..\patches\fix-additional-emscripten-exports.patch
-        git apply ..\patches\fix-additional-emscripten-default-exports.patch
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\net7-debugger-compat.patch
         git apply ..\patches\69709-bump-icu.patch
@@ -244,7 +243,6 @@ jobs:
         git apply ../patches/dbg-proxy-net5.patch
         git apply ../patches/restore-jsinterop-invokejsunmarshalled.patch
         git apply ../patches/fix-additional-emscripten-exports.patch
-        git apply ../patches/fix-additional-emscripten-default-exports.patch
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/net7-debugger-compat.patch
         git apply ../patches/69709-bump-icu.patch
