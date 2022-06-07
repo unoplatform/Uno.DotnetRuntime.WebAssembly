@@ -309,7 +309,7 @@ jobs:
 
     - name: Zip Archive
       run: |
-        if [ '${{ matrix.MONO_WASM_THREADS }}' -ne '' ]; then
+        if [ '${{ matrix.MONO_WASM_THREADS }}' != '' ]; then
             ARCHIVE_CONFIGURATION="-threads";
         fi
 
