@@ -40,10 +40,10 @@ index 2920dd8de7b..f8de6b795df 100644
 -            console.log("determined url of main script to be " + hr);
 +            const hr = blazorDotNetJS[0].href; 
 +
-+            var slashIndex = hr.lastIndexOf('/');
++            const slashIndex = hr.lastIndexOf("/");
 +
 +            if(slashIndex != -1){
-+                var urlPathName = new URL(hr).pathname;
++                const urlPathName = new URL(hr).pathname;
 +
 +                module.mainScriptPath = urlPathName.substring(slashIndex+1);
 +                module.baseUrl = urlPathName.substring(0, slashIndex);                
