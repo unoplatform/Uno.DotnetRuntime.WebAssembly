@@ -1,96 +1,116 @@
-From 5b2ecab4f34ab05f3be1c1fb2747c3344b101dde Mon Sep 17 00:00:00 2001
+From 57bfac813ede5eaaf3a478b381fa557b36ac74fd Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Tue, 15 Feb 2022 17:01:44 -0500
+Date: Wed, 8 Jun 2022 02:13:58 +0000
 Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
- src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js |  3 +++
- src/mono/wasm/runtime/driver.c              |  6 ++++++
- src/mono/wasm/runtime/es6/dotnet.es6.lib.js |  3 +++
- src/mono/wasm/runtime/exports.ts            |  5 +++++
- src/mono/wasm/runtime/method-calls.ts       | 21 +++++++++++++++++++++
- 5 files changed, 38 insertions(+)
+ src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js |  4 +++
+ src/mono/wasm/runtime/driver.c              | 15 +++++++++
+ src/mono/wasm/runtime/es6/dotnet.es6.lib.js |  4 +++
+ src/mono/wasm/runtime/exports.ts            |  7 +++++
+ src/mono/wasm/runtime/method-calls.ts       | 35 +++++++++++++++++++++
+ 5 files changed, 65 insertions(+)
 
 diff --git a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
-index 93edd268995..cf48f0196ef 100644
+index ec39de8e376..436845cf098 100644
 --- a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
 +++ b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
-@@ -42,6 +42,9 @@ const linked_functions = [
+@@ -43,6 +43,10 @@ const linked_functions = [
      "mono_wasm_invoke_js_blazor",
      "mono_wasm_trace_logger",
  
 +    // Uno-platform specifc interop
 +    "mono_wasm_invoke_js_unmarshalled",
++    "mono_wasm_invoke_on_main_thread",
 +
      // corebindings.c
      "mono_wasm_invoke_js_with_args_ref",
      "mono_wasm_get_object_property_ref",
 diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
-index a84d1d9b0ec..5fc448415d6 100644
+index 32528ad0559..87b6baee4b6 100644
 --- a/src/mono/wasm/runtime/driver.c
 +++ b/src/mono/wasm/runtime/driver.c
-@@ -35,6 +35,9 @@ extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
+@@ -46,6 +46,11 @@ extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
  // Blazor specific custom routines - see dotnet_support.js for backing code
  extern void* mono_wasm_invoke_js_blazor (MonoString **exceptionMessage, void *callInfo, void* arg0, void* arg1, void* arg2);
  
 +// Uno specific interop
 +extern void* mono_wasm_invoke_js_unmarshalled (MonoString **exceptionMessage, MonoString *funcName, void* arg0, void* arg1, void* arg2);
++extern void mono_wasm_invoke_on_main_thread ();
++extern void mono_threads_wasm_async_run_in_main_thread (void (*func) (void));
 +
  void mono_wasm_enable_debugging (int);
  
  static int _marshal_type_from_mono_type (int mono_type, MonoClass *klass, MonoType *type);
-@@ -408,6 +411,9 @@ void mono_initialize_internals ()
+@@ -424,6 +429,12 @@ get_native_to_interp (MonoMethod *method, void *extra_arg)
+ 	return addr;
+ }
+ 
++void mono_wasm_proxy_invoke_on_main_thread() {
++#ifndef DISABLE_THREADS
++	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
++#endif
++}
++
+ void mono_initialize_internals ()
+ {
+ 	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
+@@ -432,6 +443,10 @@ void mono_initialize_internals ()
  	// Blazor specific custom routines - see dotnet_support.js for backing code
  	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
  
 +	// Uno Platform specific interop
 +	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeOnMainThread", mono_wasm_proxy_invoke_on_main_thread);
 +
  #ifdef CORE_BINDINGS
  	core_initialize_internals();
  #endif
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-index 98c6238cd3f..6ce5164f69e 100644
+index 47b59063b7b..533640dcf26 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 +++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-@@ -79,6 +79,9 @@ const linked_functions = [
+@@ -80,6 +80,10 @@ const linked_functions = [
      "mono_wasm_invoke_js_blazor",
      "mono_wasm_trace_logger",
  
 +    // Uno-platform specifc interop
 +    "mono_wasm_invoke_js_unmarshalled",
++    "mono_wasm_invoke_on_main_thread",
 +
      // corebindings.c
      "mono_wasm_invoke_js_with_args_ref",
      "mono_wasm_get_object_property_ref",
 diff --git a/src/mono/wasm/runtime/exports.ts b/src/mono/wasm/runtime/exports.ts
-index 5dc4d847db6..5c4108736cd 100644
+index 8a77c785c9c..9aa435833c3 100644
 --- a/src/mono/wasm/runtime/exports.ts
 +++ b/src/mono/wasm/runtime/exports.ts
-@@ -48,6 +48,8 @@ import {
+@@ -50,6 +50,9 @@ import {
      mono_wasm_get_by_index_ref, mono_wasm_get_global_object_ref, mono_wasm_get_object_property_ref,
      mono_wasm_invoke_js,
      mono_wasm_invoke_js_blazor,
 +    // Uno Platform specific interop
 +    mono_wasm_invoke_js_unmarshalled,
++    mono_wasm_invoke_on_main_thread,
      mono_wasm_invoke_js_with_args_ref, mono_wasm_set_by_index_ref, mono_wasm_set_object_property_ref
  } from "./method-calls";
  import { mono_wasm_typed_array_copy_to_ref, mono_wasm_typed_array_from_ref, mono_wasm_typed_array_copy_from_ref, mono_wasm_load_bytes_into_heap } from "./buffers";
-@@ -278,6 +280,9 @@ export const __linker_exports: any = {
+@@ -343,6 +346,10 @@ export const __linker_exports: any = {
      mono_wasm_invoke_js_blazor,
      mono_wasm_trace_logger,
  
 +    // Uno-platform specific interop
 +    mono_wasm_invoke_js_unmarshalled,
++    mono_wasm_invoke_on_main_thread,
 +
      // also keep in sync with corebindings.c
      mono_wasm_invoke_js_with_args_ref,
      mono_wasm_get_object_property_ref,
 diff --git a/src/mono/wasm/runtime/method-calls.ts b/src/mono/wasm/runtime/method-calls.ts
-index 3bd1057c1c1..9fe6f47ef3d 100644
+index 5b37c0ae017..a81ae56b6e4 100644
 --- a/src/mono/wasm/runtime/method-calls.ts
 +++ b/src/mono/wasm/runtime/method-calls.ts
-@@ -534,6 +534,27 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
+@@ -515,6 +515,41 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
      }
  }
  
@@ -115,9 +135,23 @@ index 3bd1057c1c1..9fe6f47ef3d 100644
 +    }
 +}
 +
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++export function mono_wasm_invoke_on_main_thread(): void {
++    const dotNetExports = (<any>globalThis).DotNet;
++    if (!dotNetExports) {
++        throw new Error("The Microsoft.JSInterop.js library is not loaded.");
++    }
++
++    if (!dotNetExports.invokeOnMainThread) {
++        throw new Error("The DotNet.invokeOnMainThread method is not available.");
++    }
++
++    dotNetExports.invokeOnMainThread();
++}
++
  // code like `App.call_test_method();`
  export function mono_wasm_invoke_js(code: MonoString, is_exception: Int32Ptr): MonoString | null {
      if (code === MonoStringNull)
 -- 
-2.21.0.windows.1
+2.35.1
 

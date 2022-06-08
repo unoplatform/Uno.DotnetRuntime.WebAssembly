@@ -1,0 +1,524 @@
+From 666ec0d6859d84cee27de5b8e2485ee777b6542e Mon Sep 17 00:00:00 2001
+From: Steve Pfister <steve.pfister@microsoft.com>
+Date: Mon, 2 May 2022 17:17:35 -0400
+Subject: [PATCH 01/10] [wasm] Add leg to build wasm with threading enabled
+
+Temporarily bring up a leg that build wasm with threading enabled.  This will allow us to make sure we aren't easily broken.
+---
+ eng/pipelines/runtime.yml | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/eng/pipelines/runtime.yml b/eng/pipelines/runtime.yml
+index 0e3b684676b1a..4d56b7275433d 100644
+--- a/eng/pipelines/runtime.yml
++++ b/eng/pipelines/runtime.yml
+@@ -394,6 +394,28 @@ jobs:
+       - Browser_wasm
+     alwaysRun: ${{ variables.isRollingBuild }}
+ 
++#
++# Temporarily add a leg that makes sure the wasm runtime with threading enabled
++# builds. We are working on making this a normal part of the wasm build.
++#
++- template: /eng/pipelines/common/platform-matrix.yml
++  parameters:
++    jobTemplate: /eng/pipelines/common/global-build-job.yml
++    buildConfig: release
++    runtimeFlavor: mono
++    platforms:
++      - Browser_wasm
++    jobParameters:
++      buildArgs: -s mono+libs -c $(_BuildConfig) /p:WasmEnableThreads=true
++      nameSuffix: Threading_AllSubsets_Mono
++      timeoutInMinutes: 180
++      condition: >-
++        or(
++          eq(dependencies.evaluate_paths.outputs['SetPathVars_libraries.containsChange'], true),
++          eq(dependencies.evaluate_paths.outputs['SetPathVars_mono.containsChange'], true),
++          eq(dependencies.evaluate_paths.outputs['SetPathVars_installer.containsChange'], true),
++          eq(variables['isRollingBuild'], true))
++
+ #
+ # iOS/tvOS devices - Full AOT + AggressiveTrimming to reduce size
+ # Build the whole product using Mono and run libraries tests
+
+From 3999c7b3e57372c2ba894fbfb194532e8088009f Mon Sep 17 00:00:00 2001
+From: Steve Pfister <steve.pfister@microsoft.com>
+Date: Mon, 2 May 2022 18:20:29 -0400
+Subject: [PATCH 02/10] move set_stack_size declaration to get rid of warning
+
+---
+ src/mono/mono/utils/mono-threads-wasm.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/mono/mono/utils/mono-threads-wasm.c b/src/mono/mono/utils/mono-threads-wasm.c
+index a6b6552032bc5..1877a86f9040f 100644
+--- a/src/mono/mono/utils/mono-threads-wasm.c
++++ b/src/mono/mono/utils/mono-threads-wasm.c
+@@ -229,13 +229,14 @@ mono_thread_platform_create_thread (MonoThreadStart thread_fn, gpointer thread_d
+ 	pthread_attr_t attr;
+ 	pthread_t thread;
+ 	gint res;
+-	gsize set_stack_size;
+ 
+ 	res = pthread_attr_init (&attr);
+ 	if (res != 0)
+ 		g_error ("%s: pthread_attr_init failed, error: \"%s\" (%d)", __func__, g_strerror (res), res);
+ 
+ #if 0
++	gsize set_stack_size;
++
+ 	if (stack_size)
+ 		set_stack_size = *stack_size;
+ 	else
+
+From c2667495ddbfc8cc48a1f5847805197792cea748 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aleksey=20Kliger=20=28=CE=BBgeek=29?= <alklig@microsoft.com>
+Date: Wed, 1 Jun 2022 19:36:34 +0000
+Subject: [PATCH 03/10] enable post-MVP wasm-opt features if threading is
+ enabled
+
+---
+ src/mono/wasm/build/WasmApp.Native.targets |  7 ++-
+ src/mono/wasm/runtime/CMakeLists.txt       |  4 +-
+ src/mono/wasm/wasm.proj                    | 56 +++++++++++++---------
+ 3 files changed, 43 insertions(+), 24 deletions(-)
+
+diff --git a/src/mono/wasm/build/WasmApp.Native.targets b/src/mono/wasm/build/WasmApp.Native.targets
+index 91eda97f31f04..eb9f97b8d418e 100644
+--- a/src/mono/wasm/build/WasmApp.Native.targets
++++ b/src/mono/wasm/build/WasmApp.Native.targets
+@@ -428,7 +428,7 @@
+     </ItemGroup>
+ 
+     <Message Text="Stripping symbols from dotnet.wasm ..." Importance="High" Condition="'$(WasmNativeStrip)' == 'true'" />
+-    <Exec Command='wasm-opt$(_ExeExt) --enable-simd --enable-exception-handling --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
++    <Exec Command='wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags->'%(Identity)', ' ') --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
+           Condition="'$(WasmNativeStrip)' == 'true'"
+           IgnoreStandardErrorWarningFormat="true"
+           EnvironmentVariables="@(EmscriptenEnvVars)" />
+@@ -452,12 +452,17 @@
+ 
+     <ReadEmccProps JsonFilePath="$(_WasmRuntimePackSrcDir)emcc-props.json">
+       <Output TaskParameter="EmccProperties" ItemName="_EmccPropItems" />
++      <Output TaskParameter="WasmOptConfigurationFlags" = "_WasmOptConfigurationFlagsItems" />
+     </ReadEmccProps>
+ 
+     <CreateProperty Value="%(_EmccPropItems.Value)">
+       <Output TaskParameter="Value" PropertyName="%(_EmccPropItems.Identity)" />
+     </CreateProperty>
+ 
++    <CreateProperty Value="%(_WasmOptConfigurationFlagsItems.Value)">
++      <Output TaskParameter="Value" PropertyName="%(_WasmOptConfigurationFlagsItems.Identity)" />
++    </CreateProperty>
++
+     <Error Condition="'$(RuntimeEmccVersionRaw)' == ''"
+            Text="%24(RuntimeEmccVersionRaw) is not set. '$(_EmccPropsPath)' should have set that."/>
+ 
+diff --git a/src/mono/wasm/runtime/CMakeLists.txt b/src/mono/wasm/runtime/CMakeLists.txt
+index b55a14d2eb5f9..f857028e5ad57 100644
+--- a/src/mono/wasm/runtime/CMakeLists.txt
++++ b/src/mono/wasm/runtime/CMakeLists.txt
+@@ -35,7 +35,9 @@ set_target_properties(dotnet PROPERTIES
+     RUNTIME_OUTPUT_DIRECTORY "${NATIVE_BIN_DIR}")
+ 
+ if(CMAKE_BUILD_TYPE STREQUAL "Release")
+-    add_custom_command(TARGET dotnet POST_BUILD COMMAND ${EMSDK_PATH}/upstream/bin/wasm-opt ${WASM_OPT_ADDITIONAL_FLAGS} --enable-exception-handling --strip-dwarf ${NATIVE_BIN_DIR}/dotnet.wasm -o ${NATIVE_BIN_DIR}/dotnet.wasm)
++    add_custom_command(TARGET dotnet
++                        POST_BUILD COMMAND ${EMSDK_PATH}/upstream/bin/wasm-opt --enable-exception-handling ${CONFIGURATION_WASM_OPT_FLAGS} --strip-dwarf ${NATIVE_BIN_DIR}/dotnet.wasm -o ${NATIVE_BIN_DIR}/dotnet.wasm
++                        COMMENT "Stripping debug symbols from dotnet.wasm using wasm-opt")
+ endif()
+ 
+ configure_file(wasm-config.h.in include/wasm/wasm-config.h)
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 8b309cd75c640..dccebb7bc17ec 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -49,7 +49,7 @@
+       InputDirectory="$([MSBuild]::NormalizePath('$(PkgSystem_Runtime_TimeZoneData)', 'contentFiles', 'any', 'any', 'data'))"
+       OutputFileName="$(TimeZonesDataPath)" />
+   </Target>
+-  
++
+   <UsingTask TaskName="ManagedToNativeGenerator" AssemblyFile="$(WasmAppBuilderTasksAssemblyPath)" />
+   <Target Name="GenerateManagedToNative" DependsOnTargets="CheckEnv;ResolveLibrariesFromLocalBuild">
+     <PropertyGroup>
+@@ -72,7 +72,7 @@
+     </MSBuild>
+ 
+     <MakeDir Directories="$(WasmObjDir)" Condition="!Exists('$(WasmObjDir)')" />
+-    
++
+     <ManagedToNativeGenerator
+       Assemblies="@(WasmPInvokeAssembly)"
+       PInvokeModules="@(WasmPInvokeModule)"
+@@ -106,29 +106,12 @@
+       <_EmccVersionHash>$([System.Text.RegularExpressions.Regex]::Match($(_EmccVersionRaw), $(_EmccVersionRegexPattern)).Groups[2].Value)</_EmccVersionHash>
+     </PropertyGroup>
+ 
+-    <Error Text="Failed to parse emcc version, and hash from the full version string: '$(_EmccVersionRaw)'"
+-           Condition="'$(_EmccVersion)' == '' or '$(_EmccVersionHash)' == ''" />
+-
+     <PropertyGroup>
+-      <_EmccPropsJson>
+-<![CDATA[
+-{
+-  "items": {
+-    "EmccProperties": [
+-      { "identity": "RuntimeEmccVersion",     "value": "$(_EmccVersion)" },
+-      { "identity": "RuntimeEmccVersionRaw",  "value": "$(_EmccVersionRaw)" },
+-      { "identity": "RuntimeEmccVersionHash", "value": "$(_EmccVersionHash)" }
+-    ]
+-  }
+-}
+-]]>
+-      </_EmccPropsJson>
++        <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags)</_WasmOptConfigurationFlags>
+     </PropertyGroup>
+ 
+-    <WriteLinesToFile File="$(NativeBinDir)src\emcc-props.json"
+-                      Lines="$(_EmccPropsJson)"
+-                      Overwrite="true"
+-                      WriteOnlyWhenDifferent="true" />
++    <Error Text="Failed to parse emcc version, and hash from the full version string: '$(_EmccVersionRaw)'"
++           Condition="'$(_EmccVersion)' == '' or '$(_EmccVersionHash)' == ''" />
+ 
+     <PropertyGroup>
+       <_DefaultExportedFunctions Condition="$([MSBuild]::VersionGreaterThanOrEquals('$(_EmccVersion)', '3.1.7'))"
+@@ -160,6 +143,10 @@
+       <_EmccLinkFlags Include="-s ENVIRONMENT=&quot;web,webview,worker,node,shell&quot;" />
+     </ItemGroup>
+ 
++    <ItemGroup Condition="'$(MonoWasmThreads)' == 'true'">
++      <WasmOptConfigurationFlags Include="--enable-threads;--enable-bulk-memory;--enable-sign-ext" />
++    </ItemGroup>
++
+     <ItemGroup Condition="'$(OS)' != 'Windows_NT'">
+       <_EmccLinkFlags Include="--profiling-funcs" />
+       <_EmccFlags Include="@(_EmccCommonFlags)" />
+@@ -169,6 +156,30 @@
+       <_EmccFlags Include="@(_EmccCommonFlags)" />
+     </ItemGroup>
+ 
++    <PropertyGroup>
++      <_EmccPropsJson>
++<![CDATA[
++{
++  "items": {
++    "EmccProperties": [
++      { "identity": "RuntimeEmccVersion",     "value": "$(_EmccVersion)" },
++      { "identity": "RuntimeEmccVersionRaw",  "value": "$(_EmccVersionRaw)" },
++      { "identity": "RuntimeEmccVersionHash", "value": "$(_EmccVersionHash)" }
++    ],
++    "WasmOptConfigurationFlags": [
++      { "identity": "WasmOptConfigurationFlags", "value": "@(WasmOptConfigurationFlags->'%(Identity)', ';')" }
++    ]
++  }
++}
++]]>
++      </_EmccPropsJson>
++    </PropertyGroup>
++
++    <WriteLinesToFile File="$(NativeBinDir)src\emcc-props.json"
++                      Lines="$(_EmccPropsJson)"
++                      Overwrite="true"
++                      WriteOnlyWhenDifferent="true" />
++
+     <WriteLinesToFile File="$(_EmccDefaultsRspPath)"
+                       Lines="@(_EmccFlags)"
+                       WriteOnlyWhenDifferent="true"
+@@ -210,6 +221,7 @@
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCMAKE_BUILD_TYPE=$(Configuration)</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_EMCC_FLAGS=&quot;$(CMakeConfigurationEmccFlags)&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_LINK_FLAGS=&quot;$(CMakeConfigurationLinkFlags)&quot;</CMakeBuildRuntimeConfigureCmd>
++      <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_WASM_OPT_FLAGS=&quot;@(WasmOptConfigurationFlags->'%(Identity)', ';')&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_INCLUDES=&quot;$(MonoArtifactsPath)include/mono-2.0&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_OBJ_INCLUDES=&quot;$(MonoObjDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DICU_LIB_DIR=&quot;$(ICULibDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+
+From 6d744a51d26f621c5bc1ccbaa7834dc90174b085 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aleksey=20Kliger=20=28=CE=BBgeek=29?= <alklig@microsoft.com>
+Date: Wed, 1 Jun 2022 19:50:04 +0000
+Subject: [PATCH 04/10] fixup
+
+---
+ src/mono/wasm/build/WasmApp.Native.targets | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/build/WasmApp.Native.targets b/src/mono/wasm/build/WasmApp.Native.targets
+index eb9f97b8d418e..c6eb36a7c21f4 100644
+--- a/src/mono/wasm/build/WasmApp.Native.targets
++++ b/src/mono/wasm/build/WasmApp.Native.targets
+@@ -427,6 +427,11 @@
+       <FileWrites Include="$(_WasmIntermediateOutputPath)dotnet.js.symbols" Condition="'$(WasmEmitSymbolMap)' == 'true'" />
+     </ItemGroup>
+ 
++    <ItemGroup>
++        <!-- WasmOptConfigurationFlags property is set by reading from emcc-props.json -->
++        <WasmOptConfigurationFlags Condition="'$(WasmOptConfigurationFlags)' != ''" Include="$(WasmOptConfigurationFlags)" />
++    </ItemGroup>
++
+     <Message Text="Stripping symbols from dotnet.wasm ..." Importance="High" Condition="'$(WasmNativeStrip)' == 'true'" />
+     <Exec Command='wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags->'%(Identity)', ' ') --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
+           Condition="'$(WasmNativeStrip)' == 'true'"
+@@ -452,7 +457,7 @@
+ 
+     <ReadEmccProps JsonFilePath="$(_WasmRuntimePackSrcDir)emcc-props.json">
+       <Output TaskParameter="EmccProperties" ItemName="_EmccPropItems" />
+-      <Output TaskParameter="WasmOptConfigurationFlags" = "_WasmOptConfigurationFlagsItems" />
++      <Output TaskParameter="WasmOptConfigurationFlags" ItemName= "_WasmOptConfigurationFlagsItems" />
+     </ReadEmccProps>
+ 
+     <CreateProperty Value="%(_EmccPropItems.Value)">
+
+From ac7cca3069f488a5bb421e2b38f6833174001177 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aleksey=20Kliger=20=28=CE=BBgeek=29?= <alklig@microsoft.com>
+Date: Wed, 1 Jun 2022 20:14:54 +0000
+Subject: [PATCH 05/10] more fixups
+
+---
+ src/mono/wasm/wasm.proj | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index dccebb7bc17ec..e8e54a0c77464 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -106,10 +106,6 @@
+       <_EmccVersionHash>$([System.Text.RegularExpressions.Regex]::Match($(_EmccVersionRaw), $(_EmccVersionRegexPattern)).Groups[2].Value)</_EmccVersionHash>
+     </PropertyGroup>
+ 
+-    <PropertyGroup>
+-        <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags)</_WasmOptConfigurationFlags>
+-    </PropertyGroup>
+-
+     <Error Text="Failed to parse emcc version, and hash from the full version string: '$(_EmccVersionRaw)'"
+            Condition="'$(_EmccVersion)' == '' or '$(_EmccVersionHash)' == ''" />
+ 
+@@ -157,6 +153,7 @@
+     </ItemGroup>
+ 
+     <PropertyGroup>
++      <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags->'%(Identity)', '; ') </_WasmOptConfigurationFlags>
+       <_EmccPropsJson>
+ <![CDATA[
+ {
+@@ -167,7 +164,7 @@
+       { "identity": "RuntimeEmccVersionHash", "value": "$(_EmccVersionHash)" }
+     ],
+     "WasmOptConfigurationFlags": [
+-      { "identity": "WasmOptConfigurationFlags", "value": "@(WasmOptConfigurationFlags->'%(Identity)', ';')" }
++      { "identity": "WasmOptConfigurationFlags", "value": "$(_WasmOptConfigurationFlags)" }
+     ]
+   }
+ }
+
+From 8ab90302fda4e7cc9a86aaeab9286f8b51ad79bc Mon Sep 17 00:00:00 2001
+From: Aleksey Kliger <alklig@microsoft.com>
+Date: Wed, 1 Jun 2022 16:35:58 -0400
+Subject: [PATCH 06/10] Use a different way of escaping emcc-props.json
+ semicolons
+
+---
+ src/mono/wasm/wasm.proj | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index e8e54a0c77464..73ef23ed78764 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -153,7 +153,7 @@
+     </ItemGroup>
+ 
+     <PropertyGroup>
+-      <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags->'%(Identity)', '; ') </_WasmOptConfigurationFlags>
++      <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags->'%(Identity)', '%3B ') </_WasmOptConfigurationFlags>
+       <_EmccPropsJson>
+ <![CDATA[
+ {
+
+From 8c3844c9e0ca482b4555c45e5adc3a69b2b9b69d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aleksey=20Kliger=20=28=CE=BBgeek=29?= <akliger@gmail.com>
+Date: Wed, 1 Jun 2022 19:35:27 -0400
+Subject: [PATCH 07/10] msbuild fixes from code review
+
+Co-authored-by: Ankit Jain <radical@gmail.com>
+---
+ src/mono/wasm/build/WasmApp.Native.targets | 6 +++---
+ src/mono/wasm/wasm.proj                    | 4 ++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/mono/wasm/build/WasmApp.Native.targets b/src/mono/wasm/build/WasmApp.Native.targets
+index c6eb36a7c21f4..3a7c2e075f431 100644
+--- a/src/mono/wasm/build/WasmApp.Native.targets
++++ b/src/mono/wasm/build/WasmApp.Native.targets
+@@ -428,12 +428,12 @@
+     </ItemGroup>
+ 
+     <ItemGroup>
+-        <!-- WasmOptConfigurationFlags property is set by reading from emcc-props.json -->
+-        <WasmOptConfigurationFlags Condition="'$(WasmOptConfigurationFlags)' != ''" Include="$(WasmOptConfigurationFlags)" />
++      <!-- WasmOptConfigurationFlags property is set by reading from emcc-props.json -->
++      <WasmOptConfigurationFlags Condition="'$(WasmOptConfigurationFlags)' != ''" Include="$(WasmOptConfigurationFlags)" />
+     </ItemGroup>
+ 
+     <Message Text="Stripping symbols from dotnet.wasm ..." Importance="High" Condition="'$(WasmNativeStrip)' == 'true'" />
+-    <Exec Command='wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags->'%(Identity)', ' ') --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
++    <Exec Command='wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags, ' ') --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
+           Condition="'$(WasmNativeStrip)' == 'true'"
+           IgnoreStandardErrorWarningFormat="true"
+           EnvironmentVariables="@(EmscriptenEnvVars)" />
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index 73ef23ed78764..3515a1113fec1 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -153,7 +153,7 @@
+     </ItemGroup>
+ 
+     <PropertyGroup>
+-      <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags->'%(Identity)', '%3B ') </_WasmOptConfigurationFlags>
++      <_WasmOptConfigurationFlags>@(WasmOptConfigurationFlags, '%3B ') </_WasmOptConfigurationFlags>
+       <_EmccPropsJson>
+ <![CDATA[
+ {
+@@ -218,7 +218,7 @@
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCMAKE_BUILD_TYPE=$(Configuration)</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_EMCC_FLAGS=&quot;$(CMakeConfigurationEmccFlags)&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_LINK_FLAGS=&quot;$(CMakeConfigurationLinkFlags)&quot;</CMakeBuildRuntimeConfigureCmd>
+-      <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_WASM_OPT_FLAGS=&quot;@(WasmOptConfigurationFlags->'%(Identity)', ';')&quot;</CMakeBuildRuntimeConfigureCmd>
++      <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DCONFIGURATION_WASM_OPT_FLAGS=&quot;@(WasmOptConfigurationFlags, ';')&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_INCLUDES=&quot;$(MonoArtifactsPath)include/mono-2.0&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_OBJ_INCLUDES=&quot;$(MonoObjDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DICU_LIB_DIR=&quot;$(ICULibDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+
+From fd14d9988909191c5548f709b9722d3b70386a8e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Aleksey=20Kliger=20=28=CE=BBgeek=29?= <akliger@gmail.com>
+Date: Wed, 1 Jun 2022 23:15:29 -0400
+Subject: [PATCH 08/10] fix quoting in WasmApp.Native.targets
+
+---
+ src/mono/wasm/build/WasmApp.Native.targets | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/build/WasmApp.Native.targets b/src/mono/wasm/build/WasmApp.Native.targets
+index 3a7c2e075f431..57280e54cae54 100644
+--- a/src/mono/wasm/build/WasmApp.Native.targets
++++ b/src/mono/wasm/build/WasmApp.Native.targets
+@@ -433,7 +433,7 @@
+     </ItemGroup>
+ 
+     <Message Text="Stripping symbols from dotnet.wasm ..." Importance="High" Condition="'$(WasmNativeStrip)' == 'true'" />
+-    <Exec Command='wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags, ' ') --strip-dwarf "$(_WasmIntermediateOutputPath)dotnet.wasm" -o "$(_WasmIntermediateOutputPath)dotnet.wasm"'
++    <Exec Command="wasm-opt$(_ExeExt) --enable-exception-handling @(WasmOptConfigurationFlags, ' ') --strip-dwarf &quot;$(_WasmIntermediateOutputPath)dotnet.wasm&quot; -o &quot;$(_WasmIntermediateOutputPath)dotnet.wasm&quot;"
+           Condition="'$(WasmNativeStrip)' == 'true'"
+           IgnoreStandardErrorWarningFormat="true"
+           EnvironmentVariables="@(EmscriptenEnvVars)" />
+
+From f3a59812b541b8e09cf9f26c5d6cc1c0a3c2e9a5 Mon Sep 17 00:00:00 2001
+From: Aleksey Kliger <aleksey@lambdageek.org>
+Date: Thu, 2 Jun 2022 00:20:36 -0400
+Subject: [PATCH 09/10] declare the ReadEmccProps tasks' wasm opt flags item
+ list
+
+---
+ src/mono/wasm/build/WasmApp.Native.targets | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/mono/wasm/build/WasmApp.Native.targets b/src/mono/wasm/build/WasmApp.Native.targets
+index 57280e54cae54..104dcd3aad771 100644
+--- a/src/mono/wasm/build/WasmApp.Native.targets
++++ b/src/mono/wasm/build/WasmApp.Native.targets
+@@ -640,6 +640,7 @@
+              TaskFactory="JsonToItemsTaskFactory.JsonToItemsTaskFactory">
+     <ParameterGroup>
+       <EmccProperties ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="false" Output="true" />
++      <WasmOptConfigurationFlags ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="false" Output="true" />
+     </ParameterGroup>
+   </UsingTask>
+ </Project>
+
+From b6c009fd5d0847e1dc47fb43c48ec1160e107b05 Mon Sep 17 00:00:00 2001
+From: Steve Pfister <steve.pfister@microsoft.com>
+Date: Mon, 6 Jun 2022 17:40:16 -0400
+Subject: [PATCH 10/10] Add separate lanes in runtime-wasm.yml that can be
+ manually triggered
+
+---
+ .../runtime-extra-platforms-wasm.yml          | 30 +++++++++++++++++++
+ eng/pipelines/runtime.yml                     | 22 --------------
+ 2 files changed, 30 insertions(+), 22 deletions(-)
+
+diff --git a/eng/pipelines/runtime-extra-platforms-wasm.yml b/eng/pipelines/runtime-extra-platforms-wasm.yml
+index ea765747cf498..935dac010d840 100644
+--- a/eng/pipelines/runtime-extra-platforms-wasm.yml
++++ b/eng/pipelines/runtime-extra-platforms-wasm.yml
+@@ -65,6 +65,36 @@ jobs:
+         - WasmTestOnBrowser
+         - WasmTestOnNodeJs
+ 
++  # Library tests with full threading 
++  - template: /eng/pipelines/common/templates/wasm-library-tests.yml
++    parameters:
++      platforms:
++        - Browser_wasm
++        #- Browser_wasm_win
++      nameSuffix: _Threading
++      extraBuildArgs: /p:WasmEnableThreads=true
++      # Don't run for rolling builds, as this is covered
++      alwaysRun: ${{ parameters.isWasmOnlyBuild }}
++      scenarios:
++        - normal
++        - WasmTestOnBrowser
++        - WasmTestOnNodeJs
++
++  # Library tests with internal threads only
++  - template: /eng/pipelines/common/templates/wasm-library-tests.yml
++    parameters:
++      platforms:
++        - Browser_wasm
++        #- Browser_wasm_win
++      nameSuffix: _Threading_PerfTracing
++      extraBuildArgs: /p:WasmEnablePerfTracing=true
++      # Don't run for rolling builds, as this is covered
++      alwaysRun: ${{ parameters.isWasmOnlyBuild }}
++      scenarios:
++        - normal
++        - WasmTestOnBrowser
++        - WasmTestOnNodeJs
++
+   # EAT Library tests - only run on linux
+   - template: /eng/pipelines/common/templates/wasm-library-aot-tests.yml
+     parameters:
+diff --git a/eng/pipelines/runtime.yml b/eng/pipelines/runtime.yml
+index 4d56b7275433d..0e3b684676b1a 100644
+--- a/eng/pipelines/runtime.yml
++++ b/eng/pipelines/runtime.yml
+@@ -394,28 +394,6 @@ jobs:
+       - Browser_wasm
+     alwaysRun: ${{ variables.isRollingBuild }}
+ 
+-#
+-# Temporarily add a leg that makes sure the wasm runtime with threading enabled
+-# builds. We are working on making this a normal part of the wasm build.
+-#
+-- template: /eng/pipelines/common/platform-matrix.yml
+-  parameters:
+-    jobTemplate: /eng/pipelines/common/global-build-job.yml
+-    buildConfig: release
+-    runtimeFlavor: mono
+-    platforms:
+-      - Browser_wasm
+-    jobParameters:
+-      buildArgs: -s mono+libs -c $(_BuildConfig) /p:WasmEnableThreads=true
+-      nameSuffix: Threading_AllSubsets_Mono
+-      timeoutInMinutes: 180
+-      condition: >-
+-        or(
+-          eq(dependencies.evaluate_paths.outputs['SetPathVars_libraries.containsChange'], true),
+-          eq(dependencies.evaluate_paths.outputs['SetPathVars_mono.containsChange'], true),
+-          eq(dependencies.evaluate_paths.outputs['SetPathVars_installer.containsChange'], true),
+-          eq(variables['isRollingBuild'], true))
+-
+ #
+ # iOS/tvOS devices - Full AOT + AggressiveTrimming to reduce size
+ # Build the whole product using Mono and run libraries tests

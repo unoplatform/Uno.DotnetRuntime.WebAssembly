@@ -1,0 +1,91 @@
+From 1d38f11925182268b16de690e0b8458c2bc12b1f Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Tue, 7 Jun 2022 18:07:20 +0000
+Subject: [PATCH] fix: Add support for baseUrl configuration
+
+---
+ src/mono/wasm/runtime/crypto-worker.ts |  2 +-
+ src/mono/wasm/runtime/startup.ts       | 23 +++++++++++++++++++----
+ src/mono/wasm/runtime/types.ts         | 11 +++++++++++
+ 3 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/src/mono/wasm/runtime/crypto-worker.ts b/src/mono/wasm/runtime/crypto-worker.ts
+index ea7bd9e6fce..c7b215003a3 100644
+--- a/src/mono/wasm/runtime/crypto-worker.ts
++++ b/src/mono/wasm/runtime/crypto-worker.ts
+@@ -41,7 +41,7 @@ export function init_crypto(): void {
+         console.debug("MONO_WASM: Initializing Crypto WebWorker");
+ 
+         const chan = LibraryChannel.create(1024); // 1024 is the buffer size in char units.
+-        const worker = new Worker("dotnet-crypto-worker.js");
++        const worker = new Worker(`${Module.baseUrl}dotnet-crypto-worker.js`);
+         mono_wasm_crypto = {
+             channel: chan,
+             worker: worker,
+diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
+index 2920dd8de7b..f8de6b795df 100644
+--- a/src/mono/wasm/runtime/startup.ts
++++ b/src/mono/wasm/runtime/startup.ts
+@@ -36,18 +36,33 @@ export function configure_emscripten_startup(module: DotnetModule, exportedAPI:
+         (typeof (globalThis.document) === "object") &&
+         (typeof (globalThis.document.createElement) === "function")
+     ) {
++        module.baseUrl = module.baseUrl || "./";
++        module.mainScriptPath = module.mainScriptPath || "dotnet.js";
++
+         // blazor injects a module preload link element for dotnet.[version].[sha].js
+         const blazorDotNetJS = Array.from(document.head.getElementsByTagName("link")).filter(elt => elt.rel !== undefined && elt.rel == "modulepreload" && elt.href !== undefined && elt.href.indexOf("dotnet") != -1 && elt.href.indexOf(".js") != -1);
+         if (blazorDotNetJS.length == 1) {
+-            const hr = blazorDotNetJS[0].href;
+-            console.log("determined url of main script to be " + hr);
++            const hr = blazorDotNetJS[0].href; 
++
++            const slashIndex = hr.lastIndexOf("/");
++
++            if(slashIndex != -1){
++                const urlPathName = new URL(hr).pathname;
++
++                module.mainScriptPath = urlPathName.substring(slashIndex+1);
++                module.baseUrl = urlPathName.substring(0, slashIndex);                
++            } else {
++                module.mainScriptPath = hr;
++            }
++
+             (<any>module)["mainScriptUrlOrBlob"] = hr;
+         } else {
+             const temp = globalThis.document.createElement("a");
+-            temp.href = "dotnet.js";
+-            console.log("determined url of main script to be " + temp.href);
++            temp.href = `${module.baseUrl}${module.mainScriptPath}`;
+             (<any>module)["mainScriptUrlOrBlob"] = temp.href;
+         }
++
++        console.debug("determined url of main script to be " + (<any>module)["mainScriptUrlOrBlob"]);
+     }
+ 
+     // these could be overriden on DotnetModuleConfig
+diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types.ts
+index 8fb000c1982..481c9119f3f 100644
+--- a/src/mono/wasm/runtime/types.ts
++++ b/src/mono/wasm/runtime/types.ts
+@@ -198,6 +198,17 @@ export type DotnetModuleConfig = {
+ 
+     config?: MonoConfig | MonoConfigError,
+     configSrc?: string,
++
++    /**
++     * Base url for the app, defaults to `./` and must contain a trailing slash
++     */
++    baseUrl?: string,
++
++    /**
++     * main script path from baseUrl, defaults to `dotnet.js`
++     */
++    mainScriptPath?: string,
++    
+     onConfigLoaded?: (config: MonoConfig) => Promise<void>;
+     onDotnetReady?: () => void;
+ 
+-- 
+2.35.1
+
