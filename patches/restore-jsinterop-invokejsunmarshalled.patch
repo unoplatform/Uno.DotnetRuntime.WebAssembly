@@ -1,15 +1,15 @@
-From 57bfac813ede5eaaf3a478b381fa557b36ac74fd Mon Sep 17 00:00:00 2001
+From d4d6e322e6524b603d714ec5182ddd3d39e18657 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome.laban@nventive.com>
-Date: Wed, 8 Jun 2022 02:13:58 +0000
+Date: Thu, 9 Jun 2022 17:06:54 +0000
 Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
  src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js |  4 +++
- src/mono/wasm/runtime/driver.c              | 15 +++++++++
+ src/mono/wasm/runtime/driver.c              | 18 +++++++++++
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js |  4 +++
  src/mono/wasm/runtime/exports.ts            |  7 +++++
  src/mono/wasm/runtime/method-calls.ts       | 35 +++++++++++++++++++++
- 5 files changed, 65 insertions(+)
+ 5 files changed, 68 insertions(+)
 
 diff --git a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
 index ec39de8e376..436845cf098 100644
@@ -27,7 +27,7 @@ index ec39de8e376..436845cf098 100644
      "mono_wasm_invoke_js_with_args_ref",
      "mono_wasm_get_object_property_ref",
 diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
-index 32528ad0559..87b6baee4b6 100644
+index 32528ad0559..ded72202358 100644
 --- a/src/mono/wasm/runtime/driver.c
 +++ b/src/mono/wasm/runtime/driver.c
 @@ -46,6 +46,11 @@ extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
@@ -42,7 +42,7 @@ index 32528ad0559..87b6baee4b6 100644
  void mono_wasm_enable_debugging (int);
  
  static int _marshal_type_from_mono_type (int mono_type, MonoClass *klass, MonoType *type);
-@@ -424,6 +429,12 @@ get_native_to_interp (MonoMethod *method, void *extra_arg)
+@@ -424,6 +429,15 @@ get_native_to_interp (MonoMethod *method, void *extra_arg)
  	return addr;
  }
  
@@ -50,15 +50,15 @@ index 32528ad0559..87b6baee4b6 100644
 +#ifndef DISABLE_THREADS
 +	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
 +#else
-+    printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
-+    assert(0);
++	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
++	assert(0);
 +#endif
 +}
 +
  void mono_initialize_internals ()
  {
  	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
-@@ -432,6 +443,10 @@ void mono_initialize_internals ()
+@@ -432,6 +446,10 @@ void mono_initialize_internals ()
  	// Blazor specific custom routines - see dotnet_support.js for backing code
  	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
  
