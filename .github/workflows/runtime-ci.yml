@@ -90,6 +90,7 @@ jobs:
         git apply ..\patches\69709-bump-icu.patch
         git apply ..\patches\pr-68787.patch
         git apply ..\patches\70375-baseUrl-configuration.patch
+        git apply ..\patches\fix-threads-aot-safepoints.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -254,6 +255,7 @@ jobs:
         git apply ../patches/69709-bump-icu.patch
         git apply ../patches/pr-68787.patch
         git apply ../patches/70375-baseUrl-configuration.patch
+        git apply ../patches/fix-threads-aot-safepoints.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
