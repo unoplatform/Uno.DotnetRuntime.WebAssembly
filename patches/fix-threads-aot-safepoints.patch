@@ -1,0 +1,25 @@
+From b4c9169a3e2917f9f71e0f319a930d0942cf3822 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Thu, 9 Jun 2022 14:46:03 +0000
+Subject: [PATCH] fix: Enable AOT safepoints when threading is available
+
+---
+ src/mono/mono/mini/mini.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/mono/mini/mini.h b/src/mono/mono/mini/mini.h
+index 06883aafe5d..aefb6a9a469 100644
+--- a/src/mono/mono/mini/mini.h
++++ b/src/mono/mono/mini/mini.h
+@@ -2930,7 +2930,7 @@ mini_method_to_shared (MonoMethod *method); // null if not shared
+ static inline gboolean
+ mini_safepoints_enabled (void)
+ {
+-#if defined (TARGET_WASM)
++#if defined (TARGET_WASM) && defined(DISABLE_THREADS)
+ 	return FALSE;
+ #else
+ 	return TRUE;
+-- 
+2.35.1
+
