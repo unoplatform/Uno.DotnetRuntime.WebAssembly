@@ -49,6 +49,9 @@ index 32528ad0559..87b6baee4b6 100644
 +void mono_wasm_proxy_invoke_on_main_thread() {
 +#ifndef DISABLE_THREADS
 +	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
++#else
++    printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
++    assert(0);
 +#endif
 +}
 +
