@@ -16,8 +16,8 @@ index ec39de8e376..436845cf098 100644
 --- a/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
 +++ b/src/mono/wasm/runtime/cjs/dotnet.cjs.lib.js
 @@ -43,6 +43,10 @@ const linked_functions = [
-     "mono_wasm_invoke_js_blazor",
      "mono_wasm_trace_logger",
+     "mono_wasm_set_entrypoint_breakpoint",
  
 +    // Uno-platform specifc interop
 +    "mono_wasm_invoke_js_unmarshalled",
@@ -99,8 +99,8 @@ index 8a77c785c9c..9aa435833c3 100644
  } from "./method-calls";
  import { mono_wasm_typed_array_copy_to_ref, mono_wasm_typed_array_from_ref, mono_wasm_typed_array_copy_from_ref, mono_wasm_load_bytes_into_heap } from "./buffers";
 @@ -343,6 +346,10 @@ export const __linker_exports: any = {
-     mono_wasm_invoke_js_blazor,
      mono_wasm_trace_logger,
+     mono_wasm_set_entrypoint_breakpoint,
  
 +    // Uno-platform specific interop
 +    mono_wasm_invoke_js_unmarshalled,
