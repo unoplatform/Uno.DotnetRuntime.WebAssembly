@@ -27,9 +27,9 @@ index a397c207453..63d75932904 100644
 +		project may run with net6 only SDK installed
 +		-->
 +		<RollForward>Major</RollForward>
+     <UseAppHost>false</UseAppHost>
    </PropertyGroup>
  
-   <ItemGroup>
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 index dc945e6de1e..c17811bc612 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
