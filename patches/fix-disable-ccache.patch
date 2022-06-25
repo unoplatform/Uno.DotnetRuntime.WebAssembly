@@ -1,0 +1,31 @@
+From 69a8849aa452698dba520c3b407df7f2dd2e2cc3 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome.laban@nventive.com>
+Date: Sat, 25 Jun 2022 02:18:32 +0000
+Subject: [PATCH] fix: Disable ccache on windows
+
+---
+ src/mono/CMakeLists.txt | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/mono/CMakeLists.txt b/src/mono/CMakeLists.txt
+index 2be6fc84683..505c786d5e1 100644
+--- a/src/mono/CMakeLists.txt
++++ b/src/mono/CMakeLists.txt
+@@ -35,9 +35,11 @@ set(CMAKE_MODULE_PATH
+   )
+ set(CMAKE_INSTALL_MESSAGE LAZY)
+ 
+-find_program(CCACHE_PROGRAM ccache)
+-if(CCACHE_PROGRAM)
+-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
++  find_program(CCACHE_PROGRAM ccache)
++  if(CCACHE_PROGRAM)
++    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
++  endif()
+ endif()
+ 
+ function(append value)
+-- 
+2.35.1
+

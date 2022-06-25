@@ -14,7 +14,7 @@ on:
 
 env:
   EMSDK_VERSION: 3.1.7 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 59b2dd9fa373588d400b5f432773b6b5164ad389
+  DOTNETRUNTIME_COMMIT: ffa0fff0f31b7d869734e8032313188df523ecca
   DOTNETSDK_VERSION: 6.0.200
 
   # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
@@ -87,9 +87,10 @@ jobs:
         git apply ..\patches\fix-additional-emscripten-exports.patch
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\net7-debugger-compat.patch
-        git apply ..\patches\69709-bump-icu.patch
         git apply ..\patches\70375-baseUrl-configuration.patch
         git apply ..\patches\70926-aot-crash.patch
+        git apply ..\patches\71229-thread-gc-transitions.patch
+        git apply ..\patches\fix-disable-ccache.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -111,6 +112,7 @@ jobs:
 
     - name: Build Wasm Runtime
       run: |
+        $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
         .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
@@ -251,9 +253,10 @@ jobs:
         git apply ../patches/fix-additional-emscripten-exports.patch
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/net7-debugger-compat.patch
-        git apply ../patches/69709-bump-icu.patch
         git apply ../patches/70375-baseUrl-configuration.patch
         git apply ../patches/70926-aot-crash.patch
+        git apply ../patches/71229-thread-gc-transitions.patch
+        git apply ../patches/fix-disable-ccache.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
         git add .
@@ -293,7 +296,7 @@ jobs:
         mv include/wasm/* .
         mv src/* .
         mv System.Private.CoreLib.* ../lib/net7.0
-
+        
     - name: Copy mono/linker files
       run: |
         LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
