@@ -70,6 +70,10 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
+    - name: Clone dotnet/runtime
+      run: |
+        del C:\ProgramData\chocolatey\bin\ccache.exe
+
     - name: Apply Patches
       run: |
         cd runtime
