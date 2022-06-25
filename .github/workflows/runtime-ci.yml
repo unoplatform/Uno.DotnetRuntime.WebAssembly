@@ -66,14 +66,14 @@ jobs:
         cd linker/src/linker
         dotnet msbuild /r /bl /p:Configuration=Release
 
-    - name: Clone dotnet/runtime
-      run: |
-        git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
-
     - name: Remove chocolatey
       run: |
         C:\ProgramData\chocolatey\bin\ccache.exe -h
         del C:\ProgramData\chocolatey\bin\ccache.exe
+
+    - name: Clone dotnet/runtime
+      run: |
+        git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
     - name: Apply Patches
       run: |
