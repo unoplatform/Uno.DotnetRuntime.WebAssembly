@@ -1,0 +1,22 @@
+From 58c4a0b54aee57dcbdd7c15ca1a6671c7d37d38a Mon Sep 17 00:00:00 2001
+From: Katelyn Gadd <kg@luminance.org>
+Date: Thu, 23 Jun 2022 13:33:30 -0700
+Subject: [PATCH] Re-enable automatic gc safe transitions in threaded wasm mode
+
+---
+ src/mono/mono/metadata/marshal-lightweight.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/mono/metadata/marshal-lightweight.c b/src/mono/mono/metadata/marshal-lightweight.c
+index ff6e08bc917fc..e8856aee52ee6 100644
+--- a/src/mono/mono/metadata/marshal-lightweight.c
++++ b/src/mono/mono/metadata/marshal-lightweight.c
+@@ -661,7 +661,7 @@ gc_safe_transition_builder_init (GCSafeTransitionBuilder *builder, MonoMethodBui
+ #ifndef DISABLE_COM
+ 	builder->coop_cominterop_fnptr = -1;
+ #endif
+-#if defined (TARGET_WASM)
++#if defined (TARGET_WASM) && defined(DISABLE_THREADS)
+ 	return FALSE;
+ #else
+ 	return TRUE;
