@@ -23,7 +23,7 @@ index 25f85539d73..9e5f2e7d73c 100644
 +    <PlatformManifestFileEntry Include="libmono-profiler-log.a" IsNative="true" />
      <PlatformManifestFileEntry Include="libmono-wasm-eh-js.a" IsNative="true" />
      <PlatformManifestFileEntry Include="libmono-wasm-eh-wasm.a" IsNative="true" />
-     <PlatformManifestFileEntry Include="System.Private.Runtime.InteropServices.Javascript.dll" />
+     <PlatformManifestFileEntry Include="dotnet.js" IsNative="true" />
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
 index c0122578a9b..36e84b77356 100644
 --- a/src/mono/mono.proj
@@ -113,7 +113,7 @@ index 0283672e7b3..4b07631d3b5 100644
  	 * startup if for some mysterious reason they're too large. In this case,
 @@ -99,4 +104,5 @@ mono_profhelper_add_to_fd_set (fd_set *set, SOCKET fd, int *max_fd)
  
- 	if (*max_fd < fd)
+ 	if (*max_fd < GUINT64_TO_INT(fd))
  		*max_fd = (int)fd;
 +#endif
  }
