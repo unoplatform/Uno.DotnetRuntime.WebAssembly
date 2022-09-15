@@ -95,8 +95,6 @@ jobs:
         git apply ..\patches\fix-additional-emscripten-exports.patch
         git apply ..\patches\enable-log-profiler.patch
         git apply ..\patches\net7-debugger-compat.patch
-        git apply ..\patches\70926-aot-crash.patch
-        git apply ..\patches\71229-thread-gc-transitions.patch
         git apply ..\patches\fix-disable-ccache.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
@@ -260,8 +258,6 @@ jobs:
         git apply ../patches/fix-additional-emscripten-exports.patch
         git apply ../patches/enable-log-profiler.patch
         git apply ../patches/net7-debugger-compat.patch
-        git apply ../patches/70926-aot-crash.patch
-        git apply ../patches/71229-thread-gc-transitions.patch
         git apply ../patches/fix-disable-ccache.patch
         git config --global user.email "ci@platform.uno"
         git config --global user.name "Uno Platform CI"
