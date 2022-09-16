@@ -78,7 +78,7 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
-    - run:  $env:GITHUB_WORKSPACE/scripts/apply-patches.ps1
+    - run: ./scripts/apply-patches.ps1
       name: Apply uno-specific patches
       shell: pwsh
 
@@ -220,7 +220,7 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime
 
-    - run:  $env:GITHUB_WORKSPACE/scripts/apply-patches.ps1
+    - run: ./scripts/apply-patches.ps1
       name: Apply uno-specific patches
       shell: pwsh
 
