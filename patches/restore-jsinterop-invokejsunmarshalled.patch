@@ -1,6 +1,6 @@
-From 55080b991f8dbdcd0fe7b4b8c43867471958133c Mon Sep 17 00:00:00 2001
+From 7f67b1708ed480f108bff28ac41c5673bba02e39 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Thu, 15 Sep 2022 20:37:01 +0000
+Date: Fri, 16 Sep 2022 14:57:36 +0000
 Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
