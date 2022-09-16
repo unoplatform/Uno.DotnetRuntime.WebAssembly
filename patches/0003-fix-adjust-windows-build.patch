@@ -12,8 +12,8 @@ index f307b116184..f98bab3b30a 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
 @@ -212,7 +212,7 @@
-       <CMakeConfigurationLinkFlags Condition="'$(MonoWasmThreads)' == 'true'">$(CMakeConfigurationLinkFlags) -Wno-pthreads-mem-growth</CMakeConfigurationLinkFlags>
        <CMakeConfigurationLinkFlags                                            >$(CMakeConfigurationLinkFlags) --emit-symbol-map</CMakeConfigurationLinkFlags>
+       <CMakeConfigurationLinkFlags>$(CMakeConfigurationLinkFlags) -lidbfs.js</CMakeConfigurationLinkFlags>
  
 -      <CMakeConfigurationEmsdkPath Condition="'$(Configuration)' == 'Release'"> -DEMSDK_PATH=&quot;$(EMSDK_PATH.TrimEnd('\/'))&quot;</CMakeConfigurationEmsdkPath>
 +      <CMakeConfigurationEmsdkPath Condition="'$(Configuration)' == 'Release'"> -DEMSDK_PATH=&quot;$(EMSDK_PATH.TrimEnd('\/').Replace('\','/'))&quot;</CMakeConfigurationEmsdkPath>

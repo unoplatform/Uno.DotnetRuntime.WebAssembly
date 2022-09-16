@@ -1,0 +1,24 @@
+From 2e726adcdd3a04e221d982f343ecfbd32a4dba0e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
+Date: Thu, 15 Sep 2022 20:43:57 +0000
+Subject: [PATCH] fix: Enable IDBFS by default
+
+---
+ src/mono/wasm/wasm.proj | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+index cac849c5818..9326146aa4f 100644
+--- a/src/mono/wasm/wasm.proj
++++ b/src/mono/wasm/wasm.proj
+@@ -215,6 +215,7 @@
+       <CMakeConfigurationLinkFlags>$(CMakeConfigurationLinkFlags) -s EXPORT_ES6=1</CMakeConfigurationLinkFlags>
+       <CMakeConfigurationLinkFlags Condition="'$(MonoWasmThreads)' == 'true'">$(CMakeConfigurationLinkFlags) -Wno-pthreads-mem-growth</CMakeConfigurationLinkFlags>
+       <CMakeConfigurationLinkFlags                                            >$(CMakeConfigurationLinkFlags) --emit-symbol-map</CMakeConfigurationLinkFlags>
++      <CMakeConfigurationLinkFlags>$(CMakeConfigurationLinkFlags) -lidbfs.js</CMakeConfigurationLinkFlags>
+ 
+       <CMakeConfigurationEmsdkPath Condition="'$(Configuration)' == 'Release'"> -DEMSDK_PATH=&quot;$(EMSDK_PATH.TrimEnd('\/'))&quot;</CMakeConfigurationEmsdkPath>
+ 
+-- 
+2.25.1
+

@@ -13,8 +13,8 @@ on:
       - release/**
 
 env:
-  EMSDK_VERSION: 3.1.7 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: ffa0fff0f31b7d869734e8032313188df523ecca
+  EMSDK_VERSION: 3.1.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+  DOTNETRUNTIME_COMMIT: ca82565a60380bf4220255c65e493deb44314346
   DOTNETSDK_VERSION: 6.0.200
 
   # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
@@ -78,34 +78,9 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
-    - name: Apply Patches
-      run: |
-        cd runtime
-        git reset --hard $env:DOTNETRUNTIME_COMMIT
-
-        Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable BASE_DOTNET_SHORT_COMMIT
-
-        echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
-        echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
-
-        git apply ..\patches\enable-idbfs.patch
-        git apply ..\patches\dbg-proxy-net5.patch
-        git apply ..\patches\fix-adjust-windows-build.patch
-        git apply ..\patches\restore-jsinterop-invokejsunmarshalled.patch
-        git apply ..\patches\fix-additional-emscripten-exports.patch
-        git apply ..\patches\enable-log-profiler.patch
-        git apply ..\patches\net7-debugger-compat.patch
-        git apply ..\patches\70375-baseUrl-configuration.patch
-        git apply ..\patches\70926-aot-crash.patch
-        git apply ..\patches\71229-thread-gc-transitions.patch
-        git apply ..\patches\fix-disable-ccache.patch
-        git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
-
-        Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable PATCHED_DOTNET_SHORT_COMMIT
-        echo dotnet/runtime patched SHA1: $PATCHED_DOTNET_SHORT_COMMIT
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
 
     - name: 'Setup Emscripten'
       run: |
@@ -245,31 +220,9 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime
 
-    - name: Apply Patches
-      run: |
-        set -e
-        cd runtime
-        git reset --hard $DOTNETRUNTIME_COMMIT
-
-        echo dotnet/runtime base SHA1: `git rev-parse HEAD`
-        BASE_DOTNET_SHORT_COMMIT=`git rev-parse --short HEAD`
-        echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $GITHUB_ENV
-
-        git apply ../patches/enable-idbfs.patch
-        git apply ../patches/dbg-proxy-net5.patch
-        git apply ../patches/restore-jsinterop-invokejsunmarshalled.patch
-        git apply ../patches/fix-additional-emscripten-exports.patch
-        git apply ../patches/enable-log-profiler.patch
-        git apply ../patches/net7-debugger-compat.patch
-        git apply ../patches/70375-baseUrl-configuration.patch
-        git apply ../patches/70926-aot-crash.patch
-        git apply ../patches/71229-thread-gc-transitions.patch
-        git apply ../patches/fix-disable-ccache.patch
-        git config --global user.email "ci@platform.uno"
-        git config --global user.name "Uno Platform CI"
-        git add .
-        git commit -m "apply patches"
-        echo dotnet/runtime patched SHA1: `git rev-parse HEAD`
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
 
     - name: Install cmake 3.16 
       run: |
