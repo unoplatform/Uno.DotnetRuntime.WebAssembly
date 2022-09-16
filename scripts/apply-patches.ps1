@@ -1,4 +1,4 @@
-. "$env:GITHUB_WORKSPACE/scripts/ps_support.ps1"
+. "$env:GITHUB_WORKSPACE/scripts/helpers.ps1"
 
 cd runtime
 git reset --hard $env:DOTNETRUNTIME_COMMIT
