@@ -78,7 +78,8 @@ jobs:
       run: |
         git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
 
-    - run:  ./scripts/apply-patches.ps1
+    - run:  $env:GITHUB_WORKSPACE/scripts/apply-patches.ps1
+      name: Apply uno-specific patches
       shell: pwsh
 
     - name: 'Setup Emscripten'
@@ -218,8 +219,9 @@ jobs:
     - name: Clone dotnet/runtime
       run: |
         git clone --recursive https://github.com/dotnet/runtime
-        
-    - run:  ./scripts/apply-patches.ps1
+
+    - run:  $env:GITHUB_WORKSPACE/scripts/apply-patches.ps1
+      name: Apply uno-specific patches
       shell: pwsh
 
     - name: Install cmake 3.16 
