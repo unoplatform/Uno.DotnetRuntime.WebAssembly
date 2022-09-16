@@ -8,7 +8,7 @@ Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVaria
 echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
 echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
 
-$files = @(Get-ChildItem ../patches/*.patch)
+$files = @(Get-ChildItem ../patches/*.patch | Sort-Object)
 foreach ($file in $files) 
 {
     echo "Applying patch $file"
