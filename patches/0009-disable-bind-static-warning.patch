@@ -1,8 +1,8 @@
-From 698ea73c2603686a341cb7841d6b52c7d8632e04 Mon Sep 17 00:00:00 2001
+From fc166eca19e93db58dc840857716bf8db58c73dc Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Sun, 18 Sep 2022 00:12:42 +0000
-Subject: [PATCH] fix: Disable mono_bind_static_method backwards compatibility
- message
+Date: Sun, 18 Sep 2022 16:09:19 +0000
+Subject: [PATCH] [PATCH] fix: Disable mono_bind_static_method backwards
+ compatibility
 
 ---
  src/mono/wasm/runtime/exports.ts | 1 -
