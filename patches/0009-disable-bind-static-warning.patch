@@ -1,0 +1,25 @@
+From fc166eca19e93db58dc840857716bf8db58c73dc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
+Date: Sun, 18 Sep 2022 16:09:19 +0000
+Subject: [PATCH] [PATCH] fix: Disable mono_bind_static_method backwards
+ compatibility
+
+---
+ src/mono/wasm/runtime/exports.ts | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/mono/wasm/runtime/exports.ts b/src/mono/wasm/runtime/exports.ts
+index 18e16da2b59..80bd294a7c8 100644
+--- a/src/mono/wasm/runtime/exports.ts
++++ b/src/mono/wasm/runtime/exports.ts
+@@ -84,7 +84,6 @@ function initializeImportsAndExports(
+         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+         // @ts-ignore
+         module.mono_bind_static_method = (fqn: string, signature: string/*ArgsMarshalString*/): Function => {
+-            console.warn("MONO_WASM: Module.mono_bind_static_method is obsolete, please use [JSExportAttribute] interop instead");
+             return mono_bind_static_method(fqn, signature);
+         };
+ 
+-- 
+2.25.1
+
