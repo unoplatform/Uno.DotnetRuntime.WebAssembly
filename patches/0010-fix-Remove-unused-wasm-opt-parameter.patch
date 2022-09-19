@@ -16,6 +16,7 @@ index 2cabf54c0e0..1151dfd35c5 100644
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_ARTIFACTS_DIR=&quot;$(MonoArtifactsPath.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DNATIVE_BIN_DIR=&quot;$(NativeBinDir.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
 -      <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableSIMD)' == 'true' and '$(Configuration)' == 'Release'">$(CMakeBuildRuntimeConfigureCmd) -DWASM_OPT_ADDITIONAL_FLAGS=&quot;--enable-simd&quot;</CMakeBuildRuntimeConfigureCmd>
++      <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableSIMD)' == 'true' and '$(Configuration)' == 'Release'">$(CMakeBuildRuntimeConfigureCmd) -DWASM_OPT_ADDITIONAL_FLAGS=&quot;--enable-simd&quot; --no-warn-unused-cli</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd Condition="'$(MonoWasmThreads)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_THREADS=0</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd Condition="'$(MonoWasmThreadsNoUser)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_WASM_USER_THREADS=1</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) $(CMakeConfigurationEmsdkPath)</CMakeBuildRuntimeConfigureCmd>
