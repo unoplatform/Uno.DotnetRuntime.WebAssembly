@@ -1,6 +1,6 @@
-From 8015650b1e1a8e9316666df4346f1ee49ff01593 Mon Sep 17 00:00:00 2001
+From eb5d3c36b835a7d9f2593e6eb5e8024503331433 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Mon, 19 Sep 2022 19:47:45 +0000
+Date: Mon, 19 Sep 2022 19:59:15 +0000
 Subject: [PATCH] fix: Remove unused wasm-opt parameter
 
 ---
@@ -8,13 +8,13 @@ Subject: [PATCH] fix: Remove unused wasm-opt parameter
  1 file changed, 1 deletion(-)
 
 diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
-index cac849c5818..cc89382672b 100644
+index 2cabf54c0e0..1151dfd35c5 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
 @@ -228,7 +228,6 @@
-       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DICU_LIB_DIR=&quot;$(ICULibDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
-       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_ARTIFACTS_DIR=&quot;$(MonoArtifactsPath.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
-       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DNATIVE_BIN_DIR=&quot;$(NativeBinDir.TrimEnd('\/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DICU_LIB_DIR=&quot;$(ICULibDir.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_ARTIFACTS_DIR=&quot;$(MonoArtifactsPath.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
+       <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DNATIVE_BIN_DIR=&quot;$(NativeBinDir.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
 -      <CMakeBuildRuntimeConfigureCmd Condition="'$(WasmEnableSIMD)' == 'true' and '$(Configuration)' == 'Release'">$(CMakeBuildRuntimeConfigureCmd) -DWASM_OPT_ADDITIONAL_FLAGS=&quot;--enable-simd&quot;</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd Condition="'$(MonoWasmThreads)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_THREADS=0</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd Condition="'$(MonoWasmThreadsNoUser)' == 'true'">$(CMakeBuildRuntimeConfigureCmd) -DDISABLE_WASM_USER_THREADS=1</CMakeBuildRuntimeConfigureCmd>
