@@ -139,7 +139,7 @@ jobs:
         }
 
         if('${{ matrix.MONO_WASM_SIMD }}' -ne '') {
-            $archiveConfiguration="-simd";
+            $archiveConfiguration="$archiveConfiguration-simd";
         }
 
         Invoke-Expression "Get-Location | select -ExpandProperty Path" | Out-String -NoNewLine -OutVariable Current_Path
@@ -288,7 +288,7 @@ jobs:
             ARCHIVE_CONFIGURATION="-threads";
         fi
         if [ '${{ matrix.MONO_WASM_SIMD }}' != '' ]; then
-            ARCHIVE_CONFIGURATION="-simd";
+            ARCHIVE_CONFIGURATION="$ARCHIVE_CONFIGURATION-simd";
         fi
 
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
