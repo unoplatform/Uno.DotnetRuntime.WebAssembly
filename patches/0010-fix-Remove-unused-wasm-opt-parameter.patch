@@ -16,7 +16,7 @@ index 2cabf54c0e0..24acf5c48f7 100644
      </ItemGroup>
  
 +    <ItemGroup Condition="'$(WasmEnableSIMD)' == 'true'">
-+      <WasmOptConfigurationFlags Include="--enable-simd;--no-warn-unused-cli" />
++      <WasmOptConfigurationFlags Include="--enable-simd" />
 +    </ItemGroup>
 +
      <ItemGroup Condition="'$(OS)' != 'Windows_NT'">
