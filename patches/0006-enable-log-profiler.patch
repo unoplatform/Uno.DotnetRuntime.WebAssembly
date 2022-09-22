@@ -216,4 +216,28 @@ index c576927f177..4a377c98c57 100644
      if (MonoWasmThreads) {
          await mono_wasm_init_diagnostics();
 -- 
+diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types.ts
+index ca914585d1d..7f4e02fb74f 100644
+--- a/src/mono/wasm/runtime/types.ts
++++ b/src/mono/wasm/runtime/types.ts
+@@ -121,6 +121,7 @@ export type MonoConfigInternal = MonoConfig & {
+     runtimeOptions?: string[], // array of runtime options as strings
+     aotProfilerOptions?: AOTProfilerOptions, // dictionary-style Object. If omitted, aot profiler will not be initialized.
+     coverageProfilerOptions?: CoverageProfilerOptions, // dictionary-style Object. If omitted, coverage profiler will not be initialized.
++    logProfilerOptions?: LogProfilerOptions, // dictionary-style Object. If omitted, log profiler will not be initialized.
+     waitForDebugger?: number,
+     appendElementOnExit?: boolean
+     logExitCode?: boolean
+@@ -242,6 +243,10 @@ export type CoverageProfilerOptions = {
+     sendTo?: string // should be in the format <CLASS>::<METHODNAME>, default: 'WebAssembly.Runtime::DumpCoverageProfileData' (DumpCoverageProfileData stores the data into INTERNAL.coverage_profile_data.)
+ }
+ 
++export type LogProfilerOptions = {
++    configuration?: string //  log profiler options string"
++}
++
+ // how we extended emscripten Module
+ export type DotnetModule = EmscriptenModule & DotnetModuleConfig;
+ 
+-- 
 2.21.0.windows.1
