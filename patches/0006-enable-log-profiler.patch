@@ -168,4 +168,52 @@ index 2d3e7d403b5..7cbc9bf1563 100644
  mono_profiler_init_log (const char *desc);
  
 -- 
+diff --git a/src/mono/wasm/runtime/profiler.ts b/src/mono/wasm/runtime/profiler.ts
+index 45845417e83..bc3164e030e 100644
+--- a/src/mono/wasm/runtime/profiler.ts
++++ b/src/mono/wasm/runtime/profiler.ts
+@@ -2,7 +2,7 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ import { Module } from "./imports";
+-import { AOTProfilerOptions, CoverageProfilerOptions } from "./types";
++import { AOTProfilerOptions, CoverageProfilerOptions, LogProfilerOptions } from "./types";
+ 
+ // Initialize the AOT profiler with OPTIONS.
+ // Requires the AOT profiler to be linked into the app.
+@@ -38,3 +38,8 @@ export function mono_wasm_init_coverage_profiler(options: CoverageProfilerOption
+     const arg = "coverage:write-at-method=" + options.writeAt + ",send-to-method=" + options.sendTo;
+     Module.ccall("mono_wasm_load_profiler_coverage", null, ["string"], [arg]);
+ }
++
++// options = { configuration: "log profiler options string" }
++export function mono_wasm_init_log_profiler(options: LogProfilerOptions): void {
++    Module.ccall('mono_wasm_load_profiler_log', null, ['string'], [options.configuration]);
++}
+\ No newline at end of file
+diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
+index c576927f177..4a377c98c57 100644
+--- a/src/mono/wasm/runtime/startup.ts
++++ b/src/mono/wasm/runtime/startup.ts
+@@ -9,7 +9,7 @@ import cwraps, { init_c_exports } from "./cwraps";
+ import { mono_wasm_raise_debug_event, mono_wasm_runtime_ready } from "./debug";
+ import { mono_wasm_globalization_init } from "./icu";
+ import { toBase64StringImpl } from "./base64";
+-import { mono_wasm_init_aot_profiler, mono_wasm_init_coverage_profiler } from "./profiler";
++import { mono_wasm_init_aot_profiler, mono_wasm_init_coverage_profiler, mono_wasm_init_log_profiler } from "./profiler";
+ import { mono_on_abort, mono_exit } from "./run";
+ import { initialize_marshalers_to_cs } from "./marshal-to-cs";
+ import { initialize_marshalers_to_js } from "./marshal-to-js";
+@@ -419,6 +419,10 @@ async function _apply_configuration_from_args() {
+ 
+     if (config.coverageProfilerOptions)
+         mono_wasm_init_coverage_profiler(config.coverageProfilerOptions);
++
++    if (config.logProfilerOptions)
++        mono_wasm_init_log_profiler(config.logProfilerOptions);
++
+     // for non-Blazor, init diagnostics after environment variables are set
+     if (MonoWasmThreads) {
+         await mono_wasm_init_diagnostics();
+-- 
 2.21.0.windows.1
