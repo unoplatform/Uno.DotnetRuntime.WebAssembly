@@ -188,7 +188,7 @@ index 45845417e83..bc3164e030e 100644
 +
 +// options = { configuration: "log profiler options string" }
 +export function mono_wasm_init_log_profiler(options: LogProfilerOptions): void {
-+    Module.ccall('mono_wasm_load_profiler_log', null, ['string'], [options.configuration]);
++    Module.ccall("mono_wasm_load_profiler_log", null, ["string"], [options.configuration]);
 +}
 \ No newline at end of file
 diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
