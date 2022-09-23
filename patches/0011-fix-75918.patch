@@ -1,0 +1,25 @@
+From c32843b30038ad35e7f2767b9e8e08e863f04802 Mon Sep 17 00:00:00 2001
+From: Zoltan Varga <vargaz@gmail.com>
+Date: Tue, 20 Sep 2022 14:26:00 -0400
+Subject: [PATCH] [wasm] Keep all icall wrappers in profile only mode, the
+ generated code depends on it.
+
+---
+ src/mono/mono/mini/aot-compiler.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/mono/mono/mini/aot-compiler.c b/src/mono/mono/mini/aot-compiler.c
+index 39d73d02e46..4ebc8e0b558 100644
+--- a/src/mono/mono/mini/aot-compiler.c
++++ b/src/mono/mono/mini/aot-compiler.c
+@@ -9050,6 +9050,7 @@ compile_method (MonoAotCompile *acfg, MonoMethod *method)
+ 				switch (info->subtype) {
+ 				case WRAPPER_SUBTYPE_PTR_TO_STRUCTURE:
+ 				case WRAPPER_SUBTYPE_STRUCTURE_TO_PTR:
++				case WRAPPER_SUBTYPE_ICALL_WRAPPER:
+ 					break;
+ 				default:
+ 					keep = TRUE;
+-- 
+2.25.1
+
