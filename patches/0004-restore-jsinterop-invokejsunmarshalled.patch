@@ -1,3 +1,246 @@
+From 108f090660bbdfc8ab8a7e7815823f3743ab9dd6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
+Date: Mon, 3 Oct 2022 19:18:40 +0000
+Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
+
+---
+ src/mono/wasm/runtime/driver.c                |  22 ++++
+ src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |   5 +
+ src/mono/wasm/runtime/exports-linker.ts       |   9 ++
+ src/mono/wasm/runtime/imports.ts              |   4 +
+ .../wasm/runtime/net6-legacy/method-calls.ts  | 101 +++++++++++++++++-
+ 5 files changed, 136 insertions(+), 5 deletions(-)
+
+diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
+index e2db123f7ab..4af714643fc 100644
+--- a/src/mono/wasm/runtime/driver.c
++++ b/src/mono/wasm/runtime/driver.c
+@@ -46,6 +46,13 @@ extern void mono_wasm_set_entrypoint_breakpoint (const char* assembly_name, int
+ 
+ // Blazor specific custom routines - see dotnet_support.js for backing code
+ extern void* mono_wasm_invoke_js_blazor (MonoString **exceptionMessage, void *callInfo, void* arg0, void* arg1, void* arg2);
++ 
++// Uno specific interop
++extern void* mono_wasm_invoke_js_unmarshalled (MonoString **exceptionMessage, MonoString *funcName, void* arg0, void* arg1, void* arg2);
++extern void mono_wasm_invoke_on_main_thread ();
++extern void mono_threads_wasm_async_run_in_main_thread (void (*func) (void));
++extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
++extern void mono_wasm_proxy_invoke_on_main_thread();
+ 
+ void mono_wasm_enable_debugging (int);
+ 
+@@ -457,6 +464,12 @@ void mono_initialize_internals ()
+ 	// Blazor specific custom routines - see dotnet_support.js for backing code
+ 	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
+ 
++	// Uno Platform specific interop
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeOnMainThread", mono_wasm_proxy_invoke_on_main_thread);
++ 	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
++
++
+ #ifdef CORE_BINDINGS
+ 	core_initialize_internals();
+ #endif
+@@ -1478,3 +1491,12 @@ EMSCRIPTEN_KEEPALIVE int mono_wasm_f64_to_i52 (int64_t *destination, double valu
+ 	*destination = (int64_t)value;
+ 	return I52_ERROR_NONE;
+ }
++
++void mono_wasm_proxy_invoke_on_main_thread() {
++#ifndef DISABLE_THREADS
++	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
++#else
++	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
++	assert(0);
++#endif
++}
+\ No newline at end of file
+diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
+index 9cf4b57ebb7..2271551e1cb 100644
+--- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
++++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
+@@ -74,6 +74,11 @@ const linked_functions = [
+     "mono_wasm_trace_logger",
+     "mono_wasm_event_pipe_early_startup_callback",
+ 
++    // Uno-platform specifc interop
++    "mono_wasm_invoke_js_unmarshalled",
++    "mono_wasm_invoke_on_main_thread",
++    "mono_wasm_invoke_js",
++
+     // corebindings.c
+     "mono_wasm_invoke_js_with_args_ref",
+     "mono_wasm_get_object_property_ref",
+diff --git a/src/mono/wasm/runtime/exports-linker.ts b/src/mono/wasm/runtime/exports-linker.ts
+index 3c030f2f4f9..59629a6e22a 100644
+--- a/src/mono/wasm/runtime/exports-linker.ts
++++ b/src/mono/wasm/runtime/exports-linker.ts
+@@ -11,6 +11,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
+ import {
+     mono_wasm_invoke_js_blazor, mono_wasm_invoke_js_with_args_ref, mono_wasm_get_object_property_ref, mono_wasm_set_object_property_ref,
+     mono_wasm_get_by_index_ref, mono_wasm_set_by_index_ref, mono_wasm_get_global_object_ref
++    , // Uno Platform specific interop
++    mono_wasm_invoke_js_unmarshalled,
++    mono_wasm_invoke_on_main_thread,
++    mono_wasm_invoke_js
+ } from "./net6-legacy/method-calls";
+ import { mono_wasm_marshal_promise } from "./marshal-to-js";
+ import { mono_wasm_pthread_on_pthread_attached } from "./pthreads/worker";
+@@ -57,6 +61,11 @@ export function export_linker(): any {
+         mono_wasm_set_entrypoint_breakpoint,
+         mono_wasm_event_pipe_early_startup_callback,
+ 
++        // Uno-platform specific interop
++        mono_wasm_invoke_js_unmarshalled,
++        mono_wasm_invoke_on_main_thread,
++        mono_wasm_invoke_js,
++        
+         // also keep in sync with corebindings.c
+         mono_wasm_invoke_js_with_args_ref,
+         mono_wasm_get_object_property_ref,
+diff --git a/src/mono/wasm/runtime/imports.ts b/src/mono/wasm/runtime/imports.ts
+index b22bf7dd8ef..710a6a24a66 100644
+--- a/src/mono/wasm/runtime/imports.ts
++++ b/src/mono/wasm/runtime/imports.ts
+@@ -13,6 +13,10 @@ export let Module: EmscriptenModule & DotnetModule;
+ export let INTERNAL: any;
+ export let IMPORTS: any;
+ 
++// Uno-specific
++
++export let BINDING: any;
++
+ // these are imported and re-exported from emscripten internals
+ export let ENVIRONMENT_IS_NODE: boolean;
+ export let ENVIRONMENT_IS_SHELL: boolean;
+diff --git a/src/mono/wasm/runtime/net6-legacy/method-calls.ts b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
+index 37790b769be..7363f8576e6 100644
+--- a/src/mono/wasm/runtime/net6-legacy/method-calls.ts
++++ b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
+@@ -2,17 +2,19 @@
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
+ import { get_js_obj, mono_wasm_get_jsobj_from_js_handle } from "../gc-handles";
+-import { Module, runtimeHelpers, INTERNAL } from "../imports";
++import { Module, runtimeHelpers, INTERNAL, BINDING } from "../imports";
+ import { wrap_error_root } from "../invoke-js";
+ import { _release_temp_frame } from "../memory";
+ import { mono_wasm_new_external_root, mono_wasm_new_root } from "../roots";
+ import { find_entry_point } from "../run";
+-import { conv_string_root, js_string_to_mono_string_root } from "../strings";
+-import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot } from "../types";
+-import { Int32Ptr, VoidPtr } from "../types/emscripten";
++import { conv_string_root, js_string_to_mono_string_root, conv_string, js_string_to_mono_string } from "../strings";
++import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot, MonoStringNull } from "../types";
++import { Int32Ptr, VoidPtr, EmscriptenModule } from "../types/emscripten";
+ import { mono_array_root_to_js_array, unbox_mono_obj_root } from "./cs-to-js";
+ import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
+ import { Converter, BoundMethodToken, mono_method_resolve, mono_method_get_call_signature_ref, mono_bind_method } from "./method-binding";
++import cwraps from "../cwraps";
++import { mono_wasm_symbolicate_string } from "../logging";
+ 
+ const boundMethodsByFqn: Map<string, Function> = new Map();
+ 
+@@ -299,4 +301,93 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
+         exceptionRoot.release();
+         return 0;
+     }
+-}
+\ No newline at end of file
++}
++
++// Uno Platform specific interop
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++export function mono_wasm_invoke_js_unmarshalled(exceptionMessage: Int32Ptr, funcName: MonoString, arg0: any, arg1: any, arg2: any): void | number {
++    try {
++        // Get the function you're trying to invoke
++        const funcNameJsString = conv_string(funcName);
++        const dotNetExports = (<any>globalThis).DotNet;
++        if (!dotNetExports) {
++            throw new Error("The Microsoft.JSInterop.js library is not loaded.");
++        }
++        const funcInstance = dotNetExports.jsCallDispatcher.findJSFunction(funcNameJsString);
++
++        return funcInstance.call(null, arg0, arg1, arg2);
++    } catch (ex: any) {
++        const exceptionJsString = ex.message + "\n" + ex.stack;
++        const exceptionSystemString = cwraps.mono_wasm_string_from_js(exceptionJsString);
++        Module.setValue(exceptionMessage, <any>exceptionSystemString, "i32"); // *exceptionMessage = exceptionSystemString;
++        return 0;
++    }
++}
++
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++export function mono_wasm_invoke_on_main_thread(): void {
++    const dotNetExports = (<any>globalThis).DotNet;
++    if (!dotNetExports) {
++        throw new Error("The Microsoft.JSInterop.js library is not loaded.");
++    }
++
++    if (!dotNetExports.invokeOnMainThread) {
++        throw new Error("The DotNet.invokeOnMainThread method is not available.");
++    }
++
++    dotNetExports.invokeOnMainThread();
++}
++
++// code like `App.call_test_method();`
++export function mono_wasm_invoke_js(code: MonoString, is_exception: Int32Ptr): MonoString | null {
++    if (code === MonoStringNull)
++        return MonoStringNull;
++
++    const js_code = conv_string(code)!;
++
++    try {
++        const closedEval = function (Module: EmscriptenModule, BINDING: any, INTERNAL: any, code: string) {
++            return eval(code);
++        };
++        const res = closedEval(Module, BINDING, INTERNAL, js_code);
++        Module.setValue(is_exception, 0, "i32");
++        if (typeof res === "undefined" || res === null)
++            return MonoStringNull;
++
++        return js_string_to_mono_string(res.toString());
++    } catch (ex) {
++        return wrap_error(is_exception, ex);
++    }
++}
++
++/**
++ * @deprecated Not GC or thread safe
++ */
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++export function wrap_error(is_exception: Int32Ptr | null, ex: any): MonoString {
++    const res = _wrap_error_flag(is_exception, ex);
++    return js_string_to_mono_string(res)!;
++}
++
++// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
++function _wrap_error_flag(is_exception: Int32Ptr | null, ex: any): string {
++    let res = "unknown exception";
++    if (ex) {
++        res = ex.toString();
++        const stack = ex.stack;
++        if (stack) {
++            // Some JS runtimes insert the error message at the top of the stack, some don't,
++            //  so normalize it by using the stack as the result if it already contains the error
++            if (stack.startsWith(res))
++                res = stack;
++            else
++                res += "\n" + stack;
++        }
++
++        res = mono_wasm_symbolicate_string(res);
++    }
++    if (is_exception) {
++        Module.setValue(is_exception, 1, "i32");
++    }
++    return res;
++}
+-- 
+2.25.1
+
 From 7f67b1708ed480f108bff28ac41c5673bba02e39 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
 Date: Fri, 16 Sep 2022 14:57:36 +0000
