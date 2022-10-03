@@ -1,6 +1,6 @@
-From 7f67b1708ed480f108bff28ac41c5673bba02e39 Mon Sep 17 00:00:00 2001
+From 108f090660bbdfc8ab8a7e7815823f3743ab9dd6 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Fri, 16 Sep 2022 14:57:36 +0000
+Date: Mon, 3 Oct 2022 19:18:40 +0000
 Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
@@ -8,8 +8,8 @@ Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |   5 +
  src/mono/wasm/runtime/exports-linker.ts       |   9 ++
  src/mono/wasm/runtime/imports.ts              |   4 +
- .../wasm/runtime/net6-legacy/method-calls.ts  | 100 +++++++++++++++++-
- 5 files changed, 135 insertions(+), 5 deletions(-)
+ .../wasm/runtime/net6-legacy/method-calls.ts  | 101 +++++++++++++++++-
+ 5 files changed, 136 insertions(+), 5 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
 index e2db123f7ab..4af714643fc 100644
@@ -115,10 +115,10 @@ index b22bf7dd8ef..710a6a24a66 100644
  export let ENVIRONMENT_IS_NODE: boolean;
  export let ENVIRONMENT_IS_SHELL: boolean;
 diff --git a/src/mono/wasm/runtime/net6-legacy/method-calls.ts b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-index 37790b769be..dbbde9972f2 100644
+index 37790b769be..7363f8576e6 100644
 --- a/src/mono/wasm/runtime/net6-legacy/method-calls.ts
 +++ b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-@@ -2,17 +2,18 @@
+@@ -2,17 +2,19 @@
  // The .NET Foundation licenses this file to you under the MIT license.
  
  import { get_js_obj, mono_wasm_get_jsobj_from_js_handle } from "../gc-handles";
@@ -138,10 +138,11 @@ index 37790b769be..dbbde9972f2 100644
  import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
  import { Converter, BoundMethodToken, mono_method_resolve, mono_method_get_call_signature_ref, mono_bind_method } from "./method-binding";
 +import cwraps from "../cwraps";
++import { mono_wasm_symbolicate_string } from "../logging";
  
  const boundMethodsByFqn: Map<string, Function> = new Map();
  
-@@ -299,4 +300,93 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
+@@ -299,4 +301,93 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
          exceptionRoot.release();
          return 0;
      }
@@ -230,7 +231,7 @@ index 37790b769be..dbbde9972f2 100644
 +                res += "\n" + stack;
 +        }
 +
-+        res = INTERNAL.mono_wasm_symbolicate_string(res);
++        res = mono_wasm_symbolicate_string(res);
 +    }
 +    if (is_exception) {
 +        Module.setValue(is_exception, 1, "i32");
