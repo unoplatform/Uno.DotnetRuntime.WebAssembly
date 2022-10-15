@@ -1,41 +1,30 @@
-From 3c3a9481a04dd776df69b8ee82b73be43c458ac7 Mon Sep 17 00:00:00 2001
+From 4bf032f9b18ea6df1ca25e22401c182588b00960 Mon Sep 17 00:00:00 2001
 From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Sat, 15 Oct 2022 01:04:07 +0000
+Date: Sat, 15 Oct 2022 02:27:14 +0000
 Subject: [PATCH] fix: adjust for additional EmccExportedFunction
 
 ---
- src/mono/wasm/wasm.proj | 19 +++++++++++++++++++
- 1 file changed, 19 insertions(+)
+ src/mono/wasm/wasm.proj | 7 +++++++
+ 1 file changed, 7 insertions(+)
 
 diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
-index 0fa4a43fdc8..d65f64718c4 100644
+index 0fa4a43fdc8..c078761909d 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
-@@ -146,6 +146,25 @@
-       <EmccExportedFunction Include="stackAlloc" />
-       <EmccExportedFunction Include="_free" />
+@@ -128,6 +128,13 @@
+       <EmccExportedFunction Include="_htons" />
+       <EmccExportedFunction Include="_ntohs" />
      </ItemGroup>
 +    <ItemGroup>
-+      <EmccExportedFunction Include="FS" />
-+      <EmccExportedFunction Include="print" />
-+      <EmccExportedFunction Include="ccall" />
-+      <EmccExportedFunction Include="cwrap" />
-+      <EmccExportedFunction Include="getValue" />
-+      <EmccExportedFunction Include="UTF8ToString" />
-+      <EmccExportedFunction Include="UTF8ArrayToString" />
-+      <EmccExportedFunction Include="FS_createPath" />
-+      <EmccExportedFunction Include="FS_createDataFile" />
-+      <EmccExportedFunction Include="removeRunDependency" />
-+      <EmccExportedFunction Include="addRunDependency" />
-+      <EmccExportedFunction Include="FS_readFile" />
-+      <EmccExportedFunction Include="lengthBytesUTF8" />
-+      <EmccExportedFunction Include="stringToUTF8" />
-+      <EmccExportedFunction Include="addFunction" />
-+      <EmccExportedFunction Include="removeFunction" />
-+      <EmccExportedFunction Include="IDBFS" />
++      <EmccExportedRuntimeMethod Include="lengthBytesUTF8" />
++      <EmccExportedRuntimeMethod Include="stringToUTF8" />
++      <EmccExportedRuntimeMethod Include="addFunction" />
++      <EmccExportedRuntimeMethod Include="removeFunction" />
++      <EmccExportedRuntimeMethod Include="IDBFS" />
 +    </ItemGroup>
-     <PropertyGroup>
-       <_EmccExportedRuntimeMethods>&quot;[@(EmccExportedRuntimeMethod -> '%27%(Identity)%27', ',')]&quot;</_EmccExportedRuntimeMethods>
-       <_EmccExportedFunctions>@(EmccExportedFunction -> '%(Identity)',',')</_EmccExportedFunctions>
+     <!-- after 3.0 -->
+     <ItemGroup Condition="$([MSBuild]::VersionGreaterThan('$(_EmccVersion)', '3.0'))">
+       <EmccExportedFunction Include="_memset" />
 -- 
 2.25.1
+
