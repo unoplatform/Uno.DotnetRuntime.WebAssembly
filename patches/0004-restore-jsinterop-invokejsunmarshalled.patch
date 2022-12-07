@@ -1,21 +1,21 @@
-From 108f090660bbdfc8ab8a7e7815823f3743ab9dd6 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jerome.laban@nventive.com>
-Date: Mon, 3 Oct 2022 19:18:40 +0000
+From f1bccd5e106a29c7a7645583033d9eccdd0d1667 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jlaban@gmail.com>
+Date: Wed, 7 Dec 2022 22:14:38 +0000
 Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
 
 ---
- src/mono/wasm/runtime/driver.c                |  22 ++++
+ src/mono/wasm/runtime/driver.c                |  23 ++++
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |   5 +
  src/mono/wasm/runtime/exports-linker.ts       |   9 ++
  src/mono/wasm/runtime/imports.ts              |   4 +
  .../wasm/runtime/net6-legacy/method-calls.ts  | 101 +++++++++++++++++-
- 5 files changed, 136 insertions(+), 5 deletions(-)
+ 5 files changed, 137 insertions(+), 5 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
-index e2db123f7ab..4af714643fc 100644
+index 9b145963b0d..8d26fe6fd7d 100644
 --- a/src/mono/wasm/runtime/driver.c
 +++ b/src/mono/wasm/runtime/driver.c
-@@ -46,6 +46,13 @@ extern void mono_wasm_set_entrypoint_breakpoint (const char* assembly_name, int
+@@ -47,6 +47,13 @@ extern void mono_wasm_set_entrypoint_breakpoint (const char* assembly_name, int
  
  // Blazor specific custom routines - see dotnet_support.js for backing code
  extern void* mono_wasm_invoke_js_blazor (MonoString **exceptionMessage, void *callInfo, void* arg0, void* arg1, void* arg2);
@@ -29,7 +29,7 @@ index e2db123f7ab..4af714643fc 100644
  
  void mono_wasm_enable_debugging (int);
  
-@@ -457,6 +464,12 @@ void mono_initialize_internals ()
+@@ -449,6 +456,12 @@ void mono_initialize_internals (void)
  	// Blazor specific custom routines - see dotnet_support.js for backing code
  	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
  
@@ -42,25 +42,25 @@ index e2db123f7ab..4af714643fc 100644
  #ifdef CORE_BINDINGS
  	core_initialize_internals();
  #endif
-@@ -1478,3 +1491,12 @@ EMSCRIPTEN_KEEPALIVE int mono_wasm_f64_to_i52 (int64_t *destination, double valu
- 	*destination = (int64_t)value;
- 	return I52_ERROR_NONE;
+@@ -1497,3 +1510,13 @@ EMSCRIPTEN_KEEPALIVE const char * mono_wasm_method_get_full_name (MonoMethod *me
+ EMSCRIPTEN_KEEPALIVE const char * mono_wasm_method_get_name (MonoMethod *method) {
+ 	return mono_method_get_name(method);
  }
 +
-+void mono_wasm_proxy_invoke_on_main_thread() {
-+#ifndef DISABLE_THREADS
-+	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
-+#else
-+	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
-+	assert(0);
-+#endif
-+}
-\ No newline at end of file
+++
+++void mono_wasm_proxy_invoke_on_main_thread() {
+++#ifndef DISABLE_THREADS
+++	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
+++#else
+++	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
+++	assert(0);
+++#endif
+++}
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-index 9cf4b57ebb7..2271551e1cb 100644
+index 46e0c07a419..20e503d8115 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 +++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-@@ -74,6 +74,11 @@ const linked_functions = [
+@@ -78,6 +78,11 @@ const linked_functions = [
      "mono_wasm_trace_logger",
      "mono_wasm_event_pipe_early_startup_callback",
  
@@ -69,14 +69,14 @@ index 9cf4b57ebb7..2271551e1cb 100644
 +    "mono_wasm_invoke_on_main_thread",
 +    "mono_wasm_invoke_js",
 +
-     // corebindings.c
-     "mono_wasm_invoke_js_with_args_ref",
-     "mono_wasm_get_object_property_ref",
+     // jiterpreter.c / interp.c / transform.c
+     "mono_interp_tier_prepare_jiterpreter",
+     "mono_interp_jit_wasm_entry_trampoline",
 diff --git a/src/mono/wasm/runtime/exports-linker.ts b/src/mono/wasm/runtime/exports-linker.ts
-index 3c030f2f4f9..59629a6e22a 100644
+index 4f3b2ce45f6..aaf835a3a99 100644
 --- a/src/mono/wasm/runtime/exports-linker.ts
 +++ b/src/mono/wasm/runtime/exports-linker.ts
-@@ -11,6 +11,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
+@@ -14,6 +14,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
  import {
      mono_wasm_invoke_js_blazor, mono_wasm_invoke_js_with_args_ref, mono_wasm_get_object_property_ref, mono_wasm_set_object_property_ref,
      mono_wasm_get_by_index_ref, mono_wasm_set_by_index_ref, mono_wasm_get_global_object_ref
@@ -87,7 +87,7 @@ index 3c030f2f4f9..59629a6e22a 100644
  } from "./net6-legacy/method-calls";
  import { mono_wasm_marshal_promise } from "./marshal-to-js";
  import { mono_wasm_pthread_on_pthread_attached } from "./pthreads/worker";
-@@ -57,6 +61,11 @@ export function export_linker(): any {
+@@ -72,6 +76,11 @@ export function export_linker(): any {
          mono_wasm_set_entrypoint_breakpoint,
          mono_wasm_event_pipe_early_startup_callback,
  
@@ -96,11 +96,11 @@ index 3c030f2f4f9..59629a6e22a 100644
 +        mono_wasm_invoke_on_main_thread,
 +        mono_wasm_invoke_js,
 +        
-         // also keep in sync with corebindings.c
+         // corebindings.c
          mono_wasm_invoke_js_with_args_ref,
          mono_wasm_get_object_property_ref,
 diff --git a/src/mono/wasm/runtime/imports.ts b/src/mono/wasm/runtime/imports.ts
-index b22bf7dd8ef..710a6a24a66 100644
+index 01a3f9cdcf4..c5e1b676c6c 100644
 --- a/src/mono/wasm/runtime/imports.ts
 +++ b/src/mono/wasm/runtime/imports.ts
 @@ -13,6 +13,10 @@ export let Module: EmscriptenModule & DotnetModule;
@@ -239,5 +239,5 @@ index 37790b769be..7363f8576e6 100644
 +    return res;
 +}
 -- 
-2.25.1
+2.37.3
 
