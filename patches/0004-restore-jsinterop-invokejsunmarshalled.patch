@@ -47,15 +47,15 @@ index 9b145963b0d..8d26fe6fd7d 100644
  	return mono_method_get_name(method);
  }
 +
-++
-++void mono_wasm_proxy_invoke_on_main_thread() {
-++#ifndef DISABLE_THREADS
-++	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
-++#else
-++	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
-++	assert(0);
-++#endif
-++}
++
++void mono_wasm_proxy_invoke_on_main_thread() {
++#ifndef DISABLE_THREADS
++	mono_threads_wasm_async_run_in_main_thread (mono_wasm_invoke_on_main_thread);
++#else
++	printf("mono_wasm_proxy_invoke_on_main_thread: Threading is disabled");
++	assert(0);
++#endif
++}
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 index 46e0c07a419..20e503d8115 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
