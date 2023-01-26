@@ -1,0 +1,29 @@
+From f2d645f8972b438c38d9b1e28bee84650b22a999 Mon Sep 17 00:00:00 2001
+From: Zoltan Varga <vargaz@gmail.com>
+Date: Thu, 5 Jan 2023 20:18:32 -0500
+Subject: [PATCH] [mono][aot] Disable dedup for wrapper with a return type
+ which has a cmod.
+
+The wrappers are not found at runtime in some cases.
+
+Ref: https://github.com/dotnet/runtime/issues/79814.
+---
+ src/mono/mono/mini/aot-runtime.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/mono/mono/mini/aot-runtime.c b/src/mono/mono/mini/aot-runtime.c
+index 353b0ee4f06f2..50639c2c397af 100644
+--- a/src/mono/mono/mini/aot-runtime.c
++++ b/src/mono/mono/mini/aot-runtime.c
+@@ -4445,6 +4445,11 @@ mono_aot_can_dedup (MonoMethod *method)
+ 			/* Handled using linkonce */
+ 			return FALSE;
+ #endif
++		MonoMethodSignature *sig = mono_method_signature_internal (method);
++		if (sig->ret->has_cmods) {
++			// FIXME:
++			return FALSE;
++		}
+ 		return TRUE;
+ 	}
+ 	default:
