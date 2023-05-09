@@ -6,7 +6,7 @@ Subject: [PATCH] chore: Adjust debugger net7
 ---
  .../Common/DevToolsDebuggerConnection.cs               |  5 +++++
  .../Common/FirefoxDebuggerConnection.cs                |  5 +++++
- .../BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs  | 10 ++++++++++
+ .../BrowserDebugProxy/Firefox/FirefoxDebuggerProxy.cs  | 10 ++++++++++
  .../BrowserDebugProxy/Firefox/FirefoxMonoProxy.cs      |  5 +++++
  .../debugger/BrowserDebugProxy/JObjectValueCreator.cs  |  4 ++++
  src/mono/wasm/debugger/BrowserDebugProxy/MonoProxy.cs  |  5 +++++
@@ -48,10 +48,10 @@ index 2664cadb0cb..de0902de6eb 100644
          TcpClient = tcpClient;
          _logger = logger;
          _lengthBuffer = new byte[10];
-diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
+diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxDebuggerProxy.cs b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxDebuggerProxy.cs
 index 6824ff38110..4670087d7c8 100644
---- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
-+++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FireforDebuggerProxy.cs
+--- a/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxDebuggerProxy.cs
++++ b/src/mono/wasm/debugger/BrowserDebugProxy/Firefox/FirefoxDebuggerProxy.cs
 @@ -38,7 +38,12 @@ public static async Task RunServerLoopAsync(int browserPort, int proxyPort, ILog
          StartListener(proxyPort, logger, browserPort);
          while (!token.IsCancellationRequested)
