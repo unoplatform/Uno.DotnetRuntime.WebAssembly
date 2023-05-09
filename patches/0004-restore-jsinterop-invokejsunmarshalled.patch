@@ -1,52 +1,45 @@
-From f1bccd5e106a29c7a7645583033d9eccdd0d1667 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?J=C3=A9r=C3=B4me=20Laban?= <jlaban@gmail.com>
-Date: Wed, 7 Dec 2022 22:14:38 +0000
-Subject: [PATCH] feat: Restore support for mono_wasm_invoke_js_unmarshalled
+From b7d9fbcdc3f21617488c43f210411880ef51a7a4 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Tue, 9 May 2023 20:50:45 +0000
+Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
 
 ---
- src/mono/wasm/runtime/driver.c                |  23 ++++
- src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |   5 +
- src/mono/wasm/runtime/exports-linker.ts       |   9 ++
- src/mono/wasm/runtime/imports.ts              |   4 +
- .../wasm/runtime/net6-legacy/method-calls.ts  | 101 +++++++++++++++++-
- 5 files changed, 137 insertions(+), 5 deletions(-)
+ src/mono/wasm/runtime/corebindings.c          | 21 ++++
+ src/mono/wasm/runtime/cwraps.ts               |  9 ++
+ src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |  5 +
+ src/mono/wasm/runtime/exports-linker.ts       | 11 ++-
+ src/mono/wasm/runtime/globals.ts              |  4 +
+ .../wasm/runtime/net6-legacy/method-calls.ts  | 98 ++++++++++++++++++-
+ 6 files changed, 144 insertions(+), 4 deletions(-)
 
-diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
-index 9b145963b0d..8d26fe6fd7d 100644
---- a/src/mono/wasm/runtime/driver.c
-+++ b/src/mono/wasm/runtime/driver.c
-@@ -47,6 +47,13 @@ extern void mono_wasm_set_entrypoint_breakpoint (const char* assembly_name, int
- 
- // Blazor specific custom routines - see dotnet_support.js for backing code
+diff --git a/src/mono/wasm/runtime/corebindings.c b/src/mono/wasm/runtime/corebindings.c
+index 0b196d087ea..0225df04dec 100644
+--- a/src/mono/wasm/runtime/corebindings.c
++++ b/src/mono/wasm/runtime/corebindings.c
+@@ -42,6 +42,13 @@ extern void mono_wasm_typed_array_from_ref (int ptr, int begin, int end, int byt
  extern void* mono_wasm_invoke_js_blazor (MonoString **exceptionMessage, void *callInfo, void* arg0, void* arg1, void* arg2);
-+ 
+ #endif /* DISABLE_LEGACY_JS_INTEROP */
+ 
 +// Uno specific interop
 +extern void* mono_wasm_invoke_js_unmarshalled (MonoString **exceptionMessage, MonoString *funcName, void* arg0, void* arg1, void* arg2);
 +extern void mono_wasm_invoke_on_main_thread ();
 +extern void mono_threads_wasm_async_run_in_main_thread (void (*func) (void));
 +extern MonoString* mono_wasm_invoke_js (MonoString *str, int *is_exception);
 +extern void mono_wasm_proxy_invoke_on_main_thread();
- 
- void mono_wasm_enable_debugging (int);
- 
-@@ -449,6 +456,12 @@ void mono_initialize_internals (void)
- 	// Blazor specific custom routines - see dotnet_support.js for backing code
- 	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJS", mono_wasm_invoke_js_blazor);
- 
++
+ // HybridGlobalization
+ extern void mono_wasm_change_case_invariant(MonoString **exceptionMessage, const uint16_t* src, int32_t srcLength, uint16_t* dst, int32_t dstLength, mono_bool bToUpper);
+ extern void mono_wasm_change_case(MonoString **exceptionMessage, MonoString **culture, const uint16_t* src, int32_t srcLength, uint16_t* dst, int32_t dstLength, mono_bool bToUpper);
+@@ -81,4 +88,18 @@ void bindings_initialize_internals (void)
+ 	mono_add_internal_call ("Interop/JsGlobalization::CompareString", mono_wasm_compare_string);
+ 	mono_add_internal_call ("Interop/JsGlobalization::StartsWith", mono_wasm_starts_with);
+ 	mono_add_internal_call ("Interop/JsGlobalization::EndsWith", mono_wasm_ends_with);
++
 +	// Uno Platform specific interop
 +	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
 +	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeOnMainThread", mono_wasm_proxy_invoke_on_main_thread);
-+ 	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
-+
-+
- #ifdef CORE_BINDINGS
- 	core_initialize_internals();
- #endif
-@@ -1497,3 +1510,13 @@ EMSCRIPTEN_KEEPALIVE const char * mono_wasm_method_get_full_name (MonoMethod *me
- EMSCRIPTEN_KEEPALIVE const char * mono_wasm_method_get_name (MonoMethod *method) {
- 	return mono_method_get_name(method);
++	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
  }
-+
 +
 +void mono_wasm_proxy_invoke_on_main_thread() {
 +#ifndef DISABLE_THREADS
@@ -56,11 +49,39 @@ index 9b145963b0d..8d26fe6fd7d 100644
 +	assert(0);
 +#endif
 +}
+\ No newline at end of file
+diff --git a/src/mono/wasm/runtime/cwraps.ts b/src/mono/wasm/runtime/cwraps.ts
+index 9540663fbd4..47d9bc34248 100644
+--- a/src/mono/wasm/runtime/cwraps.ts
++++ b/src/mono/wasm/runtime/cwraps.ts
+@@ -69,6 +69,9 @@ const fn_signatures: SigLine[] = [
+     [true, "mono_wasm_diagnostic_server_post_resume_runtime", "void", []],
+     [true, "mono_wasm_diagnostic_server_create_stream", "number", []],
+ 
++    // Uno Specific
++    [true, "mono_wasm_string_from_js", "number", ["string"]],
++
+     //INTERNAL
+     [false, "mono_wasm_exit", "void", ["number"]],
+     [true, "mono_wasm_getenv", "number", ["string"]],
+@@ -189,6 +192,12 @@ export interface t_Cwraps {
+     mono_wasm_diagnostic_server_post_resume_runtime(): void;
+     mono_wasm_diagnostic_server_create_stream(): VoidPtr;
+ 
++    // Uno Specific
++    /**
++     * @deprecated Not GC or thread safe
++     */
++    mono_wasm_string_from_js(str: string): MonoString;
++
+     //INTERNAL
+     mono_wasm_exit(exit_code: number): number;
+     mono_wasm_getenv(name: string): CharPtr;
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-index 46e0c07a419..20e503d8115 100644
+index b23d1981049..52095268a62 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 +++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-@@ -78,6 +78,11 @@ const linked_functions = [
+@@ -99,6 +99,11 @@ let linked_functions = [
      "mono_wasm_trace_logger",
      "mono_wasm_event_pipe_early_startup_callback",
  
@@ -71,12 +92,12 @@ index 46e0c07a419..20e503d8115 100644
 +
      // jiterpreter.c / interp.c / transform.c
      "mono_interp_tier_prepare_jiterpreter",
-     "mono_interp_jit_wasm_entry_trampoline",
+     "mono_interp_record_interp_entry",
 diff --git a/src/mono/wasm/runtime/exports-linker.ts b/src/mono/wasm/runtime/exports-linker.ts
-index 4f3b2ce45f6..aaf835a3a99 100644
+index 417cb51e478..3e10fd9152f 100644
 --- a/src/mono/wasm/runtime/exports-linker.ts
 +++ b/src/mono/wasm/runtime/exports-linker.ts
-@@ -14,6 +14,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
+@@ -26,6 +26,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
  import {
      mono_wasm_invoke_js_blazor, mono_wasm_invoke_js_with_args_ref, mono_wasm_get_object_property_ref, mono_wasm_set_object_property_ref,
      mono_wasm_get_by_index_ref, mono_wasm_set_by_index_ref, mono_wasm_get_global_object_ref
@@ -85,70 +106,69 @@ index 4f3b2ce45f6..aaf835a3a99 100644
 +    mono_wasm_invoke_on_main_thread,
 +    mono_wasm_invoke_js
  } from "./net6-legacy/method-calls";
- import { mono_wasm_marshal_promise } from "./marshal-to-js";
- import { mono_wasm_pthread_on_pthread_attached } from "./pthreads/worker";
-@@ -72,6 +76,11 @@ export function export_linker(): any {
+ import { mono_wasm_change_case, mono_wasm_change_case_invariant, mono_wasm_compare_string, mono_wasm_ends_with, mono_wasm_starts_with } from "./hybrid-globalization";
+ 
+@@ -89,7 +93,12 @@ export function export_linker(): any {
+         mono_wasm_trace_logger,
          mono_wasm_set_entrypoint_breakpoint,
          mono_wasm_event_pipe_early_startup_callback,
- 
+-
++        
 +        // Uno-platform specific interop
 +        mono_wasm_invoke_js_unmarshalled,
 +        mono_wasm_invoke_on_main_thread,
 +        mono_wasm_invoke_js,
 +        
          // corebindings.c
-         mono_wasm_invoke_js_with_args_ref,
-         mono_wasm_get_object_property_ref,
-diff --git a/src/mono/wasm/runtime/imports.ts b/src/mono/wasm/runtime/imports.ts
-index 01a3f9cdcf4..c5e1b676c6c 100644
---- a/src/mono/wasm/runtime/imports.ts
-+++ b/src/mono/wasm/runtime/imports.ts
-@@ -13,6 +13,10 @@ export let Module: EmscriptenModule & DotnetModule;
+         mono_wasm_release_cs_owned_object,
+         mono_wasm_bind_js_function,
+diff --git a/src/mono/wasm/runtime/globals.ts b/src/mono/wasm/runtime/globals.ts
+index 1f032e37c96..0a76839b86a 100644
+--- a/src/mono/wasm/runtime/globals.ts
++++ b/src/mono/wasm/runtime/globals.ts
+@@ -13,6 +13,10 @@ import type { EmscriptenModule } from "./types/emscripten";
+ export let Module: EmscriptenModule & DotnetModule & EmscriptenModuleInternal;
  export let INTERNAL: any;
- export let IMPORTS: any;
  
 +// Uno-specific
 +
 +export let BINDING: any;
 +
  // these are imported and re-exported from emscripten internals
- export let ENVIRONMENT_IS_NODE: boolean;
- export let ENVIRONMENT_IS_SHELL: boolean;
+ export const ENVIRONMENT_IS_NODE = typeof process == "object" && typeof process.versions == "object" && typeof process.versions.node == "string";
+ export const ENVIRONMENT_IS_WEB = typeof window == "object";
 diff --git a/src/mono/wasm/runtime/net6-legacy/method-calls.ts b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-index 37790b769be..7363f8576e6 100644
+index cf9fee9430e..58ae2a7e524 100644
 --- a/src/mono/wasm/runtime/net6-legacy/method-calls.ts
 +++ b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-@@ -2,17 +2,19 @@
- // The .NET Foundation licenses this file to you under the MIT license.
+@@ -3,17 +3,20 @@
  
+ import MonoWasmThreads from "consts:monoWasmThreads";
  import { get_js_obj, mono_wasm_get_jsobj_from_js_handle } from "../gc-handles";
--import { Module, runtimeHelpers, INTERNAL } from "../imports";
-+import { Module, runtimeHelpers, INTERNAL, BINDING } from "../imports";
- import { wrap_error_root } from "../invoke-js";
+-import { Module, runtimeHelpers, INTERNAL, ENVIRONMENT_IS_PTHREAD } from "../globals";
++import { Module, runtimeHelpers, INTERNAL, ENVIRONMENT_IS_PTHREAD, BINDING } from "../globals";
+ import { wrap_error_root, wrap_no_error_root } from "../invoke-js";
  import { _release_temp_frame } from "../memory";
  import { mono_wasm_new_external_root, mono_wasm_new_root } from "../roots";
  import { find_entry_point } from "../run";
 -import { conv_string_root, js_string_to_mono_string_root } from "../strings";
 -import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot } from "../types";
--import { Int32Ptr, VoidPtr } from "../types/emscripten";
 +import { conv_string_root, js_string_to_mono_string_root, conv_string, js_string_to_mono_string } from "../strings";
 +import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot, MonoStringNull } from "../types";
-+import { Int32Ptr, VoidPtr, EmscriptenModule } from "../types/emscripten";
+ import { Int32Ptr, VoidPtr } from "../types/emscripten";
  import { mono_array_root_to_js_array, unbox_mono_obj_root } from "./cs-to-js";
  import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
  import { Converter, BoundMethodToken, mono_method_resolve, mono_method_get_call_signature_ref, mono_bind_method } from "./method-binding";
 +import cwraps from "../cwraps";
 +import { mono_wasm_symbolicate_string } from "../logging";
++import type { EmscriptenModule } from "../types/emscripten";
  
  const boundMethodsByFqn: Map<string, Function> = new Map();
  
-@@ -299,4 +301,93 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
-         exceptionRoot.release();
+@@ -304,3 +307,92 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
          return 0;
      }
--}
-\ No newline at end of file
-+}
+ }
 +
 +// Uno Platform specific interop
 +// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
@@ -239,5 +259,5 @@ index 37790b769be..7363f8576e6 100644
 +    return res;
 +}
 -- 
-2.37.3
+2.25.1
 
