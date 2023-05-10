@@ -260,7 +260,7 @@ jobs:
       run: |
         LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
         mkdir -p $LINKER_OUT
-        cp -r runtime/artifacts/bin/Mono.Linker/$env:BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
+        cp -r runtime/artifacts/bin/Mono.Linker/$BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
 
     - name: Zip Archive
       run: |
