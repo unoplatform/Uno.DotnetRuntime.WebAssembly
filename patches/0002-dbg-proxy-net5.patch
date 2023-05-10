@@ -34,6 +34,8 @@ index 5bb950ac301..eff601f58e0 100644
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
      <NoWarn>$(NoWarn),CA2007</NoWarn>
 +    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
++    <AutoGenerateBindingRedirects Condition="'$(TargetFramework)'=='net7.0'">true</AutoGenerateBindingRedirects>
++    <GenerateBindingRedirectsOutputType Condition="'$(TargetFramework)'=='net7.0'">true</GenerateBindingRedirectsOutputType>
 +
 +    <!--
 +		Enable implicit dotnet runtime forward rolling, as a net5
