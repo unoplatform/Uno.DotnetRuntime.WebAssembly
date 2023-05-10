@@ -1,13 +1,13 @@
-From 40836de853750536886dcbc50672355c5c28b9e7 Mon Sep 17 00:00:00 2001
+From a0a51a67607d073ef9a19a380658ebce31490eda Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Wed, 10 May 2023 13:44:17 +0000
+Date: Wed, 10 May 2023 14:06:02 +0000
 Subject: [PATCH] adjust debugger tfm
 
 ---
- .../Microsoft.NET.WebAssembly.Webcil.csproj   |  2 +-
- .../BrowserDebugHost/BrowserDebugHost.csproj  | 11 +++-
- .../BrowserDebugProxy.csproj                  |  4 ++
- 4 files changed, 76 insertions(+), 2 deletions(-)
+ .../src/Microsoft.NET.WebAssembly.Webcil.csproj          | 2 +-
+ .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
+ .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 6 ++++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
 index 6c66737e553..9a5dc8f4e2f 100644
@@ -22,10 +22,10 @@ index 6c66737e553..9a5dc8f4e2f 100644
      <IncludeSymbols>true</IncludeSymbols>
      <Serviceable>true</Serviceable>
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index 5bb950ac301..0b525f74d90 100644
+index 5bb950ac301..eff601f58e0 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-@@ -1,9 +1,18 @@
+@@ -1,9 +1,16 @@
  <Project Sdk="Microsoft.NET.Sdk.Web">
  
    <PropertyGroup>
@@ -34,8 +34,6 @@ index 5bb950ac301..0b525f74d90 100644
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
      <NoWarn>$(NoWarn),CA2007</NoWarn>
 +    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
-+    <AutoGenerateBindingRedirects Condition="'$(TargetFramework)'=='net7.0'">true</AutoGenerateBindingRedirects>
-+    <GenerateBindingRedirectsOutputType Condition="'$(TargetFramework)'=='net7.0'">true</GenerateBindingRedirectsOutputType>
 +
 +    <!--
 +		Enable implicit dotnet runtime forward rolling, as a net5
@@ -46,16 +44,18 @@ index 5bb950ac301..0b525f74d90 100644
    </PropertyGroup>
  
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index 22f0a963aec..fa4600c44a1 100644
+index 22f0a963aec..3fbda43c7ba 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -19,4 +19,8 @@
+@@ -19,4 +19,10 @@
      <ProjectReference Include="$(LibrariesProjectRoot)Microsoft.NET.WebAssembly.Webcil\src\Microsoft.NET.WebAssembly.Webcil.csproj" Private="true" />
    </ItemGroup>
  
 +  <PropertyGroup>
 +    <TargetFramework> </TargetFramework>
 +    <TargetFrameworks>$(AspNetCoreAppCurrent);net7.0</TargetFrameworks>
++    
++    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
 +  </PropertyGroup>
  </Project>
 -- 
