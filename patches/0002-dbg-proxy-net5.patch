@@ -1,13 +1,13 @@
-From d1a4e106a067fd7daf16aa840b6706ff51753187 Mon Sep 17 00:00:00 2001
+From 40836de853750536886dcbc50672355c5c28b9e7 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Wed, 10 May 2023 12:04:43 +0000
+Date: Wed, 10 May 2023 13:44:17 +0000
 Subject: [PATCH] adjust debugger tfm
 
 ---
- .../src/Microsoft.NET.WebAssembly.Webcil.csproj          | 2 +-
- .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
- .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 ++++
- 3 files changed, 13 insertions(+), 2 deletions(-)
+ .../Microsoft.NET.WebAssembly.Webcil.csproj   |  2 +-
+ .../BrowserDebugHost/BrowserDebugHost.csproj  | 11 +++-
+ .../BrowserDebugProxy.csproj                  |  4 ++
+ 4 files changed, 76 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
 index 6c66737e553..9a5dc8f4e2f 100644
@@ -22,10 +22,10 @@ index 6c66737e553..9a5dc8f4e2f 100644
      <IncludeSymbols>true</IncludeSymbols>
      <Serviceable>true</Serviceable>
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index 5bb950ac301..eff601f58e0 100644
+index 5bb950ac301..0b525f74d90 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-@@ -1,9 +1,16 @@
+@@ -1,9 +1,18 @@
  <Project Sdk="Microsoft.NET.Sdk.Web">
  
    <PropertyGroup>
