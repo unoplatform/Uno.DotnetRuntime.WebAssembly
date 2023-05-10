@@ -1,15 +1,28 @@
-From 98c6d7aaceead2dcc2ed7b4b1d13fdeff14f558e Mon Sep 17 00:00:00 2001
-From: Jerome Laban <jerome.laban@nventive.com>
-Date: Thu, 26 May 2022 18:01:36 +0000
+From a0a51a67607d073ef9a19a380658ebce31490eda Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Wed, 10 May 2023 14:06:02 +0000
 Subject: [PATCH] adjust debugger tfm
 
 ---
+ .../src/Microsoft.NET.WebAssembly.Webcil.csproj          | 2 +-
  .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
- .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 4 ++++
- 2 files changed, 12 insertions(+), 1 deletion(-)
+ .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 6 ++++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
 
+diff --git a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
+index 6c66737e553..9a5dc8f4e2f 100644
+--- a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
++++ b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
+@@ -1,6 +1,6 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+   <PropertyGroup>
+-    <TargetFrameworks>$(NetCoreAppToolCurrent);$(NetFrameworkToolCurrent)</TargetFrameworks>
++    <TargetFrameworks>$(NetCoreAppToolCurrent);$(NetFrameworkToolCurrent);net7.0</TargetFrameworks>
+     <Description>Abstractions for modifying .NET webcil binary images</Description>
+     <IncludeSymbols>true</IncludeSymbols>
+     <Serviceable>true</Serviceable>
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
-index a397c207453..63d75932904 100644
+index 5bb950ac301..eff601f58e0 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 @@ -1,9 +1,16 @@
@@ -17,11 +30,11 @@ index a397c207453..63d75932904 100644
  
    <PropertyGroup>
 -    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
-+    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(AspNetCoreAppCurrent);net7.0</TargetFrameworks>
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
      <NoWarn>$(NoWarn),CA2007</NoWarn>
-+    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net5.0'">true</AppendTargetFrameworkToOutputPath>
-+    
++    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
++
 +    <!--
 +		Enable implicit dotnet runtime forward rolling, as a net5
 +		project may run with net6 only SDK installed
@@ -31,18 +44,20 @@ index a397c207453..63d75932904 100644
    </PropertyGroup>
  
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-index dc945e6de1e..c17811bc612 100644
+index 22f0a963aec..3fbda43c7ba 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
-@@ -14,4 +14,8 @@
-     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="3.7.0" />
+@@ -19,4 +19,10 @@
+     <ProjectReference Include="$(LibrariesProjectRoot)Microsoft.NET.WebAssembly.Webcil\src\Microsoft.NET.WebAssembly.Webcil.csproj" Private="true" />
    </ItemGroup>
  
 +  <PropertyGroup>
 +    <TargetFramework> </TargetFramework>
-+    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(AspNetCoreAppCurrent);net7.0</TargetFrameworks>
++    
++    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
 +  </PropertyGroup>
  </Project>
 -- 
-2.35.1
+2.25.1
 

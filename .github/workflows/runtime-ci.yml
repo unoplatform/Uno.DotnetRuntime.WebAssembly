@@ -13,13 +13,9 @@ on:
       - release/**
 
 env:
-  EMSDK_VERSION: 3.1.12 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 33cb335386d39da8e4e89e75449628be7e3b375a
-  DOTNETSDK_VERSION: 6.0.200
-
-  # Original location: https://github.com/dotnet/runtime/blob/942430c5253fe58c11e32fda265bf816a13cb2b4/eng/Version.Details.xml#L235
-  LINKER_COMMIT: da3c743a606b300c245c312c8cd9b3238d110d65
-
+  EMSDK_VERSION: 3.1.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
+  DOTNETRUNTIME_COMMIT: 8adbca4855b6a12a057c6176d1e909c66cb1f01d
+  DOTNETSDK_VERSION: 8.0.100-preview.3.23178.7
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
 jobs:
@@ -56,19 +52,6 @@ jobs:
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
         echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $env:GITHUB_ENV
 
-    - name: Clone mono/linker
-      run: |
-        git config --system core.longpaths true # required for linker tree after 2022-01
-        git clone -n --recursive https://github.com/mono/linker
-        cd linker
-        git reset --hard $env:LINKER_COMMIT
-        git submodule update --recursive
-
-    - name: Build mono/linker
-      run: |
-        cd linker/src/linker
-        dotnet msbuild /r /bl /p:Configuration=Release
-
     - name: Remove ccache from chocolatey
       run: |
         # ccache installed by chocolatey in hosted agent is interfering with emscripten
@@ -96,12 +79,17 @@ jobs:
       run: |
         choco install ninja
 
+    - name: Build ILLinker
+      run: |
+        cd runtime/src/tools/illink/src/linker
+        dotnet build -c Release
+
     - name: Build Wasm Runtime
       run: |
         $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os Browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -110,22 +98,22 @@ jobs:
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
         move src\* . -Force
-        move System.Private.CoreLib.* ..\lib\net7.0
+        move System.Private.CoreLib.* ..\lib\net8.0
+
+    - name: Copy Wasm Debugger files
+      run: |
+        $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
+        mkdir -p $DEBUGGER_OUT\net7.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net7.0\* $DEBUGGER_OUT\net7.0
+        mkdir -p $DEBUGGER_OUT\net8.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net8.0
+        Remove-Item "$DEBUGGER_OUT\net8.0\net7.0" -Recurse # remove additional required for standard net7.0 packaging
 
     - name: Copy mono/linker files
       run: |
         $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
         mkdir -p $LINKER_OUT
-        cp -r linker\artifacts\bin\Mono.Linker\Release\net6.0\* $LINKER_OUT
-
-    - name: Copy Wasm Debugger files
-      run: |
-        $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
-        mkdir -p $DEBUGGER_OUT\net5
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net5.0\* $DEBUGGER_OUT\net5
-        mkdir -p $DEBUGGER_OUT\net7.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net7.0
-        Remove-Item "$DEBUGGER_OUT\net7.0\net5.0" -Recurse # remove additional required for standard net7.0 packaging
+        cp -r runtime\artifacts\bin\Mono.Linker\$env:BUILD_CONFIGURATION\net7.0\* $LINKER_OUT
 
     - name: Copy ninja
       run: |
@@ -211,20 +199,6 @@ jobs:
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $GITHUB_ENV
         echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $GITHUB_ENV
 
-    - name: Clone mono/linker
-      run: |
-        set -e
-        git clone -n --recursive https://github.com/mono/linker
-        cd linker
-        git reset --hard $LINKER_COMMIT
-        git submodule update --recursive
-
-    - name: Build mono/linker
-      run: |
-        set -e
-        cd linker/src/linker
-        dotnet msbuild /r /bl /p:Configuration=Release
-
     - name: Clone dotnet/runtime
       run: |
         git clone --recursive https://github.com/dotnet/runtime
@@ -248,39 +222,45 @@ jobs:
         ./emsdk install $EMSDK_VERSION
         ./emsdk activate $EMSDK_VERSION
 
+    - name: Build ILLinker
+      run: |
+        set -e
+        cd runtime/src/tools/illink/src/linker
+        dotnet build -c Release
+
     - name: Build Wasm Runtime
       run: |
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os Browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
 
         # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
+        chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
 
         # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/Browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
+        mv ./artifacts/bin/mono/browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
 
         # Move src and include files to locations compatible with mono's packager
         cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
         mv include/wasm/* .
         mv src/* .
-        mv System.Private.CoreLib.* ../lib/net7.0
-        
-    - name: Copy mono/linker files
-      run: |
-        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
-        mkdir -p $LINKER_OUT
-        cp -r linker/artifacts/bin/Mono.Linker/Release/net6.0/* $LINKER_OUT
+        mv System.Private.CoreLib.* ../lib/net8.0
 
     - name: Copy Wasm Debugger files
       run: |
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
-        mkdir -p $DEBUGGER_OUT/net5
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
         mkdir -p $DEBUGGER_OUT/net7.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net7.0
-        rm -fr $DEBUGGER_OUT/net7.0/net5.0 # remove additional required for standard net7.0 packaging
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net7.0/* $DEBUGGER_OUT/net7.0
+        mkdir -p $DEBUGGER_OUT/net8.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
+        rm -fr $DEBUGGER_OUT/net8.0/net7.0 # remove additional required for standard net7.0 packaging
+
+    - name: Copy mono/linker files
+      run: |
+        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
+        mkdir -p $LINKER_OUT
+        cp -r runtime/artifacts/bin/Mono.Linker/$BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
 
     - name: Zip Archive
       run: |
