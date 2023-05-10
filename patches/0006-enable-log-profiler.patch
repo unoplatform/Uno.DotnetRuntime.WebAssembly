@@ -210,9 +210,9 @@ index 1ae473cf243..9fbcb6ab5b8 100644
  
          await wait_for_all_assets();
  
-+        if (config.logProfilerOptions)
-+           mono_wasm_init_log_profiler(config.logProfilerOptions);
-+
++        if (config.logProfilerOptions) {
++            mono_wasm_init_log_profiler(config.logProfilerOptions);
++        }
 +
          // Diagnostics early are not supported with memory snapshot. See below how we enable them later.
          // Please disable startupMemoryCache in order to be able to diagnose or pause runtime startup.
