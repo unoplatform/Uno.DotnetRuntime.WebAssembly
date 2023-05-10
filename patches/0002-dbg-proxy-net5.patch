@@ -17,10 +17,10 @@ index a397c207453..63d75932904 100644
  
    <PropertyGroup>
 -    <TargetFramework>$(AspNetCoreAppCurrent)</TargetFramework>
-+    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(AspNetCoreAppCurrent);net6.0</TargetFrameworks>
      <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
      <NoWarn>$(NoWarn),CA2007</NoWarn>
-+    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net5.0'">true</AppendTargetFrameworkToOutputPath>
++    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net6.0'">true</AppendTargetFrameworkToOutputPath>
 +    
 +    <!--
 +		Enable implicit dotnet runtime forward rolling, as a net5
@@ -40,7 +40,7 @@ index dc945e6de1e..c17811bc612 100644
   
 +  <PropertyGroup>
 +    <TargetFramework> </TargetFramework>
-+    <TargetFrameworks>$(AspNetCoreAppCurrent);net5.0</TargetFrameworks>
++    <TargetFrameworks>$(AspNetCoreAppCurrent);net6.0</TargetFrameworks>
 +  </PropertyGroup>
  </Project>
 -- 
