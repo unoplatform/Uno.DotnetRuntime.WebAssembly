@@ -110,7 +110,7 @@ jobs:
         cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
         move include\wasm\* .
         move src\* . -Force
-        move System.Private.CoreLib.* ..\lib\net7.0
+        move System.Private.CoreLib.* ..\lib\net8.0
 
     - name: Copy mono/linker files
       run: |
@@ -123,9 +123,9 @@ jobs:
         $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
         mkdir -p $DEBUGGER_OUT\net5
         cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net5.0\* $DEBUGGER_OUT\net5
-        mkdir -p $DEBUGGER_OUT\net7.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net7.0
-        Remove-Item "$DEBUGGER_OUT\net7.0\net5.0" -Recurse # remove additional required for standard net7.0 packaging
+        mkdir -p $DEBUGGER_OUT\net8.0
+        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net8.0
+        Remove-Item "$DEBUGGER_OUT\net8.0\net5.0" -Recurse # remove additional required for standard net8.0 packaging
 
     - name: Copy ninja
       run: |
@@ -256,16 +256,16 @@ jobs:
         ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:WasmEnableThreads=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
 
         # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/Browser.wasm.Release/cross/*
+        chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
 
         # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/Browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
+        mv ./artifacts/bin/mono/browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
 
         # Move src and include files to locations compatible with mono's packager
         cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
         mv include/wasm/* .
         mv src/* .
-        mv System.Private.CoreLib.* ../lib/net7.0
+        mv System.Private.CoreLib.* ../lib/net8.0
         
     - name: Copy mono/linker files
       run: |
@@ -278,9 +278,9 @@ jobs:
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
         mkdir -p $DEBUGGER_OUT/net5
         cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net5
-        mkdir -p $DEBUGGER_OUT/net7.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net7.0
-        rm -fr $DEBUGGER_OUT/net7.0/net5.0 # remove additional required for standard net7.0 packaging
+        mkdir -p $DEBUGGER_OUT/net8.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
+        rm -fr $DEBUGGER_OUT/net8.0/net5.0 # remove additional required for standard net8.0 packaging
 
     - name: Zip Archive
       run: |
