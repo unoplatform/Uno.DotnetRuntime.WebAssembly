@@ -234,7 +234,7 @@ jobs:
       run: |
         DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
         mkdir -p $DEBUGGER_OUT/net7.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net5.0/* $DEBUGGER_OUT/net7.0
+        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net7.0/* $DEBUGGER_OUT/net7.0
         mkdir -p $DEBUGGER_OUT/net8.0
         cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
         rm -fr $DEBUGGER_OUT/net8.0/net7.0 # remove additional required for standard net7.0 packaging
