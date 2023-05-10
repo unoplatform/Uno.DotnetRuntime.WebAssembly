@@ -81,7 +81,7 @@ jobs:
 
     - name: Build ILLinker
       run: |
-        cd src/tools/illink/src/linker
+        cd runtime/src/tools/illink/src/linker
         dotnet build -c Release
 
     - name: Build Wasm Runtime
@@ -113,7 +113,7 @@ jobs:
       run: |
         $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
         mkdir -p $LINKER_OUT
-        cp -r artifacts\bin\Mono.Linker\$env:BUILD_CONFIGURATION\net7.0\* $LINKER_OUT
+        cp -r runtime\artifacts\bin\Mono.Linker\$env:BUILD_CONFIGURATION\net7.0\* $LINKER_OUT
 
     - name: Copy ninja
       run: |
@@ -225,7 +225,7 @@ jobs:
     - name: Build ILLinker
       run: |
         set -e
-        cd src/tools/illink/src/linker
+        cd runtime/src/tools/illink/src/linker
         dotnet build -c Release
 
     - name: Build Wasm Runtime
@@ -260,7 +260,7 @@ jobs:
       run: |
         LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
         mkdir -p $LINKER_OUT
-        cp -r artifacts/bin/Mono.Linker/$env:BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
+        cp -r runtime/artifacts/bin/Mono.Linker/$env:BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
 
     - name: Zip Archive
       run: |
