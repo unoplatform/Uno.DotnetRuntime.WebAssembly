@@ -79,6 +79,11 @@ jobs:
       run: |
         choco install ninja
 
+    - name: Build ILLinker
+      run: |
+        cd src/tools/illink/src/linker
+        dotnet build -c Release
+
     - name: Build Wasm Runtime
       run: |
         $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
@@ -103,6 +108,12 @@ jobs:
         mkdir -p $DEBUGGER_OUT\net8.0
         cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net8.0
         Remove-Item "$DEBUGGER_OUT\net8.0\net7.0" -Recurse # remove additional required for standard net7.0 packaging
+
+        - name: Copy mono/linker files
+      run: |
+        $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
+        mkdir -p $LINKER_OUT
+        cp -r artifacts\bin\Mono.Linker\$env:BUILD_CONFIGURATION\net7.0\* $LINKER_OUT
 
     - name: Copy ninja
       run: |
@@ -211,6 +222,12 @@ jobs:
         ./emsdk install $EMSDK_VERSION
         ./emsdk activate $EMSDK_VERSION
 
+    - name: Build ILLinker
+      run: |
+        set -e
+        cd src/tools/illink/src/linker
+        dotnet build -c Release
+
     - name: Build Wasm Runtime
       run: |
         set -e
@@ -238,6 +255,12 @@ jobs:
         mkdir -p $DEBUGGER_OUT/net8.0
         cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
         rm -fr $DEBUGGER_OUT/net8.0/net7.0 # remove additional required for standard net7.0 packaging
+
+    - name: Copy mono/linker files
+      run: |
+        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
+        mkdir -p $LINKER_OUT
+        cp -r artifacts/bin/Mono.Linker/$env:BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
 
     - name: Zip Archive
       run: |

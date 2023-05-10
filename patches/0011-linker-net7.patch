@@ -1,0 +1,32 @@
+From c51a03d4217315669d9759ee4ac7e22bf2881b1c Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Wed, 10 May 2023 16:05:58 +0000
+Subject: [PATCH] linker for net7.0
+
+---
+ src/tools/illink/Directory.Build.props | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/tools/illink/Directory.Build.props b/src/tools/illink/Directory.Build.props
+index 5f4701dbc80..991e83e56ff 100644
+--- a/src/tools/illink/Directory.Build.props
++++ b/src/tools/illink/Directory.Build.props
+@@ -7,7 +7,14 @@
+   <Import Project="..\..\..\Directory.Build.props" />
+ 
+   <PropertyGroup>
+-    <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
++    <TargetFrameworks>$(NetCoreAppToolCurrent);net7.0</TargetFrameworks>
++    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
++    <!--
++		Enable implicit dotnet runtime forward rolling, as a net7
++		project may run with net8 only SDK installed
++		-->
++		<RollForward>Major</RollForward>
++
+     <DisableImplicitNamespaceImports_DotNet>true</DisableImplicitNamespaceImports_DotNet>
+     <!-- Arcade uses by default xunit as test runner, illink uses nunit instead. 
+          We need to setup UseVSTestRunner to use the runner VS is using (in this case nunit) -->
+-- 
+2.25.1
+
