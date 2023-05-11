@@ -30,7 +30,6 @@ jobs:
       matrix:
        BUILD_CONFIGURATION: [Release]
        MONO_WASM_THREADS: ['multithread', 'singlethread']
-       MONO_WASM_SIMD: ['true', '']
        
 
     steps:
@@ -50,7 +49,6 @@ jobs:
         echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
-        echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $env:GITHUB_ENV
 
     - name: Remove ccache from chocolatey
       run: |
@@ -89,7 +87,7 @@ jobs:
         $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -126,10 +124,6 @@ jobs:
             $archiveConfiguration="-threads";
         }
 
-        if('${{ matrix.MONO_WASM_SIMD }}' -ne '') {
-            $archiveConfiguration="$archiveConfiguration-simd";
-        }
-
         Invoke-Expression "Get-Location | select -ExpandProperty Path" | Out-String -NoNewLine -OutVariable Current_Path
         $ARTIFACTS_FOLDER="$Current_Path\ci-artifacts"
         mkdir -p $ARTIFACTS_FOLDER
@@ -154,7 +148,6 @@ jobs:
       matrix:
        BUILD_CONFIGURATION: [Release]
        MONO_WASM_THREADS: ['multithread', 'singlethread']
-       MONO_WASM_SIMD: ['true', '']
 
     steps:
     - name: Setup .NET SDK
@@ -197,7 +190,6 @@ jobs:
         echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $GITHUB_ENV
-        echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $GITHUB_ENV
 
     - name: Clone dotnet/runtime
       run: |
@@ -233,7 +225,7 @@ jobs:
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS"
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
@@ -266,9 +258,6 @@ jobs:
       run: |
         if [ '${{ matrix.MONO_WASM_THREADS }}' != 'singlethread' ]; then
             ARCHIVE_CONFIGURATION="-threads";
-        fi
-        if [ '${{ matrix.MONO_WASM_SIMD }}' != '' ]; then
-            ARCHIVE_CONFIGURATION="$ARCHIVE_CONFIGURATION-simd";
         fi
 
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
