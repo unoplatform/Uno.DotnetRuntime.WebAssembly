@@ -29,7 +29,7 @@ jobs:
     strategy:
       matrix:
        BUILD_CONFIGURATION: [Release]
-       MONO_WASM_THREADS: ['true', '']
+       MONO_WASM_THREADS: ['multithread', 'singlethread']
        MONO_WASM_SIMD: ['true', '']
        
 
@@ -89,7 +89,7 @@ jobs:
         $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -122,7 +122,7 @@ jobs:
 
     - name: Zip Archive
       run: |
-        if('${{ matrix.MONO_WASM_THREADS }}' -ne '') {
+        if('${{ matrix.MONO_WASM_THREADS }}' -ne 'singlethread') {
             $archiveConfiguration="-threads";
         }
 
@@ -153,7 +153,7 @@ jobs:
     strategy:
       matrix:
        BUILD_CONFIGURATION: [Release]
-       MONO_WASM_THREADS: ['true', '']
+       MONO_WASM_THREADS: ['multithread', 'singlethread']
        MONO_WASM_SIMD: ['true', '']
 
     steps:
@@ -233,7 +233,7 @@ jobs:
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmThreads=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
@@ -264,7 +264,7 @@ jobs:
 
     - name: Zip Archive
       run: |
-        if [ '${{ matrix.MONO_WASM_THREADS }}' != '' ]; then
+        if [ '${{ matrix.MONO_WASM_THREADS }}' != 'singlethread' ]; then
             ARCHIVE_CONFIGURATION="-threads";
         fi
         if [ '${{ matrix.MONO_WASM_SIMD }}' != '' ]; then
