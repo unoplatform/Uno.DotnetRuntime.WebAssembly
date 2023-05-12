@@ -258,6 +258,20 @@ index cf9fee9430e..58ae2a7e524 100644
 +    }
 +    return res;
 +}
+diff --git a/src/mono/wasm/runtime/globals.ts b/src/mono/wasm/runtime/globals.ts
+index 1f032e37c96..edeba5da6f9 100644
+--- a/src/mono/wasm/runtime/globals.ts
++++ b/src/mono/wasm/runtime/globals.ts
+@@ -47,7 +47,8 @@ export function setGlobalObjects(
+     exportedRuntimeAPI = globalObjects.api;
+ 
+     Object.assign(globalObjects.module, {
+-        disableDotnet6Compatibility: true,
++        // Uno specific restore .NET 6 compatibility on Module
++        disableDotnet6Compatibility: false,
+         config: { environmentVariables: {} }
+     });
+     Object.assign(globalObjects.module.config!, {}) as any;
 -- 
 2.25.1
 
