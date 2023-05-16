@@ -1,0 +1,23 @@
+From 69894fa93cb2c1e27a3771f09035a960d55fc17b Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Tue, 16 May 2023 14:21:47 +0000
+Subject: [PATCH] fix: adjust require global imports
+
+---
+ src/mono/wasm/runtime/es6/dotnet.es6.extpost.js | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js b/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
+index 7c42d93dd9c..3027be4f69a 100644
+--- a/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
++++ b/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
+@@ -1,5 +1,5 @@
+ 
+-var fetch = fetch || undefined; var require = require || undefined; var __dirname = __dirname || '';
++var fetch = fetch || globalThis.fetch || undefined; var require = require || globalThis.require || undefined; var __dirname = __dirname || '';
+ var createEmscripten = createDotnetRuntime;
+ var unifyModuleConfig = __dotnet_runtime.unifyModuleConfig;
+ export const dotnet = __dotnet_runtime.dotnet;
+-- 
+2.25.1
+
