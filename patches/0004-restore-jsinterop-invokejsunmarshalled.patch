@@ -1,17 +1,18 @@
-From 529ff6560fb5c4289681a70928492c737c4fc9b4 Mon Sep 17 00:00:00 2001
+From 61795416b710c15e20190664b83fac672665aa52 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Fri, 19 May 2023 14:46:08 +0000
+Date: Tue, 23 May 2023 18:59:16 +0000
 Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
 
 ---
  src/mono/wasm/runtime/corebindings.c          | 21 ++++
  src/mono/wasm/runtime/cwraps.ts               |  9 ++
+ src/mono/wasm/runtime/driver.c                | 11 +++
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |  5 +
  src/mono/wasm/runtime/exports-linker.ts       | 11 ++-
  src/mono/wasm/runtime/globals.ts              |  4 +
  src/mono/wasm/runtime/loader/globals.ts       |  3 +-
  .../wasm/runtime/net6-legacy/method-calls.ts  | 98 ++++++++++++++++++-
- 7 files changed, 146 insertions(+), 5 deletions(-)
+ 8 files changed, 157 insertions(+), 5 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/corebindings.c b/src/mono/wasm/runtime/corebindings.c
 index 8d92fdc5e0e..d6465574306 100644
@@ -78,6 +79,28 @@ index 715a3936cec..f31e53abf49 100644
      //INTERNAL
      mono_wasm_exit(exit_code: number): number;
      mono_wasm_getenv(name: string): CharPtr;
+diff --git a/src/mono/wasm/runtime/driver.c b/src/mono/wasm/runtime/driver.c
+index a640e88c6e0..dd4408d23ab 100644
+--- a/src/mono/wasm/runtime/driver.c
++++ b/src/mono/wasm/runtime/driver.c
+@@ -767,6 +767,17 @@ mono_wasm_assembly_get_entry_point (MonoAssembly *assembly, int auto_insert_brea
+ 	return method;
+ }
+ 
++EMSCRIPTEN_KEEPALIVE MonoString *
++mono_wasm_string_from_js (const char *str)
++{
++	PVOLATILE(MonoString) result = NULL;
++	MONO_ENTER_GC_UNSAFE;
++	if (str)
++		result = mono_string_new (root_domain, str);
++	MONO_EXIT_GC_UNSAFE;
++	return result;
++}
++
+ EMSCRIPTEN_KEEPALIVE void
+ mono_wasm_string_from_utf16_ref (const mono_unichar2 * chars, int length, MonoString **result)
+ {
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 index ab293f667ae..22bedc64257 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
