@@ -15,7 +15,7 @@ index c7ea64155b8..b305e94ed1c 100644
              // eslint-disable-next-line @typescript-eslint/ban-ts-comment
              // @ts-ignore
              module.mono_bind_static_method = (fqn: string, signature: string/*ArgsMarshalString*/): Function => {
--                console.warn("MONO_WASM: Module.mono_bind_static_method is obsolete, please use [JSExportAttribute] interop instead");
+-                mono_log_warn("Module.mono_bind_static_method is obsolete, please use [JSExportAttribute] interop instead");
                  return mono_bind_static_method(fqn, signature);
              };
          }

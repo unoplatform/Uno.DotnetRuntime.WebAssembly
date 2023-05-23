@@ -8,16 +8,13 @@ Subject: [PATCH] fix: adjust require global imports
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js b/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
-index 7c42d93dd9c..3027be4f69a 100644
+index 510b2bef4ef..495abe0a914 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
 +++ b/src/mono/wasm/runtime/es6/dotnet.es6.extpost.js
-@@ -1,5 +1,5 @@
+@@ -1,2 +1,2 @@
  
--var fetch = fetch || undefined; var require = require || undefined; var __dirname = __dirname || '';
-+var fetch = fetch || globalThis.fetch || undefined; var require = require || globalThis.require || undefined; var __dirname = __dirname || '';
- var createEmscripten = createDotnetRuntime;
- var unifyModuleConfig = __dotnet_runtime.unifyModuleConfig;
- export const dotnet = __dotnet_runtime.dotnet;
+-var fetch = fetch || undefined; var require = require || undefined; var __dirname = __dirname || ''; var _nativeModuleLoaded = false;
++var fetch = fetch || globalThis.fetch || undefined; var require = require || globalThis.require || undefined; var __dirname = __dirname || ''; var _nativeModuleLoaded = false;
 -- 
 2.25.1
 

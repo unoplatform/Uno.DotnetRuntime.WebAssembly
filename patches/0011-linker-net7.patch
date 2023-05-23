@@ -25,8 +25,8 @@ index 5f4701dbc80..991e83e56ff 100644
 +		<RollForward>Major</RollForward>
 +
      <DisableImplicitNamespaceImports_DotNet>true</DisableImplicitNamespaceImports_DotNet>
-     <!-- Arcade uses by default xunit as test runner, illink uses nunit instead. 
-          We need to setup UseVSTestRunner to use the runner VS is using (in this case nunit) -->
+     <!-- TODO: Fix the api differences between the ref and src illink. -->
+     <ApiCompatValidateAssemblies>false</ApiCompatValidateAssemblies>
 -- 
 2.25.1
 

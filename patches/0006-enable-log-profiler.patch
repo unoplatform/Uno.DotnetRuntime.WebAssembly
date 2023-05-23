@@ -178,11 +178,11 @@ index fbaa646d903..3bc0b317c69 100644
  // The .NET Foundation licenses this file to you under the MIT license.
  
  import { ENVIRONMENT_IS_WEB, Module, runtimeHelpers } from "./globals";
--import { AOTProfilerOptions, BrowserProfilerOptions } from "./types";
-+import { AOTProfilerOptions, BrowserProfilerOptions, LogProfilerOptions } from "./types";
+-import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions } from "./types/internal";
++import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions, LogProfilerOptions } from "./types/internal";
  import cwraps from "./cwraps";
- import { MonoMethod } from "./types";
  
+ // Initialize the AOT profiler with OPTIONS.
 @@ -98,3 +98,8 @@ export function mono_wasm_profiler_leave(method: MonoMethod): void {
          globalThis.performance.measure(methodName, options);
      }
@@ -203,24 +203,24 @@ index 1ae473cf243..9fbcb6ab5b8 100644
  import { toBase64StringImpl } from "./base64";
 -import { mono_wasm_init_aot_profiler, mono_wasm_init_browser_profiler } from "./profiler";
 +import { mono_wasm_init_aot_profiler, mono_wasm_init_browser_profiler, mono_wasm_init_log_profiler } from "./profiler";
- import { mono_on_abort, mono_exit } from "./run";
  import { initialize_marshalers_to_cs } from "./marshal-to-cs";
  import { initialize_marshalers_to_js } from "./marshal-to-js";
+ import { init_polyfills_async } from "./polyfills";
 @@ -261,6 +261,10 @@ async function onRuntimeInitializedAsync(userOnRuntimeInitialized: () => void) {
  
          await wait_for_all_assets();
  
-+        if (config.logProfilerOptions) {
-+            mono_wasm_init_log_profiler(config.logProfilerOptions);
++        if (runtimeHelpers.config.logProfilerOptions) {
++            mono_wasm_init_log_profiler(runtimeHelpers.config.logProfilerOptions);
 +        }
 +
          // Diagnostics early are not supported with memory snapshot. See below how we enable them later.
          // Please disable startupMemoryCache in order to be able to diagnose or pause runtime startup.
-         if (MonoWasmThreads && !config.startupMemoryCache) {
-diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types.ts
+         if (MonoWasmThreads && !runtimeHelpers.config.startupMemoryCache) {
+diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types/internal.ts
 index 3f1c811dcec..10259374a6a 100644
---- a/src/mono/wasm/runtime/types.ts
-+++ b/src/mono/wasm/runtime/types.ts
+--- a/src/mono/wasm/runtime/types/internal.ts
++++ b/src/mono/wasm/runtime/types/internal.ts
 @@ -69,6 +69,7 @@ export function coerceNull<T extends ManagedPointer | NativePointer>(ptr: T | nu
  export type MonoConfigInternal = MonoConfig & {
      runtimeOptions?: string[], // array of runtime options as strings

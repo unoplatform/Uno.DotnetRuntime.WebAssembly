@@ -1,6 +1,6 @@
-From b7d9fbcdc3f21617488c43f210411880ef51a7a4 Mon Sep 17 00:00:00 2001
+From 529ff6560fb5c4289681a70928492c737c4fc9b4 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Tue, 9 May 2023 20:50:45 +0000
+Date: Fri, 19 May 2023 14:46:08 +0000
 Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
 
 ---
@@ -9,11 +9,12 @@ Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |  5 +
  src/mono/wasm/runtime/exports-linker.ts       | 11 ++-
  src/mono/wasm/runtime/globals.ts              |  4 +
+ src/mono/wasm/runtime/loader/globals.ts       |  3 +-
  .../wasm/runtime/net6-legacy/method-calls.ts  | 98 ++++++++++++++++++-
- 6 files changed, 144 insertions(+), 4 deletions(-)
+ 7 files changed, 146 insertions(+), 5 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/corebindings.c b/src/mono/wasm/runtime/corebindings.c
-index 0b196d087ea..0225df04dec 100644
+index 8d92fdc5e0e..d6465574306 100644
 --- a/src/mono/wasm/runtime/corebindings.c
 +++ b/src/mono/wasm/runtime/corebindings.c
 @@ -42,6 +42,13 @@ extern void mono_wasm_typed_array_from_ref (int ptr, int begin, int end, int byt
@@ -30,10 +31,10 @@ index 0b196d087ea..0225df04dec 100644
  // HybridGlobalization
  extern void mono_wasm_change_case_invariant(MonoString **exceptionMessage, const uint16_t* src, int32_t srcLength, uint16_t* dst, int32_t dstLength, mono_bool bToUpper);
  extern void mono_wasm_change_case(MonoString **exceptionMessage, MonoString **culture, const uint16_t* src, int32_t srcLength, uint16_t* dst, int32_t dstLength, mono_bool bToUpper);
-@@ -81,4 +88,18 @@ void bindings_initialize_internals (void)
- 	mono_add_internal_call ("Interop/JsGlobalization::CompareString", mono_wasm_compare_string);
+@@ -83,4 +90,18 @@ void bindings_initialize_internals (void)
  	mono_add_internal_call ("Interop/JsGlobalization::StartsWith", mono_wasm_starts_with);
  	mono_add_internal_call ("Interop/JsGlobalization::EndsWith", mono_wasm_ends_with);
+ 	mono_add_internal_call ("Interop/JsGlobalization::IndexOf", mono_wasm_index_of);
 +
 +	// Uno Platform specific interop
 +	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
@@ -51,10 +52,10 @@ index 0b196d087ea..0225df04dec 100644
 +}
 \ No newline at end of file
 diff --git a/src/mono/wasm/runtime/cwraps.ts b/src/mono/wasm/runtime/cwraps.ts
-index 9540663fbd4..47d9bc34248 100644
+index 715a3936cec..f31e53abf49 100644
 --- a/src/mono/wasm/runtime/cwraps.ts
 +++ b/src/mono/wasm/runtime/cwraps.ts
-@@ -69,6 +69,9 @@ const fn_signatures: SigLine[] = [
+@@ -70,6 +70,9 @@ const fn_signatures: SigLine[] = [
      [true, "mono_wasm_diagnostic_server_post_resume_runtime", "void", []],
      [true, "mono_wasm_diagnostic_server_create_stream", "number", []],
  
@@ -64,7 +65,7 @@ index 9540663fbd4..47d9bc34248 100644
      //INTERNAL
      [false, "mono_wasm_exit", "void", ["number"]],
      [true, "mono_wasm_getenv", "number", ["string"]],
-@@ -189,6 +192,12 @@ export interface t_Cwraps {
+@@ -190,6 +193,12 @@ export interface t_Cwraps {
      mono_wasm_diagnostic_server_post_resume_runtime(): void;
      mono_wasm_diagnostic_server_create_stream(): VoidPtr;
  
@@ -78,10 +79,10 @@ index 9540663fbd4..47d9bc34248 100644
      mono_wasm_exit(exit_code: number): number;
      mono_wasm_getenv(name: string): CharPtr;
 diff --git a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-index b23d1981049..52095268a62 100644
+index ab293f667ae..22bedc64257 100644
 --- a/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
 +++ b/src/mono/wasm/runtime/es6/dotnet.es6.lib.js
-@@ -99,6 +99,11 @@ let linked_functions = [
+@@ -90,6 +90,11 @@ let linked_functions = [
      "mono_wasm_trace_logger",
      "mono_wasm_event_pipe_early_startup_callback",
  
@@ -94,7 +95,7 @@ index b23d1981049..52095268a62 100644
      "mono_interp_tier_prepare_jiterpreter",
      "mono_interp_record_interp_entry",
 diff --git a/src/mono/wasm/runtime/exports-linker.ts b/src/mono/wasm/runtime/exports-linker.ts
-index 417cb51e478..3e10fd9152f 100644
+index f4be31cfa09..94b05727138 100644
 --- a/src/mono/wasm/runtime/exports-linker.ts
 +++ b/src/mono/wasm/runtime/exports-linker.ts
 @@ -26,6 +26,10 @@ import { mono_wasm_typed_array_from_ref } from "./net6-legacy/buffers";
@@ -106,7 +107,7 @@ index 417cb51e478..3e10fd9152f 100644
 +    mono_wasm_invoke_on_main_thread,
 +    mono_wasm_invoke_js
  } from "./net6-legacy/method-calls";
- import { mono_wasm_change_case, mono_wasm_change_case_invariant, mono_wasm_compare_string, mono_wasm_ends_with, mono_wasm_starts_with } from "./hybrid-globalization";
+ import { mono_wasm_change_case, mono_wasm_change_case_invariant, mono_wasm_compare_string, mono_wasm_ends_with, mono_wasm_index_of, mono_wasm_starts_with } from "./hybrid-globalization";
  
 @@ -89,7 +93,12 @@ export function export_linker(): any {
          mono_wasm_trace_logger,
@@ -123,22 +124,36 @@ index 417cb51e478..3e10fd9152f 100644
          mono_wasm_release_cs_owned_object,
          mono_wasm_bind_js_function,
 diff --git a/src/mono/wasm/runtime/globals.ts b/src/mono/wasm/runtime/globals.ts
-index 1f032e37c96..0a76839b86a 100644
+index 91b4248b7ca..c73e328880a 100644
 --- a/src/mono/wasm/runtime/globals.ts
 +++ b/src/mono/wasm/runtime/globals.ts
-@@ -13,6 +13,10 @@ import type { EmscriptenModule } from "./types/emscripten";
- export let Module: EmscriptenModule & DotnetModule & EmscriptenModuleInternal;
+@@ -12,6 +12,10 @@ import type { GlobalObjects, EmscriptenInternals, RuntimeHelpers, LoaderHelpers,
+ export let Module: DotnetModuleInternal;
  export let INTERNAL: any;
  
 +// Uno-specific
 +
 +export let BINDING: any;
 +
- // these are imported and re-exported from emscripten internals
  export const ENVIRONMENT_IS_NODE = typeof process == "object" && typeof process.versions == "object" && typeof process.versions.node == "string";
  export const ENVIRONMENT_IS_WEB = typeof window == "object";
+ export const ENVIRONMENT_IS_WORKER = typeof importScripts == "function";
+diff --git a/src/mono/wasm/runtime/loader/globals.ts b/src/mono/wasm/runtime/loader/globals.ts
+index 6cebb54eaa4..fe9248a1bfa 100644
+--- a/src/mono/wasm/runtime/loader/globals.ts
++++ b/src/mono/wasm/runtime/loader/globals.ts
+@@ -47,7 +47,8 @@ export function setLoaderGlobals(
+     });
+ 
+     Object.assign(globalObjects.module, {
+-        disableDotnet6Compatibility: true,
++        // Uno specific restore .NET 6 compatibility on Module
++        disableDotnet6Compatibility: false,
+         config: { environmentVariables: {} }
+     });
+     Object.assign(runtimeHelpers, {
 diff --git a/src/mono/wasm/runtime/net6-legacy/method-calls.ts b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-index cf9fee9430e..58ae2a7e524 100644
+index 235e45c8641..5c7af15e543 100644
 --- a/src/mono/wasm/runtime/net6-legacy/method-calls.ts
 +++ b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
 @@ -3,17 +3,20 @@
@@ -152,9 +167,9 @@ index cf9fee9430e..58ae2a7e524 100644
  import { mono_wasm_new_external_root, mono_wasm_new_root } from "../roots";
  import { find_entry_point } from "../run";
 -import { conv_string_root, js_string_to_mono_string_root } from "../strings";
--import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot } from "../types";
+-import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, WasmRoot } from "../types/internal";
 +import { conv_string_root, js_string_to_mono_string_root, conv_string, js_string_to_mono_string } from "../strings";
-+import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, mono_assert, WasmRoot, MonoStringNull } from "../types";
++import { JSHandle, MonoStringRef, MonoObjectRef, MonoArray, MonoString, MonoObject, is_nullish, WasmRoot, MonoStringNull } from "../types/internal";
  import { Int32Ptr, VoidPtr } from "../types/emscripten";
  import { mono_array_root_to_js_array, unbox_mono_obj_root } from "./cs-to-js";
  import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
@@ -165,7 +180,7 @@ index cf9fee9430e..58ae2a7e524 100644
  
  const boundMethodsByFqn: Map<string, Function> = new Map();
  
-@@ -304,3 +307,92 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
+@@ -303,3 +306,92 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
          return 0;
      }
  }
@@ -258,20 +273,6 @@ index cf9fee9430e..58ae2a7e524 100644
 +    }
 +    return res;
 +}
-diff --git a/src/mono/wasm/runtime/globals.ts b/src/mono/wasm/runtime/globals.ts
-index 1f032e37c96..edeba5da6f9 100644
---- a/src/mono/wasm/runtime/globals.ts
-+++ b/src/mono/wasm/runtime/globals.ts
-@@ -47,7 +47,8 @@ export function setGlobalObjects(
-     exportedRuntimeAPI = globalObjects.api;
- 
-     Object.assign(globalObjects.module, {
--        disableDotnet6Compatibility: true,
-+        // Uno specific restore .NET 6 compatibility on Module
-+        disableDotnet6Compatibility: false,
-         config: { environmentVariables: {} }
-     });
-     Object.assign(globalObjects.module.config!, {}) as any;
 -- 
 2.25.1
 
