@@ -1,6 +1,6 @@
-From 9d5dc413f32d7c7a7f3d49a994a17921e50be57a Mon Sep 17 00:00:00 2001
+From d12234594a955fb7faea32898ae04fe1258a149a Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Thu, 25 May 2023 11:43:00 +0000
+Date: Thu, 25 May 2023 13:10:57 +0000
 Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
 
 ---
@@ -12,7 +12,8 @@ Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
  src/mono/wasm/runtime/globals.ts              |  4 +
  src/mono/wasm/runtime/loader/globals.ts       |  3 +-
  .../wasm/runtime/net6-legacy/method-calls.ts  | 98 ++++++++++++++++++-
- 8 files changed, 157 insertions(+), 5 deletions(-)
+ src/mono/wasm/runtime/strings.ts              |  6 ++
+ 9 files changed, 163 insertions(+), 5 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/corebindings.c b/src/mono/wasm/runtime/corebindings.c
 index 1a6494a101c..96cc9ee476e 100644
@@ -296,6 +297,23 @@ index 61388647a83..d67e8e8c271 100644
 +    }
 +    return res;
 +}
+diff --git a/src/mono/wasm/runtime/strings.ts b/src/mono/wasm/runtime/strings.ts
+index 3fd4e012d7d..01713eea445 100644
+--- a/src/mono/wasm/runtime/strings.ts
++++ b/src/mono/wasm/runtime/strings.ts
+@@ -103,6 +103,12 @@ let _interned_string_current_root_buffer_count = 0;
+ export const string_decoder = new StringDecoder();
+ export const mono_wasm_empty_string = "";
+ 
++/* UNO SPECIFIC */
++export function conv_string(mono_obj: MonoString): string | null {
++    return string_decoder.copy(mono_obj);
++}
++/* UNO SPECIFIC */
++
+ export function conv_string_root(root: WasmRoot<MonoString>): string | null {
+     return string_decoder.copy_root(root);
+ }
 -- 
 2.25.1
 
