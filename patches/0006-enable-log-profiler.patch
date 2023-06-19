@@ -1,6 +1,6 @@
-From 402d51414bdc541a3ad5a1db9487d7feb47327f0 Mon Sep 17 00:00:00 2001
+From 37c21886fd6182731791059864656b32d7dd0805 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Tue, 9 May 2023 21:01:55 +0000
+Date: Mon, 19 Jun 2023 12:46:00 +0000
 Subject: [PATCH] enable log profiler
 
 ---
@@ -10,13 +10,13 @@ Subject: [PATCH] enable log profiler
  src/mono/mono/profiler/CMakeLists.txt          |  7 +++++++
  src/mono/mono/profiler/helper.c                |  6 ++++++
  src/mono/mono/profiler/log.c                   | 18 +++++++++++++++++-
- src/mono/wasm/runtime/profiler.ts              |  7 ++++++-
+ src/mono/wasm/runtime/profiler.ts              |  9 +++++++--
  src/mono/wasm/runtime/startup.ts               |  6 +++++-
- src/mono/wasm/runtime/types.ts                 |  5 +++++
- 9 files changed, 50 insertions(+), 4 deletions(-)
+ src/mono/wasm/runtime/types/internal.ts        |  5 +++++
+ 9 files changed, 51 insertions(+), 5 deletions(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
-index 5760758d70e..411727c680d 100644
+index 3a961b3078c..65ffb10837b 100644
 --- a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 +++ b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
 @@ -232,6 +232,7 @@
@@ -28,10 +28,10 @@ index 5760758d70e..411727c680d 100644
      <PlatformManifestFileEntry Include="libmono-wasm-eh-js.a" IsNative="true" />
      <PlatformManifestFileEntry Include="libmono-wasm-eh-wasm.a" IsNative="true" />
 diff --git a/src/mono/mono.proj b/src/mono/mono.proj
-index 8765984d989..1d8190e26a6 100644
+index 8b412b3369e..1b8c4c7b741 100644
 --- a/src/mono/mono.proj
 +++ b/src/mono/mono.proj
-@@ -1022,6 +1022,9 @@
+@@ -1023,6 +1023,9 @@
        <_MonoRuntimeArtifacts Condition="'$(TargetsBrowser)' == 'true' and '$(BuildMonoAOTCrossCompilerOnly)' != 'true'" Include="$(MonoObjDir)out\lib\libmono-profiler-aot.a">
          <Destination>$(RuntimeBinDir)libmono-profiler-aot.a</Destination>
        </_MonoRuntimeArtifacts>
@@ -42,10 +42,10 @@ index 8765984d989..1d8190e26a6 100644
          <Destination>$(RuntimeBinDir)libmono-profiler-browser.a</Destination>
        </_MonoRuntimeArtifacts>
 diff --git a/src/mono/mono/mini/mini-wasm.c b/src/mono/mono/mini/mini-wasm.c
-index c0a64db6804..94b0ad81ddb 100644
+index cab202a1fa3..33ad65edafe 100644
 --- a/src/mono/mono/mini/mini-wasm.c
 +++ b/src/mono/mono/mini/mini-wasm.c
-@@ -563,7 +563,6 @@ mono_init_native_crash_info (void)
+@@ -565,7 +565,6 @@ static void *timer_handler;
  void
  mono_runtime_setup_stat_profiler (void)
  {
@@ -121,7 +121,7 @@ index bbff8e7bf95..05fc31b6708 100644
 +#endif
  }
 diff --git a/src/mono/mono/profiler/log.c b/src/mono/mono/profiler/log.c
-index 110253833a9..b391ffabe9e 100644
+index 1aa33e9c40e..eff4aef5de0 100644
 --- a/src/mono/mono/profiler/log.c
 +++ b/src/mono/mono/profiler/log.c
 @@ -3503,6 +3503,7 @@ runtime_initialized (MonoProfiler *profiler)
@@ -171,18 +171,20 @@ index 110253833a9..b391ffabe9e 100644
  mono_profiler_init_log (const char *desc);
  
 diff --git a/src/mono/wasm/runtime/profiler.ts b/src/mono/wasm/runtime/profiler.ts
-index fbaa646d903..3bc0b317c69 100644
+index da627b50ec4..c2e4db95746 100644
 --- a/src/mono/wasm/runtime/profiler.ts
 +++ b/src/mono/wasm/runtime/profiler.ts
-@@ -2,7 +2,7 @@
+@@ -1,8 +1,8 @@
+ // Licensed to the .NET Foundation under one or more agreements.
  // The .NET Foundation licenses this file to you under the MIT license.
  
- import { ENVIRONMENT_IS_WEB, Module, runtimeHelpers } from "./globals";
+-import { ENVIRONMENT_IS_WEB, runtimeHelpers } from "./globals";
 -import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions } from "./types/internal";
++import { ENVIRONMENT_IS_WEB, Module, runtimeHelpers } from "./globals";
 +import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions, LogProfilerOptions } from "./types/internal";
  import cwraps from "./cwraps";
+ import { utf8ToString } from "./strings";
  
- // Initialize the AOT profiler with OPTIONS.
 @@ -98,3 +98,8 @@ export function mono_wasm_profiler_leave(method: MonoMethod): void {
          globalThis.performance.measure(methodName, options);
      }
@@ -194,10 +196,10 @@ index fbaa646d903..3bc0b317c69 100644
 +}
 \ No newline at end of file
 diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
-index 1ae473cf243..9fbcb6ab5b8 100644
+index e9eee44f0de..3f867a9741e 100644
 --- a/src/mono/wasm/runtime/startup.ts
 +++ b/src/mono/wasm/runtime/startup.ts
-@@ -12,7 +12,7 @@ import { disableLegacyJsInterop, ENVIRONMENT_IS_NODE, ENVIRONMENT_IS_SHELL, expo
+@@ -9,7 +9,7 @@ import { disableLegacyJsInterop, ENVIRONMENT_IS_PTHREAD, exportedRuntimeAPI, INT
  import cwraps, { init_c_exports } from "./cwraps";
  import { mono_wasm_raise_debug_event, mono_wasm_runtime_ready } from "./debug";
  import { toBase64StringImpl } from "./base64";
@@ -206,7 +208,7 @@ index 1ae473cf243..9fbcb6ab5b8 100644
  import { initialize_marshalers_to_cs } from "./marshal-to-cs";
  import { initialize_marshalers_to_js } from "./marshal-to-js";
  import { init_polyfills_async } from "./polyfills";
-@@ -261,6 +261,10 @@ async function onRuntimeInitializedAsync(userOnRuntimeInitialized: () => void) {
+@@ -232,6 +232,10 @@ async function onRuntimeInitializedAsync(userOnRuntimeInitialized: () => void) {
  
          await wait_for_all_assets();
  
@@ -217,8 +219,8 @@ index 1ae473cf243..9fbcb6ab5b8 100644
          // Diagnostics early are not supported with memory snapshot. See below how we enable them later.
          // Please disable startupMemoryCache in order to be able to diagnose or pause runtime startup.
          if (MonoWasmThreads && !runtimeHelpers.config.startupMemoryCache) {
-diff --git a/src/mono/wasm/runtime/types.ts b/src/mono/wasm/runtime/types/internal.ts
-index 3f1c811dcec..10259374a6a 100644
+diff --git a/src/mono/wasm/runtime/types/internal.ts b/src/mono/wasm/runtime/types/internal.ts
+index f2dba23fe73..3e8e4372d66 100644
 --- a/src/mono/wasm/runtime/types/internal.ts
 +++ b/src/mono/wasm/runtime/types/internal.ts
 @@ -69,6 +69,7 @@ export function coerceNull<T extends ManagedPointer | NativePointer>(ptr: T | nu
