@@ -213,7 +213,7 @@ index 753c5851ab3..04744896dd9 100644
 +// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
 +export function mono_wasm_invoke_js_unmarshalled(exceptionMessage: Int32Ptr, funcName: MonoString, arg0: any, arg1: any, arg2: any): void | number {
 +    try {
-+        var funcNameRoot = mono_wasm_new_root<MonoString>();
++        const funcNameRoot = mono_wasm_new_root<MonoString>();
 +        funcNameRoot.set(funcName);
 +
 +        // Get the function you're trying to invoke
@@ -347,7 +347,7 @@ index f4cfa442386..3617b2b31cc 100644
 +/* UNO SPECIFIC */
 +export function conv_string(mono_obj: MonoString): string | null {
 +
-+    var codeRoot = mono_wasm_new_root<MonoString>();
++    const codeRoot = mono_wasm_new_root<MonoString>();
 +    codeRoot.set(mono_obj);
 +
 +    // Get the function you're trying to invoke
