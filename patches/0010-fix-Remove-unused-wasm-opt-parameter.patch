@@ -1,6 +1,6 @@
-From 3b7c28769da7c2b732efd917240e91ac439db571 Mon Sep 17 00:00:00 2001
+From dc7db7e8a59dc5aba58bf1f25b70952aa34a9445 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Tue, 9 May 2023 21:26:19 +0000
+Date: Mon, 19 Jun 2023 12:50:59 +0000
 Subject: [PATCH] fix: Adjust for unused wasm-opt parameter
 
 ---
@@ -8,12 +8,12 @@ Subject: [PATCH] fix: Adjust for unused wasm-opt parameter
  1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
-index 5bb5fb38c0e..8305a97739b 100644
+index 7bc98cdff51..58f987dad67 100644
 --- a/src/mono/wasm/wasm.proj
 +++ b/src/mono/wasm/wasm.proj
-@@ -306,6 +306,10 @@
-     <ItemGroup Condition="'$(MonoWasmThreads)' == 'true'">
-       <WasmOptConfigurationFlags Include="--enable-threads;--enable-bulk-memory;--enable-sign-ext" />
+@@ -307,6 +307,10 @@
+       <!-- workaround for https://github.com/emscripten-core/emscripten/issues/18034 -->
+       <_EmccLinkFlags Include="-s TEXTDECODER=0"/>
      </ItemGroup>
 + 
 +    <ItemGroup Condition="'$(WasmEnableSIMD)' == 'true'">
@@ -22,7 +22,7 @@ index 5bb5fb38c0e..8305a97739b 100644
  
      <ItemGroup Condition="'$(OS)' != 'Windows_NT'">
        <_EmccLinkFlags Include="--profiling-funcs" />
-@@ -393,7 +397,6 @@
+@@ -394,7 +398,6 @@
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DICU_LIB_DIR=&quot;$(ICULibDir.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DMONO_ARTIFACTS_DIR=&quot;$(MonoArtifactsPath.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
        <CMakeBuildRuntimeConfigureCmd>$(CMakeBuildRuntimeConfigureCmd) -DNATIVE_BIN_DIR=&quot;$(NativeBinDir.TrimEnd('\/').Replace('\','/'))&quot;</CMakeBuildRuntimeConfigureCmd>
