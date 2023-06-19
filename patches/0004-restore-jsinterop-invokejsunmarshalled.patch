@@ -198,7 +198,6 @@ index 753c5851ab3..04744896dd9 100644
  import { mono_array_root_to_js_array, unbox_mono_obj_root } from "./cs-to-js";
  import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
  import { Converter, BoundMethodToken, mono_method_resolve, mono_method_get_call_signature_ref, mono_bind_method, assert_legacy_interop } from "./method-binding";
-+import cwraps from "../cwraps";
 +import { mono_wasm_symbolicate_string } from "../logging";
 +import type { EmscriptenModule } from "../types/emscripten";
  
@@ -244,7 +243,7 @@ index 753c5851ab3..04744896dd9 100644
 +    if (code === MonoStringNull)
 +        return MonoStringNull;
 +
-+    var codeRoot = mono_wasm_new_root<MonoString>();
++    const codeRoot = mono_wasm_new_root<MonoString>();
 +    codeRoot.set(code);
 +
 +    // Get the function you're trying to invoke
@@ -291,10 +290,10 @@ index 753c5851ab3..04744896dd9 100644
 +export function wrap_error(is_exception: Int32Ptr | null, ex: any): MonoString {
 +    const res = _wrap_error_flag(is_exception, ex);
 +
-+    var resRoot = mono_wasm_new_root<MonoString>();
++    const resRoot = mono_wasm_new_root<MonoString>();
 +    stringToMonoStringRoot(res, resRoot);
 +
-+    var result = resRoot.value;
++    const result = resRoot.value;
 +    
 +    resRoot.release();
 +
