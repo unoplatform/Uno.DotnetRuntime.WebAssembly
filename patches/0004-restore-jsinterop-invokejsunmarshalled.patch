@@ -1,10 +1,10 @@
-From 0bd3bb86052421b7a2c87db66578eb938daa94c8 Mon Sep 17 00:00:00 2001
+From 4685293c09f34fa17a27f93573aaf291aa437fa5 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Mon, 19 Jun 2023 12:38:28 +0000
+Date: Mon, 19 Jun 2023 15:59:05 +0000
 Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
 
 ---
- src/mono/wasm/runtime/corebindings.c          |  21 +++
+ src/mono/wasm/runtime/corebindings.c          |  23 ++++
  src/mono/wasm/runtime/cwraps.ts               |  10 ++
  src/mono/wasm/runtime/driver.c                |  11 ++
  src/mono/wasm/runtime/es6/dotnet.es6.lib.js   |   5 +
@@ -13,24 +13,17 @@ Subject: [PATCH] restore-jsinterop-invokejsunmarshalled
  src/mono/wasm/runtime/loader/globals.ts       |   3 +-
  .../wasm/runtime/net6-legacy/method-calls.ts  | 122 +++++++++++++++++-
  src/mono/wasm/runtime/strings.ts              |  19 ++-
- 9 files changed, 200 insertions(+), 6 deletions(-)
+ 9 files changed, 202 insertions(+), 6 deletions(-)
 
 diff --git a/src/mono/wasm/runtime/corebindings.c b/src/mono/wasm/runtime/corebindings.c
-index 0dd7f9f3a15..6fd235cba4c 100644
+index 0dd7f9f3a15..37f3eb15e9e 100644
 --- a/src/mono/wasm/runtime/corebindings.c
 +++ b/src/mono/wasm/runtime/corebindings.c
-@@ -93,4 +93,25 @@ void bindings_initialize_internals (void)
- 	mono_add_internal_call ("Interop/JsGlobalization::StartsWith", mono_wasm_starts_with);
- 	mono_add_internal_call ("Interop/JsGlobalization::EndsWith", mono_wasm_ends_with);
- 	mono_add_internal_call ("Interop/JsGlobalization::IndexOf", mono_wasm_index_of);
-+
-+	// Uno Platform specific interop
-+	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
-+	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeOnMainThread", mono_wasm_proxy_invoke_on_main_thread);
-+	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
- }
-+
-+// Uno specific interop
+@@ -56,6 +56,23 @@ extern mono_bool mono_wasm_starts_with(MonoString **culture, const uint16_t* str
+ extern mono_bool mono_wasm_ends_with(MonoString **culture, const uint16_t* str1, int32_t str1Length, const uint16_t* str2, int32_t str2Length, int32_t options, int *is_exception, MonoObject** ex_result);
+ extern int mono_wasm_index_of(MonoString **culture, const uint16_t* str1, int32_t str1Length, const uint16_t* str2, int32_t str2Length, int32_t options, mono_bool fromBeginning, int *is_exception, MonoObject** ex_result);
+ 
++/* BEGIN Uno specific interop */
 +extern void* mono_wasm_invoke_js_unmarshalled (MonoString **exceptionMessage, MonoString *funcName, void* arg0, void* arg1, void* arg2);
 +extern void mono_wasm_invoke_on_main_thread ();
 +extern void mono_threads_wasm_async_run_in_main_thread (void (*func) (void));
@@ -45,7 +38,22 @@ index 0dd7f9f3a15..6fd235cba4c 100644
 +	assert(0);
 +#endif
 +}
-\ No newline at end of file
++/* END Uno specific interop */
++
+ void bindings_initialize_internals (void)
+ {
+ 	mono_add_internal_call ("Interop/Runtime::ReleaseCSOwnedObject", mono_wasm_release_cs_owned_object);
+@@ -93,4 +110,10 @@ void bindings_initialize_internals (void)
+ 	mono_add_internal_call ("Interop/JsGlobalization::StartsWith", mono_wasm_starts_with);
+ 	mono_add_internal_call ("Interop/JsGlobalization::EndsWith", mono_wasm_ends_with);
+ 	mono_add_internal_call ("Interop/JsGlobalization::IndexOf", mono_wasm_index_of);
++
++	/* BEGIN Uno specific interop */
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeJSUnmarshalled", mono_wasm_invoke_js_unmarshalled);
++	mono_add_internal_call ("WebAssembly.JSInterop.InternalCalls::InvokeOnMainThread", mono_wasm_proxy_invoke_on_main_thread);
++	mono_add_internal_call ("Interop/Runtime::InvokeJS", mono_wasm_invoke_js);
++	/* END Uno specific interop */
+ }
 diff --git a/src/mono/wasm/runtime/cwraps.ts b/src/mono/wasm/runtime/cwraps.ts
 index 0bdfe5f0268..5ce8f703534 100644
 --- a/src/mono/wasm/runtime/cwraps.ts
@@ -178,10 +186,10 @@ index 6cebb54eaa4..fe9248a1bfa 100644
      });
      Object.assign(runtimeHelpers, {
 diff --git a/src/mono/wasm/runtime/net6-legacy/method-calls.ts b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-index 753c5851ab3..04744896dd9 100644
+index 753c5851ab3..f1c500a4d3a 100644
 --- a/src/mono/wasm/runtime/net6-legacy/method-calls.ts
 +++ b/src/mono/wasm/runtime/net6-legacy/method-calls.ts
-@@ -2,17 +2,20 @@
+@@ -2,18 +2,21 @@
  // The .NET Foundation licenses this file to you under the MIT license.
  
  import { get_js_obj, mono_wasm_get_jsobj_from_js_handle } from "../gc-handles";
@@ -198,12 +206,13 @@ index 753c5851ab3..04744896dd9 100644
  import { mono_array_root_to_js_array, unbox_mono_obj_root } from "./cs-to-js";
  import { js_array_to_mono_array, js_to_mono_obj_root } from "./js-to-cs";
  import { Converter, BoundMethodToken, mono_method_resolve, mono_method_get_call_signature_ref, mono_bind_method, assert_legacy_interop } from "./method-binding";
-+
+ 
 +import { mono_wasm_symbolicate_string } from "../logging";
 +import type { EmscriptenModule } from "../types/emscripten";
- 
++
  const boundMethodsByFqn: Map<string, Function> = new Map();
  
+ export function _teardown_after_call(
 @@ -304,3 +307,118 @@ export function mono_wasm_invoke_js_blazor(exceptionMessage: Int32Ptr, callInfo:
          return 0;
      }
@@ -324,7 +333,7 @@ index 753c5851ab3..04744896dd9 100644
 +    return res;
 +}
 diff --git a/src/mono/wasm/runtime/strings.ts b/src/mono/wasm/runtime/strings.ts
-index f4cfa442386..3617b2b31cc 100644
+index f4cfa442386..b0bf7c79bb9 100644
 --- a/src/mono/wasm/runtime/strings.ts
 +++ b/src/mono/wasm/runtime/strings.ts
 @@ -1,7 +1,7 @@
