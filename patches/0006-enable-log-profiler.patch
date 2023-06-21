@@ -216,7 +216,7 @@ index e9eee44f0de..3f867a9741e 100644
 +            mono_wasm_init_log_profiler(runtimeHelpers.config.logProfilerOptions);
 +        }
 +
-         // Diagnostics early are not supported with memory snapshot. See below how we enable them later.
+         // Threads early are not supported with memory snapshot. See below how we enable them later.
          // Please disable startupMemoryCache in order to be able to diagnose or pause runtime startup.
          if (MonoWasmThreads && !runtimeHelpers.config.startupMemoryCache) {
 diff --git a/src/mono/wasm/runtime/types/internal.ts b/src/mono/wasm/runtime/types/internal.ts
