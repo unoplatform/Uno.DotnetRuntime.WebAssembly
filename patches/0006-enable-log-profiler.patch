@@ -178,9 +178,9 @@ index da627b50ec4..c2e4db95746 100644
  // Licensed to the .NET Foundation under one or more agreements.
  // The .NET Foundation licenses this file to you under the MIT license.
  
--import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, runtimeHelpers } from "./globals";
+-import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, mono_assert, runtimeHelpers } from "./globals";
 -import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions } from "./types/internal";
-+import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, Module, runtimeHelpers } from "./globals";
++import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, mono_assert, Module, runtimeHelpers } from "./globals";
 +import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions, LogProfilerOptions } from "./types/internal";
  import { profiler_c_functions as cwraps } from "./cwraps";
  import { utf8ToString } from "./strings";
@@ -224,7 +224,7 @@ index f2dba23fe73..3e8e4372d66 100644
 --- a/src/mono/wasm/runtime/types/internal.ts
 +++ b/src/mono/wasm/runtime/types/internal.ts
 @@ -69,6 +69,7 @@ export function coerceNull<T extends ManagedPointer | NativePointer>(ptr: T | nu
- export type MonoConfigInternal = MonoConfig & {
+     assets?: AssetEntryInternal[],
      runtimeOptions?: string[], // array of runtime options as strings
      aotProfilerOptions?: AOTProfilerOptions, // dictionary-style Object. If omitted, aot profiler will not be initialized.
 +    logProfilerOptions?: LogProfilerOptions, // dictionary-style Object. If omitted, log profiler will not be initialized.
@@ -232,8 +232,8 @@ index f2dba23fe73..3e8e4372d66 100644
      waitForDebugger?: number,
      appendElementOnExit?: boolean
 @@ -78,6 +79,10 @@ export type MonoConfigInternal = MonoConfig & {
-     exitAfterSnapshot?: number,
-     startupOptions?: Partial<WebAssemblyStartOptions>
+     exitAfterSnapshot?: number
+     loadAllSatelliteResources?: boolean
  };
 + 
 +export type LogProfilerOptions = {
