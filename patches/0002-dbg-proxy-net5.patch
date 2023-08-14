@@ -4,23 +4,24 @@ Date: Wed, 10 May 2023 14:06:02 +0000
 Subject: [PATCH] adjust debugger tfm
 
 ---
- .../src/Microsoft.NET.WebAssembly.Webcil.csproj          | 2 +-
+ .../src/tasks/Microsoft.NET.WebAssembly.Webcil/Microsoft.NET.WebAssembly.Webcil.csproj          | 2 +-
  .../debugger/BrowserDebugHost/BrowserDebugHost.csproj    | 9 ++++++++-
  .../debugger/BrowserDebugProxy/BrowserDebugProxy.csproj  | 6 ++++++
  3 files changed, 15 insertions(+), 2 deletions(-)
 
-diff --git a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
+diff --git a/src/tasks/Microsoft.NET.WebAssembly.Webcil/Microsoft.NET.WebAssembly.Webcil.csproj b/src/tasks/Microsoft.NET.WebAssembly.Webcil/Microsoft.NET.WebAssembly.Webcil.csproj
 index 6c66737e553..9a5dc8f4e2f 100644
---- a/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
-+++ b/src/libraries/Microsoft.NET.WebAssembly.Webcil/src/Microsoft.NET.WebAssembly.Webcil.csproj
+--- a/src/tasks/Microsoft.NET.WebAssembly.Webcil/Microsoft.NET.WebAssembly.Webcil.csproj
++++ b/src/tasks/Microsoft.NET.WebAssembly.Webcil/Microsoft.NET.WebAssembly.Webcil.csproj
 @@ -1,6 +1,6 @@
  <Project Sdk="Microsoft.NET.Sdk">
+ 
    <PropertyGroup>
--    <TargetFrameworks>$(NetCoreAppToolCurrent);$(NetFrameworkToolCurrent)</TargetFrameworks>
-+    <TargetFrameworks>$(NetCoreAppToolCurrent);$(NetFrameworkToolCurrent);net7.0</TargetFrameworks>
+-    <TargetFrameworks>$(TargetFrameworkForNETCoreTasks);$(TargetFrameworkForNETFrameworkTasks)</TargetFrameworks>
++    <TargetFrameworks>$(TargetFrameworkForNETCoreTasks);$(TargetFrameworkForNETFrameworkTasks);net7.0</TargetFrameworks>
      <Description>Abstractions for modifying .NET webcil binary images</Description>
-     <IncludeSymbols>true</IncludeSymbols>
-     <Serviceable>true</Serviceable>
+     <EnableDefaultItems>true</EnableDefaultItems>
+     <Nullable>enable</Nullable>
 diff --git a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj b/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
 index 5bb950ac301..eff601f58e0 100644
 --- a/src/mono/wasm/debugger/BrowserDebugHost/BrowserDebugHost.csproj
@@ -35,20 +36,20 @@ index 5bb950ac301..eff601f58e0 100644
      <NoWarn>$(NoWarn),CA2007</NoWarn>
 +    <AppendTargetFrameworkToOutputPath Condition="'$(TargetFramework)'=='net7.0'">true</AppendTargetFrameworkToOutputPath>
 +
-+    <!--
-+		Enable implicit dotnet runtime forward rolling, as a net5
-+		project may run with net6 only SDK installed
-+		-->
-+		<RollForward>Major</RollForward>
++
++
++
++
++
      <UseAppHost>false</UseAppHost>
+     <RollForward>Major</RollForward>
    </PropertyGroup>
- 
 diff --git a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 index 22f0a963aec..3fbda43c7ba 100644
 --- a/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 +++ b/src/mono/wasm/debugger/BrowserDebugProxy/BrowserDebugProxy.csproj
 @@ -19,4 +19,10 @@
-     <ProjectReference Include="$(LibrariesProjectRoot)Microsoft.NET.WebAssembly.Webcil\src\Microsoft.NET.WebAssembly.Webcil.csproj" Private="true" />
+                       SetConfiguration="Configuration=$(TasksConfiguration)" />
    </ItemGroup>
  
 +  <PropertyGroup>
