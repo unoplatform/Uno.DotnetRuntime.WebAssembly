@@ -199,10 +199,10 @@ jobs:
       name: Apply uno-specific patches
       shell: pwsh
 
-    - name: Install cmake 3.16 
+    - name: Install cmake
       run: |
         set -e
-        wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
         sudo tar --strip-components=1 -xz -C /usr/local
 
     - name: 'Setup Emscripten'
