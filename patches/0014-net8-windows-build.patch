@@ -15,7 +15,7 @@ index 2f60f08a55c..cb3896dde5a 100644
      <OutputType>Exe</OutputType>
      <Nullable>enable</Nullable>
      <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
-+    <UseRidGraph>false</UseRidGraph>
++    <NoWarn>$(NoWarn);NETSDK1206</NoWarn>
    </PropertyGroup>
    <ItemGroup>
      <Compile Include="WasmTestRunner.cs" />
