@@ -1,0 +1,24 @@
+From 39e27c609f755fd3450fb74e1052b897b5224c7b Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Tue, 15 Aug 2023 14:29:15 +0000
+Subject: [PATCH] chore: Adjust WasmTestRunner for windows
+
+---
+ src/libraries/Common/tests/WasmTestRunner/WasmTestRunner.csproj | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/libraries/Common/tests/WasmTestRunner/WasmTestRunner.csproj b/src/libraries/Common/tests/WasmTestRunner/WasmTestRunner.csproj
+index 2f60f08a55c..cb3896dde5a 100644
+--- a/src/libraries/Common/tests/WasmTestRunner/WasmTestRunner.csproj
++++ b/src/libraries/Common/tests/WasmTestRunner/WasmTestRunner.csproj
+@@ -3,6 +3,7 @@
+     <OutputType>Exe</OutputType>
+     <Nullable>enable</Nullable>
+     <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <UseRidGraph>true</UseRidGraph>
+   </PropertyGroup>
+   <ItemGroup>
+     <Compile Include="WasmTestRunner.cs" />
+-- 
+2.25.1
+
