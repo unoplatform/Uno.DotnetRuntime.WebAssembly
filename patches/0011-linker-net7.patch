@@ -1,14 +1,15 @@
-From c51a03d4217315669d9759ee4ac7e22bf2881b1c Mon Sep 17 00:00:00 2001
+From ffdd573d3f53769a117e5cf56033fa6b41af0ce3 Mon Sep 17 00:00:00 2001
 From: Jerome Laban <jerome@platform.uno>
-Date: Wed, 10 May 2023 16:05:58 +0000
+Date: Mon, 14 Aug 2023 20:51:03 +0000
 Subject: [PATCH] linker for net7.0
 
 ---
- src/tools/illink/Directory.Build.props | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
+ src/tools/illink/Directory.Build.props                   | 9 ++++++++-
+ .../src/linker/Linker.Steps/UnsafeAccessorMarker.cs      | 3 +++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
 
 diff --git a/src/tools/illink/Directory.Build.props b/src/tools/illink/Directory.Build.props
-index 5f4701dbc80..991e83e56ff 100644
+index 9d2a6b4168a..b05c6b248f7 100644
 --- a/src/tools/illink/Directory.Build.props
 +++ b/src/tools/illink/Directory.Build.props
 @@ -7,7 +7,14 @@
@@ -27,6 +28,29 @@ index 5f4701dbc80..991e83e56ff 100644
      <DisableImplicitNamespaceImports_DotNet>true</DisableImplicitNamespaceImports_DotNet>
      <!-- TODO: Fix the api differences between the ref and src illink. -->
      <ApiCompatValidateAssemblies>false</ApiCompatValidateAssemblies>
+diff --git a/src/tools/illink/src/linker/Linker.Steps/UnsafeAccessorMarker.cs b/src/tools/illink/src/linker/Linker.Steps/UnsafeAccessorMarker.cs
+index d6155b8a50b..4397666929b 100644
+--- a/src/tools/illink/src/linker/Linker.Steps/UnsafeAccessorMarker.cs
++++ b/src/tools/illink/src/linker/Linker.Steps/UnsafeAccessorMarker.cs
+@@ -20,8 +20,10 @@ namespace Mono.Linker.Steps
+ 		// and we would need that to correctly implement the desired behavior around custom modifiers. So for now we decided to not
+ 		// duplicate the logic to tweak it and will just mark entire method groups.
+ 
++#pragma warning disable CA1822
+ 		public void ProcessUnsafeAccessorMethod (MethodDefinition method)
+ 		{
++#if NET8_0_OR_GREATER
+ 			if (!method.IsStatic || !method.HasCustomAttributes)
+ 				return;
+ 
+@@ -65,6 +67,7 @@ public void ProcessUnsafeAccessorMethod (MethodDefinition method)
+ 					}
+ 				}
+ 			}
++#endif
+ 		}
+ 
+ 		void ProcessConstructorAccessor (MethodDefinition method, string? name)
 -- 
 2.25.1
 

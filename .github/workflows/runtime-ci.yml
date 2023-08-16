@@ -14,8 +14,8 @@ on:
 
 env:
   EMSDK_VERSION: 3.1.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 57cfd0624054e7260fae0a4f3d2d6ee4d02995ca
-  DOTNETSDK_VERSION: 8.0.100-preview.4.23260.5
+  DOTNETRUNTIME_COMMIT: 6d0e3e59dd2f96eb9ca5c5397ff2a9d7c5526cac
+  DOTNETSDK_VERSION: 8.0.100-preview.7.23376.3
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
 jobs:
@@ -87,7 +87,7 @@ jobs:
         $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
         
         # Move cross compiler to appropriate location 
         move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
@@ -161,11 +161,19 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y python3-pip locales p7zip-full zip
         sudo apt-get install -y unzip zip python python3.7 msbuild libc6 ninja-build
-        sudo apt-get install -y cmake llvm-9 clang-9 autoconf automake \
+        sudo apt-get install -y cmake autoconf automake \
           libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
+
+    - name: Install LLVM 12
+      run: |
+        set -e
+        printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" |sudo tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key |sudo apt-key add -
+        sudo apt update
+        sudo apt install -y llvm-12 clang-12
         
     - name: Update to Git 2.18 or later
       run: |
@@ -199,10 +207,10 @@ jobs:
       name: Apply uno-specific patches
       shell: pwsh
 
-    - name: Install cmake 3.16 
+    - name: Install cmake
       run: |
         set -e
-        wget -qO- https://cmake.org/files/v3.16/cmake-3.16.5-Linux-x86_64.tar.gz | \
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
         sudo tar --strip-components=1 -xz -C /usr/local
 
     - name: 'Setup Emscripten'
@@ -225,7 +233,7 @@ jobs:
         set -e
         export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS"
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS"
 
         # Mark AOT generation binaries executable
         chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
