@@ -151,8 +151,8 @@ index 5db69fc91bf..ba86703dd7f 100644
 +export let BINDING: any;
 +
  export const ENVIRONMENT_IS_NODE = typeof process == "object" && typeof process.versions == "object" && typeof process.versions.node == "string";
- export const ENVIRONMENT_IS_WEB = typeof window == "object";
  export const ENVIRONMENT_IS_WORKER = typeof importScripts == "function";
+ export const ENVIRONMENT_IS_WEB = typeof window == "object" || (ENVIRONMENT_IS_WORKER && !ENVIRONMENT_IS_NODE);
 diff --git a/src/mono/wasm/runtime/loader/globals.ts b/src/mono/wasm/runtime/loader/globals.ts
 index a710ea0cb3b..3180c5b7258 100644
 --- a/src/mono/wasm/runtime/loader/globals.ts
