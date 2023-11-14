@@ -15,7 +15,7 @@ on:
 env:
   EMSDK_VERSION: 3.1.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
   DOTNETRUNTIME_COMMIT: 7331dcb60e0fd7c74a6f7216d61819c9f57a1ade
-  DOTNETSDK_VERSION: 8.0.100-rtm.23506.1
+  DOTNETSDK_VERSION: 8.0.100
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
 jobs:
