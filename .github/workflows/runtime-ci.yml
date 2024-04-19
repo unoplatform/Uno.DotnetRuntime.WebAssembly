@@ -117,7 +117,7 @@ jobs:
 
     - name: Copy ninja
       run: |
-        Invoke-WebRequest https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip -OutFile ninja-win.zip 
+        Invoke-WebRequest https://github.com/ninja-build/ninja/releases/download/v1.12.0/ninja-win.zip -OutFile ninja-win.zip 
         Expand-Archive -LiteralPath 'ninja-win.zip' -DestinationPath runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools
 
     - name: Zip Archive
