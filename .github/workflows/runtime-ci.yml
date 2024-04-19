@@ -51,14 +51,6 @@ jobs:
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
         echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $env:GITHUB_ENV
 
-    - name: Remove ccache from chocolatey
-      run: |
-        # ccache installed by chocolatey in hosted agent is interfering with emscripten
-        # Uninstalling does not work, as it's not registered in chocolatey.
-        # So we'll delete it for now until we can find where it's actually used by 
-        # the runtime's build.
-        del C:\ProgramData\chocolatey\bin\ccache.exe
-
     - name: Clone dotnet/runtime
       run: |
         git clone --recursive https://github.com/dotnet/runtime -c core.longpaths=true 
