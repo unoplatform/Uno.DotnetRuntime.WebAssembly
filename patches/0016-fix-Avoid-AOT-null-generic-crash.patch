@@ -1,0 +1,26 @@
+From f229efd4fc15a29d72d8af58fa70d130ff595352 Mon Sep 17 00:00:00 2001
+From: jerome laban <jerome@platform.uno>
+Date: Fri, 28 Jun 2024 21:38:43 +0000
+Subject: [PATCH] fix: Avoid AOT null generic crash
+
+---
+ src/mono/mono/metadata/metadata.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/mono/mono/metadata/metadata.c b/src/mono/mono/metadata/metadata.c
+index f9abe652b01..89cb9a66b6b 100644
+--- a/src/mono/mono/metadata/metadata.c
++++ b/src/mono/mono/metadata/metadata.c
+@@ -5508,6 +5508,9 @@ mono_metadata_generic_class_is_valuetype (MonoGenericClass *gclass)
+ static gboolean
+ _mono_metadata_generic_class_equal (const MonoGenericClass *g1, const MonoGenericClass *g2, gboolean signature_only)
+ {
++	if (!g1 || !g2)
++		return FALSE;
++
+ 	MonoGenericInst *i1 = g1->context.class_inst;
+ 	MonoGenericInst *i2 = g2->context.class_inst;
+ 
+-- 
+2.39.2
+
