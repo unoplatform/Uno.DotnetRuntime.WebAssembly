@@ -1,0 +1,230 @@
+From f74725e000b425f1536f92fd73b4caffdadc2c25 Mon Sep 17 00:00:00 2001
+From: Fan Yang <52458914+fanyang-mono@users.noreply.github.com>
+Date: Fri, 26 Apr 2024 21:28:09 -0400
+Subject: [PATCH] [mono] UnsafeAccessor: Add support for non-generic method
+ instance (#101442)
+
+* Support non generic instance
+
+* Create helper function for shared code
+
+* Use an existing API
+
+* Add an assert
+
+---------
+
+Co-authored-by: Larry Ewing <lewing@microsoft.com>
+---
+ src/mono/mono/metadata/class.c               |  2 +-
+ src/mono/mono/metadata/marshal-lightweight.c | 73 +++++++++++++++++---
+ src/mono/mono/metadata/unsafe-accessor.c     | 22 ++----
+ src/mono/mono/mini/method-to-ir.c            |  2 +-
+ 4 files changed, 72 insertions(+), 27 deletions(-)
+
+diff --git a/src/mono/mono/metadata/class.c b/src/mono/mono/metadata/class.c
+index c5fcd2a8d7a..00d2a0090a8 100644
+--- a/src/mono/mono/metadata/class.c
++++ b/src/mono/mono/metadata/class.c
+@@ -5164,7 +5164,7 @@ mono_class_get_fields_internal (MonoClass *klass, gpointer *iter)
+  * mono_class_get_methods:
+  * \param klass the \c MonoClass to act on
+  *
+- * This routine is an iterator routine for retrieving the fields in a class.
++ * This routine is an iterator routine for retrieving the methods in a class.
+  *
+  * You must pass a \c gpointer that points to zero and is treated as an opaque handle to
+  * iterate over all of the elements.  When no more values are
+diff --git a/src/mono/mono/metadata/marshal-lightweight.c b/src/mono/mono/metadata/marshal-lightweight.c
+index 3c5b0de4c67..8d7f180e95a 100644
+--- a/src/mono/mono/metadata/marshal-lightweight.c
++++ b/src/mono/mono/metadata/marshal-lightweight.c
+@@ -2421,6 +2421,44 @@ emit_missing_method_error (MonoMethodBuilder *mb, MonoError *failure, const char
+ 	}
+ }
+ 
++static MonoMethodSignature *
++update_signature (MonoMethod *accessor_method)
++{
++	MonoClass *accessor_method_class_instance = accessor_method->klass;
++	MonoClass *accessor_method_class = mono_class_get_generic_type_definition (accessor_method_class_instance);
++
++	const char *accessor_method_name = accessor_method->name;
++
++	gpointer iter = NULL;
++	MonoMethod *m = NULL;
++	while ((m = mono_class_get_methods (accessor_method_class, &iter))) {
++		if (!m)
++			continue;
++		
++		if (strcmp (m->name, accessor_method_name))
++			continue;
++		
++		return mono_metadata_signature_dup_full (get_method_image (m), mono_method_signature_internal (m));
++	}
++	g_assert_not_reached ();
++}
++
++static MonoMethod *
++inflate_method (MonoClass *klass, MonoMethod *method, MonoMethod *accessor_method, MonoError *error)
++{
++	MonoMethod *result = method;
++	MonoGenericContext context = { NULL, NULL };
++	if (mono_class_is_ginst (klass))
++		context.class_inst = mono_class_get_generic_class (klass)->context.class_inst;
++	if (accessor_method->is_inflated)
++		context.method_inst = mono_method_get_context (accessor_method)->method_inst;
++	if ((context.class_inst != NULL) || (context.method_inst != NULL))
++		result = mono_class_inflate_generic_method_checked (method, &context, error);
++	mono_error_assert_ok (error);
++	
++	return result;
++}
++
+ static void
+ emit_unsafe_accessor_ctor_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor_method, MonoMethodSignature *sig, MonoGenericContext *ctx, MonoUnsafeAccessorKind kind, const char *member_name)
+ {
+@@ -2439,12 +2477,17 @@ emit_unsafe_accessor_ctor_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor_m
+ 		return;
+ 	}
+ 
+-	MonoMethodSignature *member_sig = ctor_sig_from_accessor_sig (mb, sig, ctx);
+-
+ 	MonoClass *target_class = mono_class_from_mono_type_internal (target_type);
+ 
+ 	ERROR_DECL(find_method_error);
+-	MonoClass *in_class = mono_class_is_ginst (target_class) ? mono_class_get_generic_class (target_class)->container_class : target_class;
++	if (accessor_method->is_inflated) {
++		sig =  update_signature(accessor_method);
++	}
++
++	MonoMethodSignature *member_sig = ctor_sig_from_accessor_sig (mb, sig, ctx);
++	
++	MonoClass *in_class = mono_class_get_generic_type_definition (target_class);
++
+ 	MonoMethod *target_method = mono_unsafe_accessor_find_ctor (in_class, member_sig, target_class, find_method_error);
+ 	if (!is_ok (find_method_error) || target_method == NULL) {
+ 		if (mono_error_get_error_code (find_method_error) == MONO_ERROR_GENERIC)
+@@ -2454,6 +2497,9 @@ emit_unsafe_accessor_ctor_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor_m
+ 		mono_error_cleanup (find_method_error);
+ 		return;
+ 	}
++
++	target_method = inflate_method (target_class, target_method, accessor_method, find_method_error);
++
+ 	g_assert (target_method->klass == target_class);
+ 
+ 	emit_unsafe_accessor_ldargs (mb, sig, 0);
+@@ -2475,11 +2521,9 @@ emit_unsafe_accessor_method_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor
+ 		mono_mb_emit_exception_full (mb, "System", "BadImageFormatException", "Invalid usage of UnsafeAccessorAttribute.");
+ 		return;
+ 	}
+-	gboolean hasthis = kind == MONO_UNSAFE_ACCESSOR_METHOD;
+-	MonoType *target_type = sig->params[0];
+-
+-	MonoMethodSignature *member_sig = method_sig_from_accessor_sig (mb, hasthis, sig, ctx);
+ 
++	MonoType *target_type = sig->params[0];
++	gboolean hasthis = kind == MONO_UNSAFE_ACCESSOR_METHOD;
+ 	MonoClass *target_class = mono_class_from_mono_type_internal (target_type);
+ 
+ 	if (hasthis && m_class_is_valuetype (target_class) && !m_type_is_byref (target_type)) {
+@@ -2488,7 +2532,14 @@ emit_unsafe_accessor_method_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor
+ 	}
+ 
+ 	ERROR_DECL(find_method_error);
+-	MonoClass *in_class = mono_class_is_ginst (target_class) ? mono_class_get_generic_class (target_class)->container_class : target_class;
++	if (accessor_method->is_inflated) {
++		sig =  update_signature(accessor_method);
++	}
++
++	MonoMethodSignature *member_sig = method_sig_from_accessor_sig (mb, hasthis, sig, ctx);
++
++	MonoClass *in_class = mono_class_get_generic_type_definition (target_class);
++
+ 	MonoMethod *target_method = NULL;
+ 	if (!ctor_as_method)
+ 		target_method = mono_unsafe_accessor_find_method (in_class, member_name, member_sig, target_class, find_method_error);
+@@ -2502,11 +2553,15 @@ emit_unsafe_accessor_method_wrapper (MonoMethodBuilder *mb, MonoMethod *accessor
+ 		mono_error_cleanup (find_method_error);
+ 		return;
+ 	}
++
++	target_method = inflate_method (target_class, target_method, accessor_method, find_method_error);
++
+ 	if (!hasthis && target_method->klass != target_class) {
+ 		emit_missing_method_error (mb, find_method_error, member_name);
+ 		return;
+ 	}
+-	g_assert (target_method->klass == target_class); // are instance methods allowed to be looked up using inheritance?
++	
++	g_assert (target_method->klass == target_class);
+ 
+ 	emit_unsafe_accessor_ldargs (mb, sig, !hasthis ? 1 : 0);
+ 
+diff --git a/src/mono/mono/metadata/unsafe-accessor.c b/src/mono/mono/metadata/unsafe-accessor.c
+index e7287a00c46..584b2914658 100644
+--- a/src/mono/mono/metadata/unsafe-accessor.c
++++ b/src/mono/mono/metadata/unsafe-accessor.c
+@@ -14,7 +14,7 @@
+ #include "mono/metadata/class-internals.h"
+ #include "mono/utils/mono-error-internals.h"
+ #include "mono/metadata/unsafe-accessor.h"
+-
++#include <mono/metadata/debug-helpers.h>
+ 
+ 
+ static MonoMethod *
+@@ -134,7 +134,10 @@ find_method_slow (MonoClass *klass, const char *name, const char *qname, const c
+ 						return precise_match;
+ 				}
+ 				mono_error_set_generic_error (error, "System.Reflection", "AmbiguousMatchException", "Ambiguity in binding of UnsafeAccessorAttribute.");
+-				return NULL;
++				result->i = -1;
++				result->m = NULL;
++				result->matched = FALSE;
++				return result;
+ 			}
+ 			matched = TRUE;
+ 			result->i = i;
+@@ -176,23 +179,10 @@ find_method_in_class_unsafe_accessor (MonoClass *klass, const char *name, const
+ 	if (!is_ok(error) && mono_error_get_error_code (error) == MONO_ERROR_GENERIC)
+ 		return NULL;
+ 
+-	int mcount = mono_class_get_method_count (klass);
+ 
+ 	g_assert (result != NULL);
+ 	if (result->matched) {
+-		if (result->i < mcount)
+-			return mono_class_get_method_by_index (from_class, result->i);
+-		else if (result->m != NULL) {
+-			// FIXME: metadata-update: hack
+-			// it's from a metadata-update, probably
+-			MonoMethod * m = mono_class_inflate_generic_method_full_checked (
+-				result->m, from_class, mono_class_get_context (from_class), error);
+-			mono_error_assert_ok (error);
+-			g_assert (m != NULL);
+-			g_assert (m->klass == from_class);
+-			g_assert (m->is_inflated);
+-			return m;
+-		}
++		return result->m;
+ 	}
+ 
+ 	g_free (result);
+diff --git a/src/mono/mono/mini/method-to-ir.c b/src/mono/mono/mini/method-to-ir.c
+index 2dbb57653f3..58e36186390 100644
+--- a/src/mono/mono/mini/method-to-ir.c
++++ b/src/mono/mono/mini/method-to-ir.c
+@@ -7746,7 +7746,7 @@ mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_b
+ 				UNVERIFIED;
+ 
+ 			if (!cfg->gshared)
+-				g_assert (!mono_method_check_context_used (cmethod));
++				g_assertf (!mono_method_check_context_used (cmethod), "cmethod is %s", mono_method_get_full_name (cmethod));
+ 
+ 			CHECK_STACK (n);
+ 
+-- 
+2.39.2
+
