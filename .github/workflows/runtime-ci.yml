@@ -139,7 +139,7 @@ jobs:
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
-    # container: 'unoplatform/wasm-build:2.3'
+    container: 'mcr.microsoft.com/dotnet/sdk:8.0'
 
     strategy:
       matrix:
@@ -158,7 +158,7 @@ jobs:
         set -e
         sudo apt-get update
         sudo apt-get install -y python3-pip locales p7zip-full zip
-        sudo apt-get install -y unzip zip python python3.7 msbuild libc6 ninja-build
+        sudo apt-get install -y unzip zip python3.9 msbuild libc6 ninja-build
         sudo apt-get install -y cmake autoconf automake \
           libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
