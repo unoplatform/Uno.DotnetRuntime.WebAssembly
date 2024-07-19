@@ -139,7 +139,7 @@ jobs:
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
-    container: 'mcr.microsoft.com/dotnet/sdk:8.0'
+    container: 'mcr.microsoft.com/dotnet/sdk:8.0.303'
 
     strategy:
       matrix:
