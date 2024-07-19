@@ -18,6 +18,10 @@ env:
   DOTNETSDK_VERSION: 9.0.100-preview.6.24328.19
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
+concurrency: 
+  group: ${{github.workflow}} - ${{github.ref}}
+  cancel-in-progress: true
+
 jobs:
   ##
   ## Build Job
@@ -156,7 +160,8 @@ jobs:
     - name: Install dependencies
       run: |
         set -e
-        sudo apt-get update
+        apt-get update
+        sudo apt-get install -y sudo
         sudo apt-get install -y python3-pip locales p7zip-full zip
         sudo apt-get install -y unzip zip python3.9 msbuild libc6 ninja-build
         sudo apt-get install -y cmake autoconf automake \
