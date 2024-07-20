@@ -13,7 +13,6 @@ on:
       - release/**
 
 env:
-  EMSDK_VERSION: 3.1.56 # align with https://github.com/radekdoulik/runtime/blob/e6426d2a115f2115202d4b3284d4adc04f0c1772/eng/Versions.props#L265
   DOTNETRUNTIME_COMMIT: 67bb10fc3c6f10381a63f4eb87b2753d91740fb0
   DOTNETSDK_VERSION: 9.0.100-preview.6.24328.19
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
@@ -214,21 +213,6 @@ jobs:
         wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
         sudo tar --strip-components=1 -xz -C /usr/local
 
-    - name: 'Setup Emscripten'
-      run: |
-        set -e
-        cd ~
-        git clone --branch $EMSDK_VERSION https://github.com/emscripten-core/emsdk
-        cd emsdk
-        ./emsdk install $EMSDK_VERSION
-        ./emsdk activate $EMSDK_VERSION
-
-    - name: Build ILLinker
-      run: |
-        set -e
-        cd runtime/src/tools/illink/src/linker
-        dotnet build -c Release
-
     - name: Build Wasm Runtime
       run: |
         set -e
@@ -236,32 +220,16 @@ jobs:
         cd runtime
         ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
 
-        # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
-
-        # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-
-        # Move src and include files to locations compatible with mono's packager
-        cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-        mv include/wasm/* .
-        mv src/* .
-        mv System.Private.CoreLib.* ../lib/net8.0
-
-    - name: Copy Wasm Debugger files
+    - name: Create artifact structure
       run: |
-        DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
-        mkdir -p $DEBUGGER_OUT/net7.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net7.0/* $DEBUGGER_OUT/net7.0
-        mkdir -p $DEBUGGER_OUT/net8.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
-        rm -fr $DEBUGGER_OUT/net8.0/net7.0 # remove additional required for standard net7.0 packaging
-
-    - name: Copy mono/linker files
-      run: |
-        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
-        mkdir -p $LINKER_OUT
-        cp -r runtime/artifacts/bin/Mono.Linker/$BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
+        set -e
+        cd ~/runtime/artifacts/packages/Release/Shipping
+        rm *.symbols.nupkg
+        rm *.Templates.*.nupkg
+        rm *.ToolChain.net6.Manifest.*.nupkg
+        rm *.ToolChain.net7.Manifest.*.nupkg
+        rm *.ToolChain.net8.Manifest.*.nupkg
+        unzip -o `*.nupkg` -d uno
 
     - name: Zip Archive
       run: |
@@ -274,7 +242,7 @@ jobs:
 
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
-        cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
+        cd ~/runtime/artifacts/packages/Release/Shipping/uno
         /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
