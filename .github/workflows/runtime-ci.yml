@@ -80,7 +80,11 @@ jobs:
         rm *ToolChain.net6.Manifest*.nupkg
         rm *ToolChain.net7.Manifest*.nupkg
         rm *ToolChain.net8.Manifest*.nupkg
-        unzip -o '*.nupkg' -d uno
+
+        # rename to zip as Expand-Archive does not support nupkg
+        gci -filter *.nupkg | Rename-Item -NewName { $_.name -replace "\.nupkg$", ".zip" }
+        Get-ChildItem . -Filter *.zip | Expand-Archive -DestinationPath uno -Force
+
         cd uno
         rm *.nuspec
         rm -fR _rels
