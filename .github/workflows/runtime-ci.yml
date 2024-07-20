@@ -143,7 +143,7 @@ jobs:
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
-    container: 'mcr.microsoft.com/dotnet/sdk:8.0.303'
+    container: 'mcr.microsoft.com/dotnet/sdk:8.0.303-jammy'
 
     strategy:
       matrix:
@@ -170,21 +170,21 @@ jobs:
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
 
-    - name: Install LLVM 12
-      run: |
-        set -e
-        printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" |sudo tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list
-        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key |sudo apt-key add -
-        sudo apt update
-        sudo apt install -y llvm-12 clang-12
+    # - name: Install LLVM 12
+    #   run: |
+    #     set -e
+    #     printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" |sudo tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list
+    #     wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key |sudo apt-key add -
+    #     sudo apt update
+    #     sudo apt install -y llvm-12 clang-12
         
-    - name: Update to Git 2.18 or later
-      run: |
-        set -e       
-        sudo apt install -y software-properties-common
-        sudo add-apt-repository ppa:git-core/ppa
-        sudo apt update;
-        sudo apt install -y git
+    # - name: Update to Git 2.18 or later
+    #   run: |
+    #     set -e       
+    #     sudo apt install -y software-properties-common
+    #     sudo add-apt-repository ppa:git-core/ppa
+    #     sudo apt update;
+    #     sudo apt install -y git
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
