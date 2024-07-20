@@ -228,7 +228,7 @@ jobs:
         rm *ToolChain.net6.Manifest*.nupkg
         rm *ToolChain.net7.Manifest*.nupkg
         rm *ToolChain.net8.Manifest*.nupkg
-        unzip -o `*.nupkg` -d uno
+        unzip -o '*.nupkg' -d uno
 
     - name: Zip Archive
       run: |
