@@ -83,8 +83,8 @@ jobs:
         unzip -o '*.nupkg' -d uno
         cd uno
         rm *.nuspec
-        rm -f _rels
-        rm -f data
+        rm -fR _rels
+        rm -fR data
   
     - name: Copy ninja
       run: |
@@ -208,8 +208,8 @@ jobs:
         unzip -o '*.nupkg' -d uno
         cd uno
         rm *.nuspec
-        rm -f _rels
-        rm -f data
+        rm -fR _rels
+        rm -fR data
 
     - name: Zip Archive
       run: |
