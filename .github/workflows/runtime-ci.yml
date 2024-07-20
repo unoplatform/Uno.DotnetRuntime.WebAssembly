@@ -170,7 +170,7 @@ jobs:
         sudo apt-get install -y python3-pip locales p7zip-full zip
         sudo apt-get install -y unzip zip libc6 ninja-build
         sudo apt-get install -y lsb-release wget software-properties-common gnupg
-        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y unzip zip libc6 ninja-build \
           libtool build-essential curl git \
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
