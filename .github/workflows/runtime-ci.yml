@@ -216,7 +216,6 @@ jobs:
     - name: Build Wasm Runtime
       run: |
         set -e
-        export EMSDK_PATH=$HOME/emsdk
         cd runtime
         ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
 
