@@ -169,27 +169,19 @@ jobs:
         apt-get install -y sudo
         sudo apt-get install -y python3-pip locales p7zip-full zip
         sudo apt-get install -y unzip zip libc6 ninja-build
-        sudo apt-get install -y cmake autoconf automake \
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build
           libtool build-essential curl git \
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
 
-    # - name: Install LLVM 12
-    #   run: |
-    #     set -e
-    #     printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" |sudo tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list
-    #     wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key |sudo apt-key add -
-    #     sudo apt update
-    #     sudo apt install -y llvm-12 clang-12
-        
-    # - name: Update to Git 2.18 or later
-    #   run: |
-    #     set -e       
-    #     sudo apt install -y software-properties-common
-    #     sudo add-apt-repository ppa:git-core/ppa
-    #     sudo apt update;
-    #     sudo apt install -y git
+    - name: Install LLVM 12
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 17
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
