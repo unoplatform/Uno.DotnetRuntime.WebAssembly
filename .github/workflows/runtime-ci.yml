@@ -86,9 +86,10 @@ jobs:
         Get-ChildItem . -Filter *.zip | Expand-Archive -DestinationPath uno -Force
 
         cd uno
-        rm *.nuspec
-        rm -fR _rels
-        rm -fR data
+        Remove-Item *.nuspec
+        Remove-Item *.nuspec
+        Remove-Item _rels -Recurse
+        Remove-Item data -Recurse
   
     - name: Copy ninja
       run: |
