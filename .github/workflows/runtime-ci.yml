@@ -222,7 +222,7 @@ jobs:
     - name: Create artifact structure
       run: |
         set -e
-        cd ~/runtime/artifacts/packages/Release/Shipping
+        cd ./runtime/artifacts/packages/Release/Shipping
         rm *.symbols.nupkg
         rm *.Templates.*.nupkg
         rm *.ToolChain.net6.Manifest.*.nupkg
@@ -241,7 +241,7 @@ jobs:
 
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
-        cd ~/runtime/artifacts/packages/Release/Shipping/uno
+        cd ./runtime/artifacts/packages/Release/Shipping/uno
         /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
 
     - uses: actions/upload-artifact@v2
