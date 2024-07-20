@@ -155,6 +155,11 @@ jobs:
     - name: Setup .NET SDK
       uses: actions/setup-dotnet@v1.7.2
       with:
+        dotnet-version:  8.0.303
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
     - name: Install dependencies
