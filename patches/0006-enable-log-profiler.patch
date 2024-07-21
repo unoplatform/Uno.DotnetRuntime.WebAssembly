@@ -10,9 +10,9 @@ Subject: [PATCH] enable log profiler
  src/mono/mono/profiler/CMakeLists.txt          |  7 +++++++
  src/mono/mono/profiler/helper.c                |  6 ++++++
  src/mono/mono/profiler/log.c                   | 18 +++++++++++++++++-
- src/mono/wasm/runtime/profiler.ts              |  9 +++++++--
- src/mono/wasm/runtime/startup.ts               |  6 +++++-
- src/mono/wasm/runtime/types/internal.ts        |  5 +++++
+ src/mono/browser/runtime/profiler.ts              |  9 +++++++--
+ src/mono/browser/runtime/startup.ts               |  6 +++++-
+ src/mono/browser/runtime/types/internal.ts        |  5 +++++
  9 files changed, 51 insertions(+), 5 deletions(-)
 
 diff --git a/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props b/src/installer/pkg/sfx/Microsoft.NETCore.App/Directory.Build.props
@@ -170,17 +170,17 @@ index 1aa33e9c40e..eff4aef5de0 100644
  MONO_API void
  mono_profiler_init_log (const char *desc);
  
-diff --git a/src/mono/wasm/runtime/profiler.ts b/src/mono/wasm/runtime/profiler.ts
+diff --git a/src/mono/browser/runtime/profiler.ts b/src/mono/browser/runtime/profiler.ts
 index da627b50ec4..c2e4db95746 100644
---- a/src/mono/wasm/runtime/profiler.ts
-+++ b/src/mono/wasm/runtime/profiler.ts
+--- a/src/mono/browser/runtime/profiler.ts
++++ b/src/mono/browser/runtime/profiler.ts
 @@ -1,8 +1,8 @@
  // Licensed to the .NET Foundation under one or more agreements.
  // The .NET Foundation licenses this file to you under the MIT license.
  
--import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, mono_assert, runtimeHelpers } from "./globals";
+-import { ENVIRONMENT_IS_WEB, mono_assert, runtimeHelpers } from "./globals";
 -import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions } from "./types/internal";
-+import { ENVIRONMENT_IS_WEB, linkerEnableAotProfiler, linkerEnableBrowserProfiler, mono_assert, Module, runtimeHelpers } from "./globals";
++import { ENVIRONMENT_IS_WEB, mono_assert, Module, runtimeHelpers } from "./globals";
 +import { MonoMethod, AOTProfilerOptions, BrowserProfilerOptions, LogProfilerOptions } from "./types/internal";
  import { profiler_c_functions as cwraps } from "./cwraps";
  import { utf8ToString } from "./strings";
@@ -195,12 +195,12 @@ index da627b50ec4..c2e4db95746 100644
 +    Module.ccall("mono_wasm_load_profiler_log", null, ["string"], [options.configuration]);
 +}
 \ No newline at end of file
-diff --git a/src/mono/wasm/runtime/startup.ts b/src/mono/wasm/runtime/startup.ts
+diff --git a/src/mono/browser/runtime/startup.ts b/src/mono/browser/runtime/startup.ts
 index e9eee44f0de..3f867a9741e 100644
---- a/src/mono/wasm/runtime/startup.ts
-+++ b/src/mono/wasm/runtime/startup.ts
+--- a/src/mono/browser/runtime/startup.ts
++++ b/src/mono/browser/runtime/startup.ts
 @@ -9,7 +9,7 @@ import { disableLegacyJsInterop, ENVIRONMENT_IS_PTHREAD, exportedRuntimeAPI, INT
- import cwraps, { init_c_exports } from "./cwraps";
+ import cwraps, { init_c_exports, threads_c_functions as tcwraps } from "./cwraps";
  import { mono_wasm_raise_debug_event, mono_wasm_runtime_ready } from "./debug";
  import { toBase64StringImpl } from "./base64";
 -import { mono_wasm_init_aot_profiler, mono_wasm_init_browser_profiler } from "./profiler";
@@ -216,13 +216,13 @@ index e9eee44f0de..3f867a9741e 100644
 +            mono_wasm_init_log_profiler(runtimeHelpers.config.logProfilerOptions);
 +        }
 +
-         // Threads early are not supported with memory snapshot. See below how we enable them later.
-         // Please disable startupMemoryCache in order to be able to diagnose or pause runtime startup.
-         if (MonoWasmThreads && !runtimeHelpers.config.startupMemoryCache) {
-diff --git a/src/mono/wasm/runtime/types/internal.ts b/src/mono/wasm/runtime/types/internal.ts
+         if (WasmEnableThreads) {
+             runtimeHelpers.deputyWorker.thread!.postMessageToWorker({
+                 type:"deputyThread",
+diff --git a/src/mono/browser/runtime/types/internal.ts b/src/mono/browser/runtime/types/internal.ts
 index f2dba23fe73..3e8e4372d66 100644
---- a/src/mono/wasm/runtime/types/internal.ts
-+++ b/src/mono/wasm/runtime/types/internal.ts
+--- a/src/mono/browser/runtime/types/internal.ts
++++ b/src/mono/browser/runtime/types/internal.ts
 @@ -69,6 +69,7 @@ export function coerceNull<T extends ManagedPointer | NativePointer>(ptr: T | nu
      assets?: AssetEntryInternal[],
      runtimeOptions?: string[], // array of runtime options as strings
@@ -232,8 +232,8 @@ index f2dba23fe73..3e8e4372d66 100644
      waitForDebugger?: number,
      appendElementOnExit?: boolean
 @@ -78,6 +79,10 @@ export type MonoConfigInternal = MonoConfig & {
-     exitAfterSnapshot?: number
-     loadAllSatelliteResources?: boolean
+ 
+     jsThreadBlockingMode?: JSThreadBlockingMode,
  };
 + 
 +export type LogProfilerOptions = {

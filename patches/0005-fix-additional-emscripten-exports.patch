@@ -4,16 +4,16 @@ Date: Sat, 15 Oct 2022 02:27:14 +0000
 Subject: [PATCH] fix: adjust for additional EmccExportedFunction
 
 ---
- src/mono/wasm/wasm.proj | 7 +++++++
+ src/mono/browser/browser.proj | 7 +++++++
  1 file changed, 7 insertions(+)
 
-diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+diff --git a/src/mono/browser/browser.proj b/src/mono/browser/browser.proj
 index 0fa4a43fdc8..c078761909d 100644
---- a/src/mono/wasm/wasm.proj
-+++ b/src/mono/wasm/wasm.proj
+--- a/src/mono/browser/browser.proj
++++ b/src/mono/browser/browser.proj
 @@ -128,6 +128,13 @@
-       <EmccExportedFunction Include="stackRestore" />
        <EmccExportedFunction Include="stackSave"  />
+       <EmccExportedFunction Include="_emscripten_force_exit" />
      </ItemGroup>
 +    <ItemGroup>
 +      <EmccExportedRuntimeMethod Include="lengthBytesUTF8" />
@@ -24,7 +24,7 @@ index 0fa4a43fdc8..c078761909d 100644
 +    </ItemGroup>
      <!-- for the jiterpreter -->
      <ItemGroup>
-       <EmccExportedFunction Include="_fmod" />
+       <EmccExportedRuntimeMethod Include="wasmExports" />
 -- 
 2.25.1
 
