@@ -93,7 +93,7 @@ jobs:
         Remove-Item package -Recurse
 
         # Move cross compiler to appropriate location 
-        move .\artifacts\bin\mono\Browser.wasm.Release\cross runtimes\browser-wasm\native
+        move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross runtimes\browser-wasm\native
 
   
     - name: Copy ninja
@@ -226,7 +226,7 @@ jobs:
         chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
 
         # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/browser.wasm.Release/cross runtimes/browser-wasm/native
+        mv $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross runtimes/browser-wasm/native
 
     - name: Zip Archive
       run: |
