@@ -223,7 +223,7 @@ jobs:
         rm -fR package
 
         # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
+        chmod +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/*
 
         # Move cross compiler to appropriate location
         mv $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross runtimes/browser-wasm/native
