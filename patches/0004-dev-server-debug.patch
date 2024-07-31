@@ -1,0 +1,25 @@
+From cb7e73139071dc7a8fb479b08c9863a6fecb92f5 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Wed, 31 Jul 2024 07:40:42 -0400
+Subject: [PATCH] chore: DevServer debug
+
+---
+ src/mono/wasm/host/DevServer/DevServer.cs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mono/wasm/host/DevServer/DevServer.cs b/src/mono/wasm/host/DevServer/DevServer.cs
+index 9a5a079cee6..3a4f003ca29 100644
+--- a/src/mono/wasm/host/DevServer/DevServer.cs
++++ b/src/mono/wasm/host/DevServer/DevServer.cs
+@@ -28,7 +28,7 @@ internal static class DevServer
+             .UseStartup<DevServerStartup>()
+             .ConfigureLogging(logging =>
+             {
+-                logging.AddConsole().AddFilter(null, LogLevel.Warning);
++                logging.AddConsole().AddFilter(null, LogLevel.Debug);
+             })
+             .ConfigureServices((ctx, services) =>
+             {
+-- 
+2.45.0.windows.1
+
