@@ -89,7 +89,6 @@ jobs:
         Remove-Item *.nuspec
         Remove-Item *.nuspec
         Remove-Item _rels -Recurse
-        Remove-Item data -Recurse
         Remove-Item package -Recurse
 
         # Move cross compiler to appropriate location 
@@ -219,7 +218,6 @@ jobs:
         cd uno
         rm *.nuspec
         rm -fR _rels
-        rm -fR data
         rm -fR package
 
         # Mark AOT generation binaries executable
