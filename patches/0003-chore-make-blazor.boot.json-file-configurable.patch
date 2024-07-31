@@ -1,0 +1,61 @@
+From dd6ed81013f708679819e9e20eb3e91ee841764e Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Tue, 30 Jul 2024 23:46:59 -0400
+Subject: [PATCH] chore: make blazor.boot.json file configurable
+
+---
+ .../Microsoft.NET.Sdk.WebAssembly.Browser.targets    | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.targets b/src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.targets
+index 22ebca926a5..f06299c9ecc 100644
+--- a/src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.targets
++++ b/src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.targets
+@@ -19,6 +19,8 @@ Copyright (c) .NET Foundation. All rights reserved.
+     <RunCommand Condition="'$(RunCommand)' == ''">dotnet</RunCommand>
+ 
+     <WasmAppHostDir>$([MSBuild]::NormalizeDirectory($(MSBuildThisFileDirectory), '..', 'WasmAppHost'))</WasmAppHostDir>
++    <WasmBuildBootJsonFileName Condition="'$(WasmBuildBootJsonFileName)'==''">blazor.boot.json</WasmBuildBootJsonFileName>
++    <WasmBuildPublishBootJsonFileName Condition="'$(WasmBuildPublishBootJsonFileName)'==''">blazor.publish.boot.json</WasmBuildPublishBootJsonFileName>
+ 
+     <_RunWorkingDirectory>$(OutputPath)</_RunWorkingDirectory>
+     <_RunWorkingDirectory Condition="'$(_RunWorkingDirectory)' != '' and !$([System.IO.Path]::IsPathRooted($(_RunWorkingDirectory)))">$([System.IO.Path]::Combine($(MSBuildProjectDirectory), $(_RunWorkingDirectory)))</_RunWorkingDirectory>
+@@ -327,7 +329,7 @@ Copyright (c) .NET Foundation. All rights reserved.
+ 
+   <Target Name="_GenerateBuildWasmBootJson" DependsOnTargets="$(GenerateBuildWasmBootJsonDependsOn)">
+     <PropertyGroup>
+-      <_WasmBuildBootJsonPath>$(IntermediateOutputPath)blazor.boot.json</_WasmBuildBootJsonPath>
++      <_WasmBuildBootJsonPath>$(IntermediateOutputPath)$(WasmBuildBootJsonFileName)</_WasmBuildBootJsonPath>
+     </PropertyGroup>
+ 
+     <ItemGroup>
+@@ -392,13 +394,13 @@ Copyright (c) .NET Foundation. All rights reserved.
+     </ItemGroup>
+ 
+     <PropertyGroup>
+-      <_WasmBuildBootJsonPath>$(IntermediateOutputPath)blazor.boot.json</_WasmBuildBootJsonPath>
++      <_WasmBuildBootJsonPath>$(IntermediateOutputPath)$(WasmBuildBootJsonFileName)</_WasmBuildBootJsonPath>
+     </PropertyGroup>
+ 
+     <ItemGroup>
+       <_BuildWasmBootJson
+         Include="$(_WasmBuildBootJsonPath)"
+-        RelativePath="_framework/blazor.boot.json" />
++        RelativePath="_framework/$(WasmBuildBootJsonFileName)" />
+     </ItemGroup>
+ 
+     <DefineStaticWebAssets
+@@ -589,8 +591,8 @@ Copyright (c) .NET Foundation. All rights reserved.
+   <Target Name="_AddPublishWasmBootJsonToStaticWebAssets" DependsOnTargets="GeneratePublishWasmBootJson">
+     <ItemGroup>
+       <_PublishWasmBootJson
+-        Include="$(IntermediateOutputPath)blazor.publish.boot.json"
+-        RelativePath="_framework/blazor.boot.json" />
++        Include="$(IntermediateOutputPath)$(WasmBuildPublishBootJsonFileName)"
++        RelativePath="_framework/$(WasmBuildBootJsonFileName)" />
+     </ItemGroup>
+ 
+     <DefineStaticWebAssets
+-- 
+2.45.0.windows.1
+
