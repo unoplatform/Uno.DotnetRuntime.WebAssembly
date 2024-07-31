@@ -16,7 +16,7 @@ index 316f644ccc1..9953a729783 100644
        <_EmccLinkFlags Include="-s EXPORT_NAME=&quot;'createDotnetRuntime'&quot;" />
        <_EmccLinkFlags Include="-s MODULARIZE=1" />
 +      
-+      <_EmccLinkFlags Include="--profiling" />
++      <_EmccCommonFlags Include="--profiling" />
  
        <_EmccLinkFlags Include="-s ENVIRONMENT=&quot;web,webview,worker,node,shell&quot;" />
        <!-- remove -Wno-limited-postlink-optimizations once below issue is fixed
