@@ -227,6 +227,8 @@ jobs:
     - name: Create NuGet SDK Packages
       run: |
         cd nuget
+        ls -la
+        find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
         dotnet pack /p:OutputPath=$GITHUB_WORKSPACE/ci-output
 
     - uses: actions/upload-artifact@v2
