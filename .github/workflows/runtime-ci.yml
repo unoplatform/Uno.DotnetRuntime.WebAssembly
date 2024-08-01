@@ -67,7 +67,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono.runtime+libs.native+libs.pretest /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono.aotcross /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
@@ -197,20 +197,47 @@ jobs:
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
         cd ./runtime/artifacts/packages/Release/Shipping/uno
-        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/sdk-${{ matrix.MONO_WASM_THREADS }}.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
-        name: wasm
+        name: wasm-sdk
         path: ci-artifacts
-    
+
+  package_job:
+    needs: [build_linux_job,build_aot_windows_job]
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+
+    - name: Download package
+      uses: actions/download-artifact@v2
+      with:
+          name: wasm-sdk
+          path: wasm-sdk
+
+    - name: Create NuGet SDK Packages
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/ci-output
+        cd wasm-sdk
+        scripts/dedup.sh "$GITHUB_WORKSPACE/ci-output/sdk.zip"
+
+    - uses: actions/upload-artifact@v2
+      if: ${{ always() }}
+      with:
+        name: nuget
+        path: ci-output
+
   ##
   ## Release Job
   ##
   release_job:
     if: github.event_name == 'push'
-    needs: [build_linux_job,build_aot_windows_job]
+    needs: [package_job]
     runs-on: ubuntu-latest
     environment:
         name: Release
