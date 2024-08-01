@@ -71,8 +71,8 @@ jobs:
 
     - name: Create artifact structure
       run: |
-        mkdir -p ./runtime/artifacts/packages/Release/Shipping
-        cd ./runtime/artifacts/packages/Release/Shipping
+        New-Item -ItemType Directory -Force -Path ./runtime/artifacts/packages/Release/Shipping/uno
+        cd ./runtime/artifacts/packages/Release/Shipping/uno
 
         # Move cross compiler to appropriate location 
         move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross runtimes\browser-wasm\native
