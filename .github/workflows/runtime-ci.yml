@@ -217,7 +217,7 @@ jobs:
   ##
   release_job:
     if: github.event_name == 'push'
-    needs: [build_linux_job,build_windows_job]
+    needs: [build_linux_job,build_aot_windows_job]
     runs-on: ubuntu-latest
     environment:
         name: Release
