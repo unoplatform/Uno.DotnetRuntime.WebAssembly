@@ -131,12 +131,12 @@ jobs:
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
 
-    - name: Install LLVM 12
+    - name: Install LLVM
       run: |
         set -e
         wget https://apt.llvm.org/llvm.sh
         chmod u+x llvm.sh
-        sudo ./llvm.sh 17
+        sudo ./llvm.sh 18
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
