@@ -49,7 +49,6 @@ jobs:
         echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $env:GITHUB_ENV
         echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
-        echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
 
     - name: Clone dotnet/runtime
       run: |
@@ -67,7 +66,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
