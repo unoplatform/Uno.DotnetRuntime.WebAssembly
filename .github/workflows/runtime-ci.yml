@@ -67,7 +67,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono.wasmruntime+mono.aotcross /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
@@ -214,17 +214,21 @@ jobs:
       with:
         submodules: true
 
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version:  8.0.303
+
     - name: Download package
       uses: actions/download-artifact@v2
       with:
           name: wasm-sdk
-          path: wasm-sdk
+          path: nuget
 
     - name: Create NuGet SDK Packages
       run: |
-        mkdir -p $GITHUB_WORKSPACE/ci-output
-        cd wasm-sdk
-        scripts/dedup.sh "$GITHUB_WORKSPACE/ci-output/sdk.zip"
+        cd nuget
+        dotnet pack /p:OutputPath=$GITHUB_WORKSPACE/ci-output
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
