@@ -67,7 +67,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono.runtime+libs.native /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono.runtime+libs.native+libs.pretest /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
@@ -76,7 +76,6 @@ jobs:
 
         # Move cross compiler to appropriate location 
         move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross runtimes\browser-wasm\native
-
 
     - name: Zip Archive
       run: |
@@ -188,12 +187,6 @@ jobs:
         rm *.nuspec
         rm -fR _rels
         rm -fR package
-
-        # Mark AOT generation binaries executable
-        chmod +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/*
-
-        # Move cross compiler to appropriate location
-        mv $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross runtimes/browser-wasm/native
 
     - name: Zip Archive
       run: |
