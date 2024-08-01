@@ -66,11 +66,11 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
-        New-Item -ItemType Directory -Force -Path ./runtime/artifacts/packages/Release/Shipping/uno
+        New-Item -ItemType Directory -Force -Path ./runtime/artifacts/packages/Release/Shipping/uno/runtimes/browser-wasm/native
         cd ./runtime/artifacts/packages/Release/Shipping/uno
 
         # Move cross compiler to appropriate location 
