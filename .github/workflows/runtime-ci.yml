@@ -13,7 +13,7 @@ on:
       - release/**
 
 env:
-  DOTNETRUNTIME_COMMIT: 68fed4ca330e104b821f5ba0ce8cbf7b00793c44
+  DOTNETRUNTIME_COMMIT: be32947d322ae71526ad1dde412a1dca44ea4fba
   DOTNETSDK_VERSION: 9.0.100-preview.6.24328.19
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
 
