@@ -2,41 +2,41 @@
 
 	<!-- Property overrides -->
 	<PropertyGroup>
-		<_BaseTasksDir>$(MSBuildThisFileDirectory)../data/singlethread/</_BaseTasksDir>
-		<_TasksDir Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_BaseTasksDir)..\tasks\net9.0\</_TasksDir>
-		<_TasksDir Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_BaseTasksDir)..\tasks\net472\</_TasksDir>
+		<_UnoNetCoreAppRuntimeBasePath>$(MSBuildThisFileDirectory)../data/singlethread/</_UnoNetCoreAppRuntimeBasePath>
+		<_UnoNetCoreAppRuntimeTaskPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)..\tasks\net9.0\</_UnoNetCoreAppRuntimeTaskPath>
+		<_UnoNetCoreAppRuntimeTaskPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_UnoNetCoreAppRuntimeBasePath)..\tasks\net472\</_UnoNetCoreAppRuntimeTaskPath>
 
-		<WasmAppBuilderTasksAssemblyPath>$(_TasksDir)WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
-		<WasmBuildTasksAssemblyPath>$(_TasksDir)WasmBuildTasks.dll</WasmBuildTasksAssemblyPath>
-		<WasmAppHostDir>$([MSBuild]::NormalizeDirectory($(_BaseTasksDir), '..', 'WasmAppHost'))</WasmAppHostDir>
+		<WasmAppBuilderTasksAssemblyPath>$(_UnoNetCoreAppRuntimeTaskPath)WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
+		<WasmBuildTasksAssemblyPath>$(_UnoNetCoreAppRuntimeTaskPath)WasmBuildTasks.dll</WasmBuildTasksAssemblyPath>
+		<WasmAppHostDir>$([MSBuild]::NormalizeDirectory($(_UnoNetCoreAppRuntimeBasePath), '..', 'WasmAppHost'))</WasmAppHostDir>
 	</PropertyGroup>
 
-	<Import Project="$(_BaseTasksDir)\build\Microsoft.NET.Sdk.WebAssembly.Browser.props"/>
+	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)\build\Microsoft.NET.Sdk.WebAssembly.Browser.props"/>
 
 	<PropertyGroup>
-		<MicrosoftNetCoreAppRuntimePackDir>$(_BaseTasksDir)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackDir>
-		<MicrosoftNetCoreAppRuntimePackRidDir>$(_BaseTasksDir)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackRidDir>
-		<MicrosoftNetCoreAppRuntimePackRidLibTfmDir>$(_BaseTasksDir)runtimes\browser-wasm\lib\net9.0\</MicrosoftNetCoreAppRuntimePackRidLibTfmDir>
+		<MicrosoftNetCoreAppRuntimePackDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackDir>
+		<MicrosoftNetCoreAppRuntimePackRidDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackRidDir>
+		<MicrosoftNetCoreAppRuntimePackRidLibTfmDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\lib\net9.0\</MicrosoftNetCoreAppRuntimePackRidLibTfmDir>
 
-		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_BaseTasksDir)tasks\net9.0\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
-		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_BaseTasksDir)tasks\net472\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
+		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)tasks\net9.0\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
+		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_UnoNetCoreAppRuntimeBasePath)tasks\net472\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
 	</PropertyGroup>
 
 	<!--
 	Don't import to avoid including official wasm workloads
-	<Import Project="$(_BaseTasksDir)\Sdk\BrowserWasmApp.props"/>
+	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)\Sdk\BrowserWasmApp.props"/>
 	-->
 
 	<ItemGroup>
 		<RuntimePack
 			Include="Uno.NETCore.App.Runtime.Mono.browser-wasm"
-			NuGetPackageVersion="9.0-dev.1"
+			NuGetPackageVersion="$buildversion$"
 			FrameworkName="Microsoft.NETCore.App"
-			PackageDirectory="$(_BaseTasksDir)"
+			PackageDirectory="$(_UnoNetCoreAppRuntimeBasePath)"
 			RuntimeIdentifier="browser-wasm"
 			NuGetPackageId="Uno.NETCore.App.Runtime.Mono.browser-wasm"
 			IsTrimmable=""
-					/>
+			/>
 
 		<PackageConflictPreferredPackages Include="Uno.NETCore.App.Runtime.Mono.browser-wasm" />
 
@@ -45,7 +45,7 @@
 		<FrameworkReference Remove="Microsoft.AspNetCore.App" IsImplicitlyDefined="true" />
 	</ItemGroup>
 
-	<Import Project="$(_BaseTasksDir)Sdk\MonoTargetsTasks.props"/>
-	<Import Project="$(_BaseTasksDir)Sdk\WasmApp.Common.props"/>
+	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)Sdk\MonoTargetsTasks.props"/>
+	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)Sdk\WasmApp.Common.props"/>
 	
 </Project>
