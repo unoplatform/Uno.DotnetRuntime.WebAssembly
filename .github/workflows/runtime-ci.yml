@@ -80,7 +80,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono.runtime+libs.native+libs.pretest /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
@@ -275,29 +275,78 @@ jobs:
         name: nuget
         path: ci-output
 
-  ##
-  ## Release Job
-  ##
-  release_job:
-    if: github.event_name == 'push'
+  sign:
+    name: Sign Package
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/')) }}
+    runs-on: windows-latest
     needs: [package_job,build_aot_windows_job]
-    runs-on: ubuntu-latest
-    environment:
-        name: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget
+          path: artifacts
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: '3.1.x'
+
+      - name: Setup SignClient
+        run: |
+          dotnet tool install --tool-path build SignClient
+
+      - name: SignClient
+        shell: pwsh
+        run: |
+          build\SignClient sign -i artifacts\*.nupkg -c build\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "Uno.Check" -d "Uno.Check" -u "https://github.com/unoplatform/uno.check"
+
+      - name: Upload Signed Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: nuget-signed
+          path: .\artifacts        
+
+  publish_dev:
+    name: Publish Dev
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: windows-latest
+
+    needs:
+      - sign
 
     steps:
-    - name: Download package
-      uses: actions/download-artifact@v2
-      with:
-          name: wasm
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget-signed
+          path: artifacts
 
-    - uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_STORAGE_CREDENTIALS }}
+      - name: NuGet Push
+        shell: pwsh
+        run: |
+          dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}"
 
-    - name: Upload to blob storage
-      uses: azure/CLI@v1
-      with:
-        inlineScript: |
-            az storage blob upload-batch --account-name unowasmbootstrap -d 'runtime' -s .
+  publish_prod:
+    name: Publish Production
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') }}
+    runs-on: windows-latest
+    environment: Production
 
+    needs:
+      - sign
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget-signed
+          path: artifacts
+
+      - name: NuGet Push
+        shell: pwsh
+        run: |
+          dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}"
