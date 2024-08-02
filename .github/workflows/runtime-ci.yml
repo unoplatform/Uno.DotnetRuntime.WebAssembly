@@ -188,6 +188,8 @@ jobs:
         # Mark AOT generation binaries executable
         chmod -R +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/*
 
+        ls -laR $GITHUB_WORKSPACE/runtime/artifacts/bin/mono
+
         # Move cross compiler to appropriate location
         cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
