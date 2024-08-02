@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+        <IsPackable>true</IsPackable>
+        <IncludeBuildOutput>false</IncludeBuildOutput>
+		<PackageProjectUrl>https://github.dev/unoplatform/Uno.DotnetRuntime.WebAssembly</PackageProjectUrl>
+		<RepositoryUrl>https://github.dev/unoplatform/Uno.DotnetRuntime.WebAssembly</RepositoryUrl>
+		<Description>.NET Ahead of Time Compiler for WebAssembly</Description>
+		<Copyright>Copyright (C) 2015-$([System.DateTime]::Now.ToString(`yyyy`)) Uno Platform inc. - all rights reserved</Copyright>
+        <NoWarn>NU5100;NU5128</NoWarn>
+		<PackageId>Uno.NETCore.App.Runtime.AOT.$(NETCoreSdkPortableRuntimeIdentifier).Cross.browser-wasm</PackageId>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="tools/**" Pack="true" PackagePath="tools" />
+	</ItemGroup>
+
+	<Target Name="DownloadAndSetPackageIcon" BeforeTargets="_GetPackageFiles">
+		<PropertyGroup>
+			<IconUrl>https://uno-assets.platform.uno/logos/uno.png</IconUrl>
+		</PropertyGroup>
+
+		<DownloadFile SourceUrl="$(IconUrl)" DestinationFolder="$(IntermediateOutputPath)">
+			<Output TaskParameter="DownloadedFile" PropertyName="UnoPackageDownloadedIcon" />
+		</DownloadFile>
+
+	    <PropertyGroup>
+			<PackageIcon>$([System.IO.Path]::GetFileName($(UnoPackageDownloadedIcon)))</PackageIcon>
+		</PropertyGroup>
+
+		<ItemGroup>
+			<None Include="$(UnoPackageDownloadedIcon)" Pack="true" PackagePath="\" Visible="false" />
+		</ItemGroup>
+	</Target>
+</Project>  

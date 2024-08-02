@@ -1,0 +1,26 @@
+From 37552a5b0b20fc1463980491d6c90163d6547a37 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Tue, 30 Jul 2024 23:37:48 -0400
+Subject: [PATCH] chore: Add browser wasm packages
+
+---
+ .../AssetsComputingHelper.cs                                   | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/tasks/Microsoft.NET.Sdk.WebAssembly.Pack.Tasks/AssetsComputingHelper.cs b/src/tasks/Microsoft.NET.Sdk.WebAssembly.Pack.Tasks/AssetsComputingHelper.cs
+index b7bdbd752ed..54ba9935970 100644
+--- a/src/tasks/Microsoft.NET.Sdk.WebAssembly.Pack.Tasks/AssetsComputingHelper.cs
++++ b/src/tasks/Microsoft.NET.Sdk.WebAssembly.Pack.Tasks/AssetsComputingHelper.cs
+@@ -16,6 +16,9 @@ public class AssetsComputingHelper
+     {
+         "Microsoft.NETCore.App.Runtime.Mono.browser-wasm",
+         "Microsoft.NETCore.App.Runtime.Mono.multithread.browser-wasm",
++
++        "Uno.NETCore.App.Runtime.Mono.browser-wasm",
++        "Uno.NETCore.App.Runtime.Mono.multithread.browser-wasm",
+     };
+ 
+     private static readonly string[] dotnetJsSingleThreadNames = new[]
+-- 
+2.45.0.windows.1
+

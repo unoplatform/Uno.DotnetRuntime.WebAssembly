@@ -1,0 +1,25 @@
+From 373eb7e1b334671fbf5db14051f7da3c6ec9142a Mon Sep 17 00:00:00 2001
+From: Jerome Laban <jerome@platform.uno>
+Date: Wed, 31 Jul 2024 15:14:21 -0400
+Subject: [PATCH] chore: Enable stack profiling
+
+---
+ src/mono/browser/browser.proj | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/mono/browser/browser.proj b/src/mono/browser/browser.proj
+index 316f644ccc1..9953a729783 100644
+--- a/src/mono/browser/browser.proj
++++ b/src/mono/browser/browser.proj
+@@ -299,6 +299,8 @@
+       <_EmccLinkFlags Include="-s WASM_BIGINT=1" />
+       <_EmccLinkFlags Include="-s EXPORT_NAME=&quot;'createDotnetRuntime'&quot;" />
+       <_EmccLinkFlags Include="-s MODULARIZE=1" />
++      
++      <_EmccCommonFlags Include="--profiling" />
+ 
+       <_EmccLinkFlags Include="-s ENVIRONMENT=&quot;web,webview,worker,node,shell&quot;" />
+       <!-- remove -Wno-limited-postlink-optimizations once below issue is fixed
+-- 
+2.45.0.windows.1
+

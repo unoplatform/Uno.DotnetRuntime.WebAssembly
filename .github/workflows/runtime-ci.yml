@@ -13,24 +13,26 @@ on:
       - release/**
 
 env:
-  EMSDK_VERSION: 3.1.34 # align with https://github.com/dotnet/runtime/blob/4ae9b33cc5bd291abd18d5b4353adf780f6810bc/src/mono/wasm/emscripten-version.txt
-  DOTNETRUNTIME_COMMIT: 6d0e3e59dd2f96eb9ca5c5397ff2a9d7c5526cac
-  DOTNETSDK_VERSION: 8.0.100-preview.7.23376.3
+  DOTNETRUNTIME_COMMIT: be32947d322ae71526ad1dde412a1dca44ea4fba
+  DOTNETSDK_VERSION: 9.0.100-preview.6.24328.19
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
+  GitVersion_Version: 5.10.3
+
+concurrency: 
+  group: ${{github.workflow}} - ${{github.ref}}
+  cancel-in-progress: true
 
 jobs:
   ##
   ## Build Job
   ##
-  build_windows_job:
+  build_aot_windows_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: windows-latest
 
     strategy:
       matrix:
        BUILD_CONFIGURATION: [Release]
-       MONO_WASM_THREADS: ['multithread', 'singlethread']
-       MONO_WASM_SIMD: ['true', 'false']
 
     steps:
     - name: Setup .NET SDK
@@ -41,15 +43,23 @@ jobs:
     - uses: actions/checkout@v2
       with:
         submodules: true
-        
-    - name: Set Variable from current Commit
+        fetch-depth: 0
+
+    - name: Setup GitVersion
+      uses: gittools/actions/gitversion/setup@v0.9.9
+      with:
+        versionSpec: ${{ env.GitVersion_Version }}
+
+    - name: GitVersion
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v0.9.9
+      with:
+        useConfigFile: true
+        configFilePath: build/gitversion.yml
+
+    - name: Update variables
       run: |
-        Invoke-Expression "git rev-parse --short HEAD"  | Out-String -NoNewLine -OutVariable CURRENT_COMMIT
-        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $env:GITHUB_ENV
-        echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
-        echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $env:GITHUB_ENV
-        echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $env:GITHUB_ENV
 
     - name: Clone dotnet/runtime
       run: |
@@ -59,79 +69,28 @@ jobs:
       name: Apply uno-specific patches
       shell: pwsh
 
-    - name: 'Setup Emscripten'
-      run: |
-        git clone --branch $env:EMSDK_VERSION https://github.com/emscripten-core/emsdk
-        cd emsdk
-        .\emsdk install $env:EMSDK_VERSION
-        .\emsdk activate $env:EMSDK_VERSION
-
-    - name: 'Setup Ninja'
-      run: |
-        choco install ninja
-
-    - name: Build ILLinker
-      run: |
-        cd runtime/src/tools/illink/src/linker
-        dotnet build -c Release
-
     - name: Build Wasm Runtime
       run: |
-        $env:EMSDK_PATH="$env:GITHUB_WORKSPACE\emsdk"
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$env:MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD" /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
-        
+        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+
+    - name: Create artifact structure
+      run: |
+        New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE/nuget/tools
+        New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE/ci-output
+
         # Move cross compiler to appropriate location 
-        move .\artifacts\bin\mono\Browser.wasm.Release\cross .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
+        move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross $env:GITHUB_WORKSPACE/nuget/tools
 
-        # Move src and include files to locations compatible with mono's packager
-        cd .\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\runtimes\browser-wasm\native
-        move include\wasm\* .
-        move src\* . -Force
-        move System.Private.CoreLib.* ..\lib\net8.0
-
-    - name: Copy Wasm Debugger files
-      run: |
-        $DEBUGGER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\dbg-proxy"
-        mkdir -p $DEBUGGER_OUT\net7.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\net7.0\* $DEBUGGER_OUT\net7.0
-        mkdir -p $DEBUGGER_OUT\net8.0
-        cp -r runtime\artifacts\bin\BrowserDebugHost\wasm\$env:BUILD_CONFIGURATION\* $DEBUGGER_OUT\net8.0
-        Remove-Item "$DEBUGGER_OUT\net8.0\net7.0" -Recurse # remove additional required for standard net7.0 packaging
-
-    - name: Copy mono/linker files
-      run: |
-        $LINKER_OUT="runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools"
-        mkdir -p $LINKER_OUT
-        cp -r runtime\artifacts\bin\Mono.Linker\$env:BUILD_CONFIGURATION\net7.0\* $LINKER_OUT
-
-    - name: Copy ninja
-      run: |
-        Invoke-WebRequest https://github.com/ninja-build/ninja/releases/download/v1.12.0/ninja-win.zip -OutFile ninja-win.zip 
-        Expand-Archive -LiteralPath 'ninja-win.zip' -DestinationPath runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION\tools
-
-    - name: Zip Archive
-      run: |
-        if('${{ matrix.MONO_WASM_THREADS }}' -ne 'singlethread') {
-            $archiveConfiguration="-threads";
-        }
-
-        if('${{ matrix.MONO_WASM_SIMD }}' -ne 'false') {
-            $archiveConfiguration="$archiveConfiguration-simd";
-        }
-
-        Invoke-Expression "Get-Location | select -ExpandProperty Path" | Out-String -NoNewLine -OutVariable Current_Path
-        $ARTIFACTS_FOLDER="$Current_Path\ci-artifacts"
-        mkdir -p $ARTIFACTS_FOLDER
-        cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
-        Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION$archiveConfiguration.zip -Path *
+        cd $env:GITHUB_WORKSPACE/nuget
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
-        name: wasm
-        path: ci-artifacts
+        name: nuget
+        path: ci-output
 
   ##
   ## Build Job
@@ -139,15 +98,36 @@ jobs:
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
-    container: 'unoplatform/wasm-build:2.3'
+    container: 'mcr.microsoft.com/dotnet/sdk:8.0.303-jammy'
 
     strategy:
       matrix:
        BUILD_CONFIGURATION: [Release]
        MONO_WASM_THREADS: ['multithread', 'singlethread']
-       MONO_WASM_SIMD: ['true', 'false']
 
     steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup GitVersion
+      uses: gittools/actions/gitversion/setup@v0.9.9
+      with:
+        versionSpec: ${{ env.GitVersion_Version }}
+
+    - name: GitVersion
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v0.9.9
+      with:
+        useConfigFile: true
+        configFilePath: build/gitversion.yml
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version:  8.0.303
+
     - name: Setup .NET SDK
       uses: actions/setup-dotnet@v1.7.2
       with:
@@ -156,47 +136,32 @@ jobs:
     - name: Install dependencies
       run: |
         set -e
-        sudo apt-get update
+        apt-get update
+        apt-get install -y sudo
         sudo apt-get install -y python3-pip locales p7zip-full zip
-        sudo apt-get install -y unzip zip python python3.7 msbuild libc6 ninja-build
-        sudo apt-get install -y cmake autoconf automake \
-          libtool build-essential curl git lldb-6.0 liblldb-6.0-dev \
+        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
           libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
           libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
         sudo locale-gen en_US.UTF-8
 
-    - name: Install LLVM 12
+    - name: Install LLVM
       run: |
         set -e
-        printf "deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main" |sudo tee /etc/apt/sources.list.d/llvm-toolchain-xenial-12.list
-        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key |sudo apt-key add -
-        sudo apt update
-        sudo apt install -y llvm-12 clang-12
-        
-    - name: Update to Git 2.18 or later
-      run: |
-        set -e       
-        sudo apt install -y software-properties-common
-        sudo add-apt-repository ppa:git-core/ppa
-        sudo apt update;
-        sudo apt install -y git
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
         
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
-        
     - name: Set Variable from current Commit
       run: |
         set -e
-        CURRENT_COMMIT=`git rev-parse --short HEAD`
-        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $GITHUB_ENV
-        echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $GITHUB_ENV
-        echo "MONO_WASM_SIMD=${{ matrix.MONO_WASM_SIMD }}" >> $GITHUB_ENV
 
     - name: Clone dotnet/runtime
       run: |
@@ -212,98 +177,166 @@ jobs:
         wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
         sudo tar --strip-components=1 -xz -C /usr/local
 
-    - name: 'Setup Emscripten'
-      run: |
-        set -e
-        cd ~
-        git clone --branch $EMSDK_VERSION https://github.com/emscripten-core/emsdk
-        cd emsdk
-        ./emsdk install $EMSDK_VERSION
-        ./emsdk activate $EMSDK_VERSION
-
-    - name: Build ILLinker
-      run: |
-        set -e
-        cd runtime/src/tools/illink/src/linker
-        dotnet build -c Release
-
     - name: Build Wasm Runtime
       run: |
         set -e
-        export EMSDK_PATH=$HOME/emsdk
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS" "/p:WasmEnableSIMD=$MONO_WASM_SIMD"
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false "/p:MonoWasmBuildVariant=$MONO_WASM_THREADS"
 
-        # Mark AOT generation binaries executable
-        chmod +x ./artifacts/bin/mono/browser.wasm.Release/cross/*
-
-        # Move cross compiler to appropriate location
-        mv ./artifacts/bin/mono/browser.wasm.Release/cross ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-
-        # Move src and include files to locations compatible with mono's packager
-        cd ./artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/runtimes/browser-wasm/native
-        mv include/wasm/* .
-        mv src/* .
-        mv System.Private.CoreLib.* ../lib/net8.0
-
-    - name: Copy Wasm Debugger files
+    - name: Create artifact structure
       run: |
-        DEBUGGER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/dbg-proxy
-        mkdir -p $DEBUGGER_OUT/net7.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/net7.0/* $DEBUGGER_OUT/net7.0
-        mkdir -p $DEBUGGER_OUT/net8.0
-        cp -r runtime/artifacts/bin/BrowserDebugHost/wasm/$BUILD_CONFIGURATION/* $DEBUGGER_OUT/net8.0
-        rm -fr $DEBUGGER_OUT/net8.0/net7.0 # remove additional required for standard net7.0 packaging
+        set -e
+        cd ./runtime/artifacts/packages/Release/Shipping
+        rm *.symbols.nupkg
+        rm *.Templates.*.nupkg
+        rm *ToolChain.net6.Manifest*.nupkg
+        rm *ToolChain.net7.Manifest*.nupkg
+        rm *ToolChain.net8.Manifest*.nupkg
+        unzip -o '*.nupkg' -d uno
+        cd uno
+        rm *.nuspec
 
-    - name: Copy mono/linker files
-      run: |
-        LINKER_OUT=runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION/tools
-        mkdir -p $LINKER_OUT
-        cp -r runtime/artifacts/bin/Mono.Linker/$BUILD_CONFIGURATION/net7.0/* $LINKER_OUT
+        # remove unused assets that are part of the official SDK
+        rm -fR _rels
+        rm -fR package
+        rm -fR analyzers
+        rm -fR ref
+        rm -f \[Content_Types\].xml
+        rm -f Icon.png
+        rm -f LICENCE.TXT
+        find data ! -name 'RuntimeList.xml' -type f -exec rm -f {} +
 
     - name: Zip Archive
       run: |
-        if [ '${{ matrix.MONO_WASM_THREADS }}' != 'singlethread' ]; then
-            ARCHIVE_CONFIGURATION="-threads";
-        fi
-        if [ '${{ matrix.MONO_WASM_SIMD }}' != 'false' ]; then
-            ARCHIVE_CONFIGURATION="$ARCHIVE_CONFIGURATION-simd";
-        fi
-
         ARTIFACTS_FOLDER=`pwd`/ci-artifacts
         mkdir -p $ARTIFACTS_FOLDER
-        cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
-        /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
+        cd ./runtime/artifacts/packages/Release/Shipping/uno
+        /usr/bin/zip -r $ARTIFACTS_FOLDER/sdk-${{ matrix.MONO_WASM_THREADS }}.zip *
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
-        name: wasm
+        name: wasm-sdk
         path: ci-artifacts
-        
-  ##
-  ## Release Job
-  ##
-  release_job:
-    if: github.event_name == 'push'
-    needs: [build_linux_job,build_windows_job]
+
+  package_job:
+    needs: [build_linux_job]
     runs-on: ubuntu-latest
-    environment:
-        name: Release
 
     steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup GitVersion
+      uses: gittools/actions/gitversion/setup@v0.9.9
+      with:
+        versionSpec: ${{ env.GitVersion_Version }}
+
+    - name: GitVersion
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v0.9.9
+      with:
+        useConfigFile: true
+        configFilePath: build/gitversion.yml
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version:  8.0.303
+
     - name: Download package
       uses: actions/download-artifact@v2
       with:
-          name: wasm
+          name: wasm-sdk
+          path: nuget
 
-    - uses: azure/login@v1
+    - name: Create NuGet SDK Packages
+      run: |
+        cd nuget
+        ls -la
+        find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
+        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+
+    - uses: actions/upload-artifact@v2
+      if: ${{ always() }}
       with:
-        creds: ${{ secrets.AZURE_STORAGE_CREDENTIALS }}
+        name: nuget
+        path: ci-output
 
-    - name: Upload to blob storage
-      uses: azure/CLI@v1
-      with:
-        inlineScript: |
-            az storage blob upload-batch --account-name unowasmbootstrap -d 'runtime' -s .
+  sign:
+    name: Sign Package
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/')) }}
+    runs-on: windows-latest
+    needs: [package_job,build_aot_windows_job]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
 
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget
+          path: artifacts
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v1
+        with:
+          dotnet-version: '3.1.x'
+
+      - name: Setup SignClient
+        run: |
+          dotnet tool install --tool-path build SignClient
+
+      - name: SignClient
+        shell: pwsh
+        run: |
+          build\SignClient sign -i artifacts\*.nupkg -c build\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "Uno.Check" -d "Uno.Check" -u "https://github.com/unoplatform/uno.check"
+
+      - name: Upload Signed Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: nuget-signed
+          path: .\artifacts        
+
+  publish_dev:
+    name: Publish Dev
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: windows-latest
+
+    needs:
+      - sign
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget-signed
+          path: artifacts
+
+      - name: NuGet Push
+        shell: pwsh
+        run: |
+          dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}"
+
+  publish_prod:
+    name: Publish Production
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') }}
+    runs-on: windows-latest
+    environment: Production
+
+    needs:
+      - sign
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: nuget-signed
+          path: artifacts
+
+      - name: NuGet Push
+        shell: pwsh
+        run: |
+          dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}"

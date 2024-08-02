@@ -4,16 +4,16 @@ Date: Thu, 15 Sep 2022 20:43:57 +0000
 Subject: [PATCH] fix: Enable IDBFS by default
 
 ---
- src/mono/wasm/wasm.proj | 1 +
+ src/mono/browser/browser.proj | 1 +
  1 file changed, 1 insertion(+)
 
-diff --git a/src/mono/wasm/wasm.proj b/src/mono/wasm/wasm.proj
+diff --git a/src/mono/browser/browser.proj b/src/mono/browser/browser.proj
 index cac849c5818..9326146aa4f 100644
---- a/src/mono/wasm/wasm.proj
-+++ b/src/mono/wasm/wasm.proj
+--- a/src/mono/browser/browser.proj
++++ b/src/mono/browser/browser.proj
 @@ -215,6 +215,7 @@
        <CMakeConfigurationLinkFlags Condition="'$(WasmEnableSIMD)' == 'true'">$(CMakeConfigurationLinkFlags) -msimd128</CMakeConfigurationLinkFlags>
-       <CMakeConfigurationLinkFlags Condition="'$(MonoWasmThreads)' == 'true'">$(CMakeConfigurationLinkFlags) -Wno-pthreads-mem-growth</CMakeConfigurationLinkFlags>
+       <CMakeConfigurationLinkFlags Condition="'$(WasmEnableThreads)' == 'true'">$(CMakeConfigurationLinkFlags) -Wno-pthreads-mem-growth</CMakeConfigurationLinkFlags>
        <CMakeConfigurationLinkFlags                                            >$(CMakeConfigurationLinkFlags) --emit-symbol-map</CMakeConfigurationLinkFlags>
 +      <CMakeConfigurationLinkFlags>$(CMakeConfigurationLinkFlags) -lidbfs.js</CMakeConfigurationLinkFlags>
  
