@@ -6,7 +6,7 @@ branches:
     mode: ContinuousDeployment
     regex: main
     tag: dev
-    increment: Minor
+    increment: patch
 
   pull-request:
     regex: ^(pull|pull\-requests|pr)[/-]
