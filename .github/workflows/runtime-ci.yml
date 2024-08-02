@@ -365,7 +365,7 @@ jobs:
         cd nuget
 
         # Adjust version numbers for target files
-        sed -i "s/\\\$buildversion\\\$/${{ steps.gitversion.outputs.semVer }}/g" runtime/*.*
+        sed -i "s/\\\$buildversion\\\$/${{ steps.gitversion.outputs.semVer }}/g" runtime/buildTransitive/*
 
         # Unzip all packages in separate folders
         find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
