@@ -178,12 +178,15 @@ jobs:
       run: |
         set -e
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false
+        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false
 
     - name: Create NuGet Package
       run: |
         mkdir -p $GITHUB_WORKSPACE/nuget/tools
         mkdir -p $GITHUB_WORKSPACE/ci-output
+
+        # Mark AOT generation binaries executable
+        chmod +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/*
 
         # Move cross compiler to appropriate location 
         mv $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross $GITHUB_WORKSPACE/nuget/tools
