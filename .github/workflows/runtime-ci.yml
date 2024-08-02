@@ -191,7 +191,7 @@ jobs:
         # Move cross compiler to appropriate location
         cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
-        cd $env:GITHUB_WORKSPACE/nuget
+        cd $GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
     - uses: actions/upload-artifact@v2
