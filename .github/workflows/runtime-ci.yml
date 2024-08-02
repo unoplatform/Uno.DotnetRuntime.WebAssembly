@@ -91,7 +91,7 @@ jobs:
         move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross $env:GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
-        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
