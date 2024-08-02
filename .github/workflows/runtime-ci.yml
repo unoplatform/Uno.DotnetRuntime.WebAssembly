@@ -363,8 +363,13 @@ jobs:
     - name: Create NuGet SDK Packages
       run: |
         cd nuget
-        ls -la
+
+        # Adjust version numbers for target files
+        find . -name 'runtime/*.*' -exec sed -i "s/\$buildversion\$/\${{ steps.gitversion.outputs.semVer }}/g" {} \;
+
+        # Unzip all packages in separate folders
         find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
+
         dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
     - uses: actions/upload-artifact@v2
