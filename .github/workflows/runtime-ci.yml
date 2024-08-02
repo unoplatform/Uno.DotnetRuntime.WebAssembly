@@ -186,7 +186,7 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/ci-output
 
         # Move cross compiler to appropriate location 
-        move $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross $GITHUB_WORKSPACE/nuget/tools
+        mv $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross $GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
@@ -397,7 +397,7 @@ jobs:
       - name: SignClient
         shell: pwsh
         run: |
-          build\SignClient sign -i artifacts\*.nupkg -c build\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "Uno.Check" -d "Uno.Check" -u "https://github.com/unoplatform/uno.check"
+          build\SignClient sign -i artifacts\*.nupkg -c build\signing\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "dotnet runtime" -d "dotnet runtime" -u "https://github.dev/unoplatform/Uno.DotnetRuntime.WebAssembly"
 
       - name: Upload Signed Artifacts
         uses: actions/upload-artifact@v2
