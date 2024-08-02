@@ -57,11 +57,8 @@ jobs:
         useConfigFile: true
         configFilePath: build/gitversion.yml
 
-    - name: Set Variable from current Commit
+    - name: Update variables
       run: |
-        Invoke-Expression "git rev-parse --short HEAD"  | Out-String -NoNewLine -OutVariable CURRENT_COMMIT
-        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $env:GITHUB_ENV
-        echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
 
     - name: Clone dotnet/runtime
@@ -72,15 +69,11 @@ jobs:
       name: Apply uno-specific patches
       shell: pwsh
 
-    - name: 'Setup Ninja'
-      run: |
-        choco install ninja
-
     - name: Build Wasm Runtime
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono.runtime+libs.native+libs.pretest /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd -arch wasm -os browser -subset mono /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create artifact structure
       run: |
@@ -167,9 +160,6 @@ jobs:
     - name: Set Variable from current Commit
       run: |
         set -e
-        CURRENT_COMMIT=`git rev-parse --short HEAD`
-        echo "CURRENT_COMMIT=$CURRENT_COMMIT" >> $GITHUB_ENV
-        echo "CurrentCommit=$CURRENT_COMMIT"
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
         echo "MONO_WASM_THREADS=${{ matrix.MONO_WASM_THREADS }}" >> $GITHUB_ENV
 
