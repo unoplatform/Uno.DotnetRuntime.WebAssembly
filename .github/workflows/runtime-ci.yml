@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   ##
-  ## Build Job
+  ## Windows AOT Cross
   ##
   build_aot_windows_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
@@ -73,9 +73,9 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd mono.runtime -arch wasm -os browser /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
-    - name: Create artifact structure
+    - name: Create NuGet Package
       run: |
         New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE/nuget/tools
         New-Item -ItemType Directory -Force -Path $env:GITHUB_WORKSPACE/ci-output
@@ -85,6 +85,114 @@ jobs:
 
         cd $env:GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+
+    - uses: actions/upload-artifact@v2
+      if: ${{ always() }}
+      with:
+        name: nuget
+        path: ci-output
+
+  ##
+  ## Build Linux AOT Cross
+  ##
+  build_aot_linux_job:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    container: 'mcr.microsoft.com/dotnet/sdk:8.0.303-jammy'
+
+    strategy:
+      matrix:
+       BUILD_CONFIGURATION: [Release]
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup GitVersion
+      uses: gittools/actions/gitversion/setup@v0.9.9
+      with:
+        versionSpec: ${{ env.GitVersion_Version }}
+
+    - name: GitVersion
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v0.9.9
+      with:
+        useConfigFile: true
+        configFilePath: build/gitversion.yml
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version:  8.0.303
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v1.7.2
+      with:
+        dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        set -e
+        apt-get update
+        apt-get install -y sudo
+        sudo apt-get install -y python3-pip locales p7zip-full zip
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
+          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+        sudo locale-gen en_US.UTF-8
+
+    - name: Install LLVM
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
+        
+    - name: Set Variable from current Commit
+      run: |
+        set -e
+        echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
+
+    - name: Clone dotnet/runtime
+      run: |
+        git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Install cmake
+      run: |
+        set -e
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
+        sudo tar --strip-components=1 -xz -C /usr/local
+
+    - name: Build Wasm Runtime
+      run: |
+        set -e
+        cd runtime
+        ./build.sh mono.runtime -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false
+
+    - name: Create NuGet Package
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/nuget/tools
+        mkdir -p $GITHUB_WORKSPACE/ci-output
+
+        # Mark AOT generation binaries executable
+        chmod -R +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/*
+
+        # Move cross compiler to appropriate location
+        cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
+
+        cd $GITHUB_WORKSPACE/nuget
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
@@ -269,7 +377,7 @@ jobs:
     name: Sign Package
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/')) }}
     runs-on: windows-latest
-    needs: [package_job,build_aot_windows_job]
+    needs: [package_job,build_aot_windows_job,build_aot_linux_job]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -292,7 +400,7 @@ jobs:
       - name: SignClient
         shell: pwsh
         run: |
-          build\SignClient sign -i artifacts\*.nupkg -c build\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "Uno.Check" -d "Uno.Check" -u "https://github.com/unoplatform/uno.check"
+          build\SignClient sign -i artifacts\*.nupkg -c build\signing\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "dotnet runtime" -d "dotnet runtime" -u "https://github.dev/unoplatform/Uno.DotnetRuntime.WebAssembly"
 
       - name: Upload Signed Artifacts
         uses: actions/upload-artifact@v2

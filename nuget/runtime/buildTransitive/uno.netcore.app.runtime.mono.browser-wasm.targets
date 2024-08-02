@@ -1,0 +1,56 @@
+<Project>
+	
+	<PropertyGroup>
+
+		<!-- Import like an SDK targets file (e.g. after the .NET SDK targets have been evaluated) -->
+		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_BaseTasksDir)\build\Microsoft.NET.Sdk.WebAssembly.Browser.targets</AfterMicrosoftNETSdkTargets>
+		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_BaseTasksDir)\Sdk\BrowserWasmApp.targets</AfterMicrosoftNETSdkTargets>
+
+	</PropertyGroup>
+
+
+	<!--
+	BEGIN Microsoft.NET.Sdk.WebAssembly.Browser.targets Imports
+	https://github.com/dotnet/runtime/blob/39dd2e1eaa2461df01b0e06157c573f9ce649c4f/src/mono/nuget/Microsoft.NET.Sdk.WebAssembly.Pack/build/Microsoft.NET.Sdk.WebAssembly.Browser.targets#L135-L143
+	-->
+	<Target Name="_UnoWasmNativeForBuild"
+			BeforeTargets="ResolveWasmOutputs"
+			DependsOnTargets="_UnoGatherWasmFilesToBuild;WasmBuildApp" />
+
+	<Target Name="_UnoGatherWasmFilesToBuild">
+		<ItemGroup>
+			<WasmAssembliesToBundle Remove="@(WasmAssembliesToBundle)" />
+			<WasmAssembliesToBundle Include="@(IntermediateAssembly)" />
+			<WasmAssembliesToBundle Include="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.Extension)' == '.dll'" />
+		</ItemGroup>
+	</Target>
+	<!--
+	END Microsoft.NET.Sdk.WebAssembly.Browser.targets Imports
+	-->
+
+	<Target Name="_UnoPopulateAssets" AfterTargets="ResolveRuntimePackAssets">
+		<ItemGroup>
+			<!-- We cannot set SelfContained as it requires official packs, copy the RuntimePackAsset items manually -->
+			<ReferenceCopyLocalPaths Include="@(RuntimePackAsset)"
+									 OriginalItemSpec="%(RuntimePackAsset.Identity)"
+									 Condition="'%(RuntimePackAsset.AssetType)' != 'pgodata'" />
+		</ItemGroup>
+
+	</Target>
+
+	<Target Name="_UnoAdjustPreferredPackages" AfterTargets="ResolveTargetingPackAssets">
+		<PropertyGroup>
+			<!-- Adjust the preferred list in order for assets deduplication to choose our package assets -->
+			<PackageConflictPreferredPackages>$(PackageConflictPreferredPackages);Uno.NETCore.App.Runtime.Mono.browser-wasm</PackageConflictPreferredPackages>
+		</PropertyGroup>
+
+		<!--
+		We're not setting a RuntimeIdentifier, so we need to remove the
+		PackageConflictPlatformManifests to match WasmApp's behavior
+		-->
+		<ItemGroup>
+			<PackageConflictPlatformManifests Remove="@(PlatformManifestsFromTargetingPacks)" />
+		</ItemGroup>
+	</Target>
+
+</Project>
