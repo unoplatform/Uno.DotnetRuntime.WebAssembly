@@ -3,8 +3,8 @@
 	<PropertyGroup>
 
 		<!-- Import like an SDK targets file (e.g. after the .NET SDK targets have been evaluated) -->
-		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_BaseTasksDir)\build\Microsoft.NET.Sdk.WebAssembly.Browser.targets</AfterMicrosoftNETSdkTargets>
-		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_BaseTasksDir)\Sdk\BrowserWasmApp.targets</AfterMicrosoftNETSdkTargets>
+		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_UnoNetCoreAppRuntimeBasePath)\build\Microsoft.NET.Sdk.WebAssembly.Browser.targets</AfterMicrosoftNETSdkTargets>
+		<AfterMicrosoftNETSdkTargets>$(AfterMicrosoftNETSdkTargets);$(_UnoNetCoreAppRuntimeBasePath)\Sdk\BrowserWasmApp.targets</AfterMicrosoftNETSdkTargets>
 
 	</PropertyGroup>
 

@@ -3,13 +3,13 @@ name: runtime CI
 on:
   push:
     branches:
-      - master
+      - main
       - release/**
       
   pull_request:
     types: [opened, synchronize, reopened, closed]
     branches:
-      - master
+      - main
       - release/**
 
 env:
@@ -375,7 +375,7 @@ jobs:
 
   sign:
     name: Sign Package
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/')) }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     runs-on: windows-latest
     needs: [package_job,build_aot_windows_job,build_aot_linux_job]
     steps:

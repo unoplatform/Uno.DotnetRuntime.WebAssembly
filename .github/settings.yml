@@ -19,7 +19,7 @@ repository:
 
   has_downloads: true
 
-  default_branch: master
+  default_branch: main
 
   allow_squash_merge: true
   allow_merge_commit: false
@@ -178,7 +178,7 @@ labels:
   #  oldname: Help Wanted
 
 branches:
-  - name: master
+  - name: main
     # https://developer.github.com/v3/repos/branches/#update-branch-protection
     # Branch Protection settings. Set to null to disable
     protection:
