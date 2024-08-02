@@ -188,10 +188,8 @@ jobs:
         # Mark AOT generation binaries executable
         chmod -R +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/*
 
-        ls -laR $GITHUB_WORKSPACE/runtime/artifacts/bin/mono
-
         # Move cross compiler to appropriate location
-        cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
+        cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
