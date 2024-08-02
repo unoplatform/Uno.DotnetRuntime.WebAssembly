@@ -17,6 +17,9 @@
 		<None Include="sdk-singlethread/**" Pack="true" PackagePath="data/singlethread  " />
 
 		<!-- This is required to get the automatic GeneratePathProperty -->
+		<None Include="runtime/buildTransitive" Pack="true" PackagePath="buildTransitive" />
+
+		<!-- This is required to get the automatic GeneratePathProperty -->
 		<None Include="_._" Pack="true" PackagePath="tools" />
 	</ItemGroup>
 

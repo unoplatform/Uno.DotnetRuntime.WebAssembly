@@ -73,7 +73,7 @@ jobs:
       run: |
         $env:MonoEnableAssertMessages=true # enable emsdk assert messages
         cd runtime
-        .\build.cmd -arch wasm -os browser -subset mono+libs /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
+        .\build.cmd mono.runtime -arch wasm -os browser /p:RuntimeFlavor=Mono -c $env:BUILD_CONFIGURATION $env:ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false /p:CrossBuild=false /bl:ci-artifacts\msbuild.binlog
 
     - name: Create NuGet Package
       run: |
@@ -178,7 +178,7 @@ jobs:
       run: |
         set -e
         cd runtime
-        ./build.sh -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS "/p:MonoWasmBuildVariant=singlethread" /p:TestAssemblies=false
+        ./build.sh mono.runtime -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false
 
     - name: Create NuGet Package
       run: |
@@ -186,10 +186,10 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/ci-output
 
         # Mark AOT generation binaries executable
-        chmod +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/*
+        chmod -R +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/*
 
-        # Move cross compiler to appropriate location 
-        cp $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross/* $GITHUB_WORKSPACE/nuget/tools
+        # Move cross compiler to appropriate location
+        cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/Browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
