@@ -230,7 +230,7 @@ jobs:
         path: ci-artifacts
 
   package_job:
-    needs: [build_linux_job,build_aot_windows_job]
+    needs: [build_linux_job]
     runs-on: ubuntu-latest
 
     steps:
@@ -280,7 +280,7 @@ jobs:
   ##
   release_job:
     if: github.event_name == 'push'
-    needs: [package_job]
+    needs: [package_job,build_aot_windows_job]
     runs-on: ubuntu-latest
     environment:
         name: Release
