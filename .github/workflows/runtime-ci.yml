@@ -158,7 +158,7 @@ jobs:
 
     steps:
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
