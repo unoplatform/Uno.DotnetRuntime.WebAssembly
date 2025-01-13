@@ -148,7 +148,6 @@ jobs:
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-20.04
-    container: 'unoplatform/wasm-build:2.3'
 
     strategy:
       matrix:
