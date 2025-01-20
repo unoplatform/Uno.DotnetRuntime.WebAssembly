@@ -136,7 +136,7 @@ jobs:
         cd runtime\artifacts\bin\microsoft.netcore.app.runtime.browser-wasm\$env:BUILD_CONFIGURATION
         Compress-Archive -DestinationPath $ARTIFACTS_FOLDER\dotnet-runtime-wasm-windows-$env:CURRENT_COMMIT-$env:BASE_DOTNET_SHORT_COMMIT-${{ github.run_id }}-$env:BUILD_CONFIGURATION$archiveConfiguration.zip -Path *
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       if: ${{ always() }}
       with:
         name: wasm
@@ -147,8 +147,7 @@ jobs:
   ##
   build_linux_job:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
-    runs-on: ubuntu-latest
-    container: 'unoplatform/wasm-build:2.3'
+    runs-on: ubuntu-20.04
 
     strategy:
       matrix:
@@ -158,7 +157,7 @@ jobs:
 
     steps:
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
@@ -284,7 +283,7 @@ jobs:
         cd runtime/artifacts/bin/microsoft.netcore.app.runtime.browser-wasm/$BUILD_CONFIGURATION
         /usr/bin/zip -r $ARTIFACTS_FOLDER/dotnet-runtime-wasm-linux-$CURRENT_COMMIT-$BASE_DOTNET_SHORT_COMMIT-$GITHUB_RUN_ID-$BUILD_CONFIGURATION$ARCHIVE_CONFIGURATION.zip *
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v3
       if: ${{ always() }}
       with:
         name: wasm
@@ -296,13 +295,13 @@ jobs:
   release_job:
     if: github.event_name == 'push'
     needs: [build_linux_job,build_windows_job]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     environment:
         name: Release
 
     steps:
     - name: Download package
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v3
       with:
           name: wasm
 
