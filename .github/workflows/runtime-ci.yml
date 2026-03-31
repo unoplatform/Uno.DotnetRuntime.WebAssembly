@@ -16,7 +16,7 @@ env:
   DOTNETRUNTIME_COMMIT: 081d220c0a773ffb7c6bea6b48727833576a65ef
   DOTNETSDK_VERSION: 10.0.100
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
-  NBGV_VERSION: 3.7.112
+  NBGV_VERSION: 3.9.50
 
 concurrency: 
   group: ${{github.workflow}} - ${{github.ref}} - ${{github.event_name}}
@@ -309,7 +309,9 @@ jobs:
         dotnet-version: 10.0.100
 
     - name: Install nbgv
-      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
+      run: |
+        dotnet tool uninstall --global nbgv || true
+        dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
 
     - name: Get version
       id: nbgv
