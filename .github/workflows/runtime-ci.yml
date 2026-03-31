@@ -36,11 +36,11 @@ jobs:
 
     steps:
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version: ${{ env.DOTNETSDK_VERSION }}
 
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
         fetch-depth: 0
@@ -86,10 +86,10 @@ jobs:
         cd $env:GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
-        name: nuget
+        name: nuget-aot-windows
         path: ci-output
 
   ##
@@ -105,7 +105,7 @@ jobs:
        BUILD_CONFIGURATION: [Release]
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
         fetch-depth: 0
@@ -123,12 +123,12 @@ jobs:
         configFilePath: build/gitversion.yml
 
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.100
 
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
@@ -194,10 +194,10 @@ jobs:
         cd $GITHUB_WORKSPACE/nuget
         dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
-        name: nuget
+        name: nuget-aot-linux
         path: ci-output
 
   ##
@@ -214,7 +214,7 @@ jobs:
        MONO_WASM_THREADS: ['multithread', 'singlethread']
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
         fetch-depth: 0
@@ -232,12 +232,12 @@ jobs:
         configFilePath: build/gitversion.yml
 
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.100
 
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
     
@@ -323,7 +323,7 @@ jobs:
         cd ./runtime/artifacts/packages/Release/Shipping/uno
         /usr/bin/zip -r $ARTIFACTS_FOLDER/sdk-${{ matrix.MONO_WASM_THREADS }}.zip *
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
         name: wasm-sdk
@@ -334,7 +334,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
       with:
         submodules: true
         fetch-depth: 0
@@ -352,12 +352,12 @@ jobs:
         configFilePath: build/gitversion.yml
 
     - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v1.7.2
+      uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.100
 
     - name: Download package
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v4
       with:
           name: wasm-sdk
           path: nuget
@@ -374,10 +374,10 @@ jobs:
 
         dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
-        name: nuget
+        name: nuget-sdk
         path: ci-output
 
   sign:
@@ -387,16 +387,17 @@ jobs:
     needs: [package_job,build_aot_windows_job,build_aot_linux_job]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Download Artifacts
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
-          name: nuget
+          pattern: nuget-*
           path: artifacts
+          merge-multiple: true
 
       - name: Setup .NET SDK
-        uses: actions/setup-dotnet@v1
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '3.1.x'
 
@@ -410,7 +411,7 @@ jobs:
           build\SignClient sign -i artifacts\*.nupkg -c build\signing\SignClient.json -r "${{ secrets.UNO_PLATFORM_CODESIGN_USERNAME }}" -s "${{ secrets.UNO_PLATFORM_CODESIGN_SECRET }}" -n "dotnet runtime" -d "dotnet runtime" -u "https://github.dev/unoplatform/Uno.DotnetRuntime.WebAssembly"
 
       - name: Upload Signed Artifacts
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: nuget-signed
           path: .\artifacts        
@@ -425,7 +426,7 @@ jobs:
 
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: nuget-signed
           path: artifacts
@@ -446,7 +447,7 @@ jobs:
 
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: nuget-signed
           path: artifacts
