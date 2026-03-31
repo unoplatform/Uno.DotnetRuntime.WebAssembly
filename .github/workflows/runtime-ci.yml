@@ -16,7 +16,7 @@ env:
   DOTNETRUNTIME_COMMIT: 081d220c0a773ffb7c6bea6b48727833576a65ef
   DOTNETSDK_VERSION: 10.0.100
   ADDITIONAL_BUILD_ARGS: '/p:MonoEnableAssertMessages=true /p:WasmEnableES6=true /p:WasmExceptionHandling=true'
-  GitVersion_Version: 5.10.3
+  NBGV_VERSION: 3.7.112
 
 concurrency: 
   group: ${{github.workflow}} - ${{github.ref}} - ${{github.event_name}}
@@ -45,17 +45,13 @@ jobs:
         submodules: true
         fetch-depth: 0
 
-    - name: Setup GitVersion
-      uses: gittools/actions/gitversion/setup@v0.9.9
-      with:
-        versionSpec: ${{ env.GitVersion_Version }}
+    - name: Install nbgv
+      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
 
-    - name: GitVersion
-      id: gitversion
-      uses: gittools/actions/gitversion/execute@v0.9.9
-      with:
-        useConfigFile: true
-        configFilePath: build/gitversion.yml
+    - name: Get version
+      id: nbgv
+      run: |
+        echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $env:GITHUB_OUTPUT
 
     - name: Update variables
       run: |
@@ -84,7 +80,7 @@ jobs:
         move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross $env:GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
-        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
@@ -110,18 +106,6 @@ jobs:
         submodules: true
         fetch-depth: 0
 
-    - name: Setup GitVersion
-      uses: gittools/actions/gitversion/setup@v0.9.9
-      with:
-        versionSpec: ${{ env.GitVersion_Version }}
-
-    - name: GitVersion
-      id: gitversion
-      uses: gittools/actions/gitversion/execute@v0.9.9
-      with:
-        useConfigFile: true
-        configFilePath: build/gitversion.yml
-
     - name: Setup .NET SDK
       uses: actions/setup-dotnet@v4
       with:
@@ -131,7 +115,10 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
-    
+
+    - name: Install nbgv
+      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
+
     - name: Install dependencies
       run: |
         set -e
@@ -154,7 +141,12 @@ jobs:
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
-        
+
+    - name: Get version
+      id: nbgv
+      run: |
+        echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $GITHUB_OUTPUT
+
     - name: Set Variable from current Commit
       run: |
         set -e
@@ -192,7 +184,7 @@ jobs:
         cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
         cd $GITHUB_WORKSPACE/nuget
-        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
@@ -219,18 +211,6 @@ jobs:
         submodules: true
         fetch-depth: 0
 
-    - name: Setup GitVersion
-      uses: gittools/actions/gitversion/setup@v0.9.9
-      with:
-        versionSpec: ${{ env.GitVersion_Version }}
-
-    - name: GitVersion
-      id: gitversion
-      uses: gittools/actions/gitversion/execute@v0.9.9
-      with:
-        useConfigFile: true
-        configFilePath: build/gitversion.yml
-
     - name: Setup .NET SDK
       uses: actions/setup-dotnet@v4
       with:
@@ -240,7 +220,7 @@ jobs:
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
-    
+
     - name: Install dependencies
       run: |
         set -e
@@ -264,7 +244,7 @@ jobs:
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
-        
+
     - name: Set Variable from current Commit
       run: |
         set -e
@@ -339,22 +319,18 @@ jobs:
         submodules: true
         fetch-depth: 0
 
-    - name: Setup GitVersion
-      uses: gittools/actions/gitversion/setup@v0.9.9
-      with:
-        versionSpec: ${{ env.GitVersion_Version }}
-
-    - name: GitVersion
-      id: gitversion
-      uses: gittools/actions/gitversion/execute@v0.9.9
-      with:
-        useConfigFile: true
-        configFilePath: build/gitversion.yml
-
     - name: Setup .NET SDK
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: 10.0.100
+
+    - name: Install nbgv
+      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
+
+    - name: Get version
+      id: nbgv
+      run: |
+        echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $GITHUB_OUTPUT
 
     - name: Download package
       uses: actions/download-artifact@v4
@@ -368,12 +344,12 @@ jobs:
         cd nuget
 
         # Adjust version numbers for target files
-        sed -i "s/\\\$buildversion\\\$/${{ steps.gitversion.outputs.semVer }}/g" runtime/buildTransitive/*
+        sed -i "s/\\\$buildversion\\\$/${{ steps.nbgv.outputs.SemVer2 }}/g" runtime/buildTransitive/*
 
         # Unzip all packages in separate folders
         find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
 
-        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.gitversion.outputs.semVer }}"
+        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
