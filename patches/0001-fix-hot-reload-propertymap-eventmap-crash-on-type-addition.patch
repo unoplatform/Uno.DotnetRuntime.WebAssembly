@@ -1,21 +1,18 @@
 diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
-index e5614bb0788..400d6e3f8c3 100644
+index e5614bb0788..734eff2372e 100644
 --- a/src/mono/mono/component/hot_reload.c
 +++ b/src/mono/mono/component/hot_reload.c
-@@ -2142,17 +2142,18 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2140,8 +2140,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 		case MONO_TABLE_PROPERTYMAP: {
+ 			switch (func_code) {
  			case ENC_FUNC_DEFAULT:
- 				/* adding a new property map - parent could be new or existing class, but it didn't have a propertymap before */
- 				g_assert (is_addition);
-+				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: new propertymap token=0x%08x (addition)", log_token);
+-				/* adding a new property map - parent could be new or existing class, but it didn't have a propertymap before */
+-				g_assert (is_addition);
++				/* could be adding a new property map or updating an existing one */
  				break;
--			case ENC_FUNC_ADD_PROPERTY:
-+			case ENC_FUNC_ADD_PROPERTY: {
+ 			case ENC_FUNC_ADD_PROPERTY:
  				/* adding a new property to a propertymap.  could be new or existing propertymap. */
-+				uint32_t prop_cols[MONO_PROPERTY_MAP_SIZE];
-+				mono_metadata_decode_row (&image_base->tables [MONO_TABLE_PROPERTYMAP], token_index - 1, prop_cols, MONO_PROPERTY_MAP_SIZE);
-+				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: propertymap parent = 0x%08x, props = 0x%08x\n", prop_cols [MONO_PROPERTY_MAP_PARENT], prop_cols [MONO_PROPERTY_MAP_PROPERTY_LIST]);
- 				break;
-+			}
+@@ -2149,10 +2148,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -23,23 +20,27 @@ index e5614bb0788..400d6e3f8c3 100644
 -			mono_metadata_decode_row (&image_base->tables [MONO_TABLE_PROPERTYMAP], token_index - 1, prop_cols, MONO_PROPERTY_MAP_SIZE);
 -
 -			mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: propertymap parent = 0x%08x, props = 0x%08x\n", prop_cols [MONO_PROPERTY_MAP_PARENT], prop_cols [MONO_PROPERTY_MAP_PROPERTY_LIST]);
++			if (!is_addition) {
++				uint32_t prop_cols[MONO_PROPERTY_MAP_SIZE];
++				mono_metadata_decode_row (&image_base->tables [MONO_TABLE_PROPERTYMAP], token_index - 1, prop_cols, MONO_PROPERTY_MAP_SIZE);
++				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: propertymap token=0x%08x parent = 0x%08x, props = 0x%08x", log_token, prop_cols [MONO_PROPERTY_MAP_PARENT], prop_cols [MONO_PROPERTY_MAP_PROPERTY_LIST]);
++			} else {
++				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: new propertymap token=0x%08x (addition)", log_token);
++			}
  			break;
  		}
  		case MONO_TABLE_PROPERTY: {
-@@ -2196,17 +2197,18 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2194,8 +2196,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 		case MONO_TABLE_EVENTMAP: {
+ 			switch (func_code) {
  			case ENC_FUNC_DEFAULT:
- 				/* adding a new eventmap - parent could be new or existing class, but it didn't have an eventmap before */
- 				g_assert (is_addition);
-+				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: new eventmap token=0x%08x (addition)", log_token);
+-				/* adding a new eventmap - parent could be new or existing class, but it didn't have an eventmap before */
+-				g_assert (is_addition);
++				/* could be adding a new eventmap or updating an existing one */
  				break;
--			case ENC_FUNC_ADD_EVENT:
-+			case ENC_FUNC_ADD_EVENT: {
+ 			case ENC_FUNC_ADD_EVENT:
  				/* adding a new event to an eventmap. could be new or existing eventmap. */
-+				uint32_t evt_cols[MONO_EVENT_MAP_SIZE];
-+				mono_metadata_decode_row (&image_base->tables [MONO_TABLE_EVENTMAP], token_index - 1, evt_cols, MONO_EVENT_MAP_SIZE);
-+				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: eventmap parent = 0x%08x, evts = 0x%08x\n", evt_cols [MONO_EVENT_MAP_PARENT], evt_cols [MONO_EVENT_MAP_EVENTLIST]);
- 				break;
-+			}
+@@ -2203,12 +2204,14 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -47,6 +48,15 @@ index e5614bb0788..400d6e3f8c3 100644
 -			mono_metadata_decode_row (&image_base->tables [MONO_TABLE_EVENTMAP], token_index - 1, prop_cols, MONO_EVENT_MAP_SIZE);
 -
 -			mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: eventmap parent = 0x%08x, evts = 0x%08x\n", prop_cols [MONO_EVENT_MAP_PARENT], prop_cols [MONO_EVENT_MAP_EVENTLIST]);
++			if (!is_addition) {
++				uint32_t evt_cols[MONO_EVENT_MAP_SIZE];
++				mono_metadata_decode_row (&image_base->tables [MONO_TABLE_EVENTMAP], token_index - 1, evt_cols, MONO_EVENT_MAP_SIZE);
++				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: eventmap token=0x%08x parent = 0x%08x, evts = 0x%08x", log_token, evt_cols [MONO_EVENT_MAP_PARENT], evt_cols [MONO_EVENT_MAP_EVENTLIST]);
++			} else {
++				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: new eventmap token=0x%08x (addition)", log_token);
++			}
  			break;
- 
+-
  		}
+ 		case MONO_TABLE_EVENT: {
+ 			if (is_addition) {
