@@ -28,16 +28,6 @@
 	-->
 
 	<ItemGroup>
-		<RuntimePack
-			Include="Uno.NETCore.App.Runtime.Mono.browser-wasm"
-			NuGetPackageVersion="$buildversion$"
-			FrameworkName="Microsoft.NETCore.App"
-			PackageDirectory="$(_UnoNetCoreAppRuntimeBasePath)"
-			RuntimeIdentifier="browser-wasm"
-			NuGetPackageId="Uno.NETCore.App.Runtime.Mono.browser-wasm"
-			IsTrimmable=""
-			/>
-
 		<PackageConflictPreferredPackages Include="Uno.NETCore.App.Runtime.Mono.browser-wasm" />
 
 		<MonoAotCrossCompiler Include="$(_MonoAotCrossCompilerPath)" RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />

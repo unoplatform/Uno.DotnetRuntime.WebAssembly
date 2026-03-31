@@ -45,14 +45,6 @@ jobs:
         submodules: true
         fetch-depth: 0
 
-    - name: Install nbgv
-      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
-
-    - name: Get version
-      id: nbgv
-      run: |
-        echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $env:GITHUB_OUTPUT
-
     - name: Update variables
       run: |
         echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $env:GITHUB_ENV
@@ -80,7 +72,7 @@ jobs:
         move $env:GITHUB_WORKSPACE\runtime\artifacts\bin\mono\Browser.wasm.Release\cross $env:GITHUB_WORKSPACE/nuget/tools
 
         cd $env:GITHUB_WORKSPACE/nuget
-        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$env:GITHUB_WORKSPACE\ci-output
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
@@ -116,9 +108,6 @@ jobs:
       with:
         dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
 
-    - name: Install nbgv
-      run: dotnet tool install --global nbgv --version ${{ env.NBGV_VERSION }}
-
     - name: Install dependencies
       run: |
         set -e
@@ -141,11 +130,6 @@ jobs:
 
     - name: Trust My Directory
       run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
-
-    - name: Get version
-      id: nbgv
-      run: |
-        echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $GITHUB_OUTPUT
 
     - name: Set Variable from current Commit
       run: |
@@ -184,7 +168,7 @@ jobs:
         cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
 
         cd $GITHUB_WORKSPACE/nuget
-        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
@@ -349,7 +333,7 @@ jobs:
         # Unzip all packages in separate folders
         find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
 
-        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output "/p:Version=${{ steps.nbgv.outputs.SemVer2 }}"
+        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
