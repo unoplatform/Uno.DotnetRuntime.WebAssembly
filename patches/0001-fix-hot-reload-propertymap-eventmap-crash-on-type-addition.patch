@@ -1,8 +1,35 @@
 diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
-index e5614bb0788..734eff2372e 100644
+index e5614bb0788..cf7afa0b52a 100644
 --- a/src/mono/mono/component/hot_reload.c
 +++ b/src/mono/mono/component/hot_reload.c
-@@ -2140,8 +2140,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -1995,7 +1995,6 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 		case MONO_TABLE_METHOD: {
+ 			/* if adding a param, handle it with the next record */
+ 			if (func_code == ENC_FUNC_ADD_PARAM) {
+-				g_assert (is_addition);
+ 				break;
+ 			}
+ 			g_assert (func_code == ENC_FUNC_DEFAULT);
+@@ -2042,7 +2041,10 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 			break;
+ 		}
+ 		case MONO_TABLE_FIELD: {
+-			g_assert (is_addition);
++			/* is_addition can be false when the field token index falls within
++			 * prev_gen_rows (e.g. adding properties to an existing type where
++			 * the backing field reuses a token slot). The real guard is
++			 * add_member_typedef which is set by the preceding ENC_FUNC_ADD_FIELD entry. */
+ 			g_assert (add_member_typedef);
+ 			if (pass2_context_is_skeleton (ctx, add_member_typedef)) {
+ 				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "Adding new field 0x%08x to new class 0x%08x", log_token, add_member_typedef);
+@@ -2133,15 +2135,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 			break;
+ 		}
+ 		case MONO_TABLE_NESTEDCLASS: {
+-			g_assert (is_addition);
+ 			add_nested_class_to_worklist (ctx, image_base, log_token);
+ 			break;
+ 		}
  		case MONO_TABLE_PROPERTYMAP: {
  			switch (func_code) {
  			case ENC_FUNC_DEFAULT:
@@ -12,7 +39,7 @@ index e5614bb0788..734eff2372e 100644
  				break;
  			case ENC_FUNC_ADD_PROPERTY:
  				/* adding a new property to a propertymap.  could be new or existing propertymap. */
-@@ -2149,10 +2148,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2149,10 +2149,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -30,7 +57,7 @@ index e5614bb0788..734eff2372e 100644
  			break;
  		}
  		case MONO_TABLE_PROPERTY: {
-@@ -2194,8 +2196,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2194,8 +2197,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  		case MONO_TABLE_EVENTMAP: {
  			switch (func_code) {
  			case ENC_FUNC_DEFAULT:
@@ -40,7 +67,7 @@ index e5614bb0788..734eff2372e 100644
  				break;
  			case ENC_FUNC_ADD_EVENT:
  				/* adding a new event to an eventmap. could be new or existing eventmap. */
-@@ -2203,12 +2204,14 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2203,12 +2205,14 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -60,3 +87,16 @@ index e5614bb0788..734eff2372e 100644
  		}
  		case MONO_TABLE_EVENT: {
  			if (is_addition) {
+@@ -2284,12 +2288,10 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 			break;
+ 		}
+ 		case MONO_TABLE_INTERFACEIMPL: {
+-			g_assert (is_addition);
+ 			/* added rows ok (for added classes). will be processed when the MonoClass is created. */
+ 			break;
+ 		}
+ 		case MONO_TABLE_METHODSEMANTICS: {
+-			g_assert (is_addition);
+ 			/* added rows ok (for new or existing classes). don't expect modifications */
+ 			uint32_t sema_cols[MONO_METHOD_SEMA_SIZE];
+ 
