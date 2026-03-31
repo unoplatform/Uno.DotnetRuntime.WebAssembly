@@ -8,18 +8,22 @@ Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVaria
 echo dotnet/runtime base SHA1: $BASE_DOTNET_SHORT_COMMIT
 echo "BASE_DOTNET_SHORT_COMMIT=$BASE_DOTNET_SHORT_COMMIT" >> $env:GITHUB_ENV
 
-$files = @(Get-ChildItem ../patches/*.patch | Sort-Object)
-foreach ($file in $files) 
-{
-    echo "Applying patch $file"
-    git apply --whitespace=fix $file
-    ThrowOnNativeFailure
-}
+$files = @(Get-ChildItem ../patches/*.patch -ErrorAction SilentlyContinue | Sort-Object)
+if ($files.Count -gt 0) {
+    foreach ($file in $files)
+    {
+        echo "Applying patch $file"
+        git apply --whitespace=fix $file
+        ThrowOnNativeFailure
+    }
 
-git config --global user.email "ci@platform.uno"
-git config --global user.name "Uno Platform CI"
-git add .
-git commit -m "apply patches"
+    git config --global user.email "ci@platform.uno"
+    git config --global user.name "Uno Platform CI"
+    git add .
+    git commit -m "apply patches"
+} else {
+    echo "No patches to apply."
+}
 
 Invoke-Expression "git rev-parse --short HEAD" | Out-String -NoNewLine -OutVariable PATCHED_DOTNET_SHORT_COMMIT
 echo dotnet/runtime patched SHA1: $PATCHED_DOTNET_SHORT_COMMIT

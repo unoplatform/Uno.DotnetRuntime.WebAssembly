@@ -13,6 +13,10 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<PackageReference Include="Nerdbank.GitVersioning" Version="3.9.50" PrivateAssets="all" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<None Include="sdk-multithread/**" Pack="true" PackagePath="data/multithread" />
 		<None Include="sdk-singlethread/**" Pack="true" PackagePath="data/singlethread  " />
 

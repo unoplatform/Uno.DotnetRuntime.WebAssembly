@@ -28,6 +28,33 @@
 	END Microsoft.NET.Sdk.WebAssembly.Browser.targets Imports
 	-->
 
+	<!--
+	Override the resolved runtime pack to point at our custom-built runtime.
+	Must run after ResolveFrameworkReferences so the SDK has already resolved
+	the stock Microsoft.NETCore.App runtime pack. We replace its PackageDirectory
+	to redirect all native/.a/lib assets to our build.
+	-->
+	<!--
+	Override the resolved runtime pack to point at our custom-built runtime.
+	Runs after ResolveFrameworkReferences so the SDK has already resolved the
+	stock Microsoft.NETCore.App. We replace PackageDirectory and the derived
+	RuntimePackPath to redirect all native/.a/lib assets to our build.
+	-->
+	<Target Name="_UnoOverrideRuntimePack" AfterTargets="ResolveFrameworkReferences">
+		<ItemGroup>
+			<ResolvedRuntimePack Condition="'%(ResolvedRuntimePack.FrameworkName)' == 'Microsoft.NETCore.App'">
+				<PackageDirectory>$(_UnoNetCoreAppRuntimeBasePath)</PackageDirectory>
+				<RuntimePackPath>$(_UnoNetCoreAppRuntimeBasePath)</RuntimePackPath>
+			</ResolvedRuntimePack>
+		</ItemGroup>
+		<PropertyGroup>
+			<!-- Ensure the property-based paths win over what the SDK resolved -->
+			<MicrosoftNetCoreAppRuntimePackDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes/browser-wasm/</MicrosoftNetCoreAppRuntimePackDir>
+			<MicrosoftNetCoreAppRuntimePackRidDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes/browser-wasm/</MicrosoftNetCoreAppRuntimePackRidDir>
+			<MicrosoftNetCoreAppRuntimePackRidLibTfmDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes/browser-wasm/lib/net10.0/</MicrosoftNetCoreAppRuntimePackRidLibTfmDir>
+		</PropertyGroup>
+	</Target>
+
 	<Target Name="_UnoPopulateAssets" AfterTargets="ResolveRuntimePackAssets">
 		<ItemGroup>
 			<!-- We cannot set SelfContained as it requires official packs, copy the RuntimePackAsset items manually -->
