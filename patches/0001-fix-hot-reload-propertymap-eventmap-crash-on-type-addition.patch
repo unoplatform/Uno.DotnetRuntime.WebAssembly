@@ -1,5 +1,5 @@
 diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
-index e5614bb0788..cf7afa0b52a 100644
+index e5614bb0788..ff2ea665159 100644
 --- a/src/mono/mono/component/hot_reload.c
 +++ b/src/mono/mono/component/hot_reload.c
 @@ -1995,7 +1995,6 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
@@ -39,7 +39,7 @@ index e5614bb0788..cf7afa0b52a 100644
  				break;
  			case ENC_FUNC_ADD_PROPERTY:
  				/* adding a new property to a propertymap.  could be new or existing propertymap. */
-@@ -2149,10 +2149,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2149,16 +2149,21 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -57,7 +57,18 @@ index e5614bb0788..cf7afa0b52a 100644
  			break;
  		}
  		case MONO_TABLE_PROPERTY: {
-@@ -2194,8 +2197,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+-			/* allow updates to existing properties. */
+-			if (is_addition) {
+-				g_assert (add_property_propertymap != 0);
++			/* Register properties when signaled by a preceding ENC_FUNC_ADD_PROPERTY
++			 * entry (add_property_propertymap != 0). Use this context variable instead
++			 * of is_addition because is_addition is unreliable — token indices can fall
++			 * within prev_gen_rows when re-applying the same type across generations. */
++			if (add_property_propertymap != 0) {
+ 
+ 				uint32_t parent_type_token = mono_metadata_decode_row_col (&image_base->tables [MONO_TABLE_PROPERTYMAP], mono_metadata_token_index (add_property_propertymap) - 1, MONO_PROPERTY_MAP_PARENT);
+ 				parent_type_token = mono_metadata_make_token (MONO_TABLE_TYPEDEF, parent_type_token);
+@@ -2194,8 +2199,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  		case MONO_TABLE_EVENTMAP: {
  			switch (func_code) {
  			case ENC_FUNC_DEFAULT:
@@ -67,7 +78,7 @@ index e5614bb0788..cf7afa0b52a 100644
  				break;
  			case ENC_FUNC_ADD_EVENT:
  				/* adding a new event to an eventmap. could be new or existing eventmap. */
-@@ -2203,12 +2205,14 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+@@ -2203,16 +2207,17 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			default:
  				g_assert_not_reached (); /* unexpected func code */
  			}
@@ -86,8 +97,13 @@ index e5614bb0788..cf7afa0b52a 100644
 -
  		}
  		case MONO_TABLE_EVENT: {
- 			if (is_addition) {
-@@ -2284,12 +2288,10 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+-			if (is_addition) {
+-				g_assert (add_event_eventmap != 0);
++			if (add_event_eventmap != 0) {
+ 
+ 				uint32_t parent_type_token = mono_metadata_decode_row_col (&image_base->tables [MONO_TABLE_EVENTMAP], mono_metadata_token_index (add_event_eventmap) - 1, MONO_EVENT_MAP_PARENT);
+ 				parent_type_token = mono_metadata_make_token (MONO_TABLE_TYPEDEF, parent_type_token);
+@@ -2284,12 +2289,10 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
  			break;
  		}
  		case MONO_TABLE_INTERFACEIMPL: {
