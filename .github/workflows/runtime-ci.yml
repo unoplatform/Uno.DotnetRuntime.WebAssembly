@@ -347,6 +347,7 @@ jobs:
     name: Sign Package
     if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) }}
     runs-on: windows-latest
+    environment: PackageSign
 
     permissions:
       id-token: write # Required for requesting the JWT
