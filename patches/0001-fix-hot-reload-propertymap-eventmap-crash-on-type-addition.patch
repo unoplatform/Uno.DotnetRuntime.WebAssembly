@@ -1,3 +1,339 @@
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs
+new file mode 100644
+index 00000000000..f58772c763f
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs
+@@ -0,0 +1,10 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs
+new file mode 100644
+index 00000000000..c7608580fa0
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs
+@@ -0,0 +1,31 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// New type added in generation 1 with auto-properties.
++/// This produces PROPERTYMAP, PROPERTY, and FIELD ENCLOG entries.
++/// </summary>
++public class NewClassWithProperties
++{
++    public string Title { get; set; } = "Default";
++    public decimal Price { get; set; }
++    public bool IsActive { get; set; }
++
++    public static NewClassWithProperties Create()
++    {
++        return new NewClassWithProperties
++        {
++            Title = "Gen1",
++            Price = 9.99m,
++            IsActive = true,
++        };
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs
+new file mode 100644
+index 00000000000..261faf78c00
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs
+@@ -0,0 +1,35 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// Generation 2: Same type as v1, but with a new method added.
++/// This re-emits PROPERTYMAP, PROPERTY, FIELD, and METHODSEMANTICS entries
++/// where is_addition will be false (tokens already exist from gen 1).
++/// This is the exact scenario that triggers the hot_reload crash.
++/// </summary>
++public class NewClassWithProperties
++{
++    public string Title { get; set; } = "Updated";
++    public decimal Price { get; set; }
++    public bool IsActive { get; set; }
++
++    public string GetSummary() => $"{Title}: {Price:C}";
++
++    public static NewClassWithProperties Create()
++    {
++        return new NewClassWithProperties
++        {
++            Title = "Gen2",
++            Price = 19.99m,
++            IsActive = true,
++        };
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj
+new file mode 100644
+index 00000000000..4ebca83c87a
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <RootNamespace>System.Runtime.Loader.Tests</RootNamespace>
++    <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <TestRuntime>true</TestRuntime>
++    <DeltaScript>deltascript.json</DeltaScript>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="ReflectionAddNewTypeWithProperties.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json
+new file mode 100644
+index 00000000000..d652e9b86d8
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json
+@@ -0,0 +1,12 @@
++{
++  "changes": [
++    {
++      "document": "ReflectionAddNewTypeWithProperties.cs",
++      "update": "ReflectionAddNewTypeWithProperties_v1.cs"
++    },
++    {
++      "document": "ReflectionAddNewTypeWithProperties.cs",
++      "update": "ReflectionAddNewTypeWithProperties_v2.cs"
++    }
++  ]
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs
+new file mode 100644
+index 00000000000..f58772c763f
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties.cs
+@@ -0,0 +1,10 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs
+new file mode 100644
+index 00000000000..c7608580fa0
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v1.cs
+@@ -0,0 +1,31 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// New type added in generation 1 with auto-properties.
++/// This produces PROPERTYMAP, PROPERTY, and FIELD ENCLOG entries.
++/// </summary>
++public class NewClassWithProperties
++{
++    public string Title { get; set; } = "Default";
++    public decimal Price { get; set; }
++    public bool IsActive { get; set; }
++
++    public static NewClassWithProperties Create()
++    {
++        return new NewClassWithProperties
++        {
++            Title = "Gen1",
++            Price = 9.99m,
++            IsActive = true,
++        };
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs
+new file mode 100644
+index 00000000000..261faf78c00
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/ReflectionAddNewTypeWithProperties_v2.cs
+@@ -0,0 +1,35 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// Generation 2: Same type as v1, but with a new method added.
++/// This re-emits PROPERTYMAP, PROPERTY, FIELD, and METHODSEMANTICS entries
++/// where is_addition will be false (tokens already exist from gen 1).
++/// This is the exact scenario that triggers the hot_reload crash.
++/// </summary>
++public class NewClassWithProperties
++{
++    public string Title { get; set; } = "Updated";
++    public decimal Price { get; set; }
++    public bool IsActive { get; set; }
++
++    public string GetSummary() => $"{Title}: {Price:C}";
++
++    public static NewClassWithProperties Create()
++    {
++        return new NewClassWithProperties
++        {
++            Title = "Gen2",
++            Price = 19.99m,
++            IsActive = true,
++        };
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj
+new file mode 100644
+index 00000000000..4ebca83c87a
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <RootNamespace>System.Runtime.Loader.Tests</RootNamespace>
++    <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <TestRuntime>true</TestRuntime>
++    <DeltaScript>deltascript.json</DeltaScript>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="ReflectionAddNewTypeWithProperties.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json
+new file mode 100644
+index 00000000000..d652e9b86d8
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties/deltascript.json
+@@ -0,0 +1,12 @@
++{
++  "changes": [
++    {
++      "document": "ReflectionAddNewTypeWithProperties.cs",
++      "update": "ReflectionAddNewTypeWithProperties_v1.cs"
++    },
++    {
++      "document": "ReflectionAddNewTypeWithProperties.cs",
++      "update": "ReflectionAddNewTypeWithProperties_v2.cs"
++    }
++  ]
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+index c8576441586..8506c146367 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+@@ -924,6 +924,61 @@ public static void TestReflectionAddNewType()
+             });
+         }
+ 
++        [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
++        public static void TestReflectionAddNewTypeWithProperties()
++        {
++            // Regression test: adding a new type with auto-properties across two generations.
++            // Generation 1 adds the type with PROPERTYMAP/PROPERTY/FIELD entries.
++            // Generation 2 modifies the same type, re-emitting the same tokens with is_addition=false.
++            // Before the fix, this crashed in apply_enclog_pass2 with assertion failures on
++            // PROPERTYMAP, Field, and later prop==NULL in hot_reload_get_property.
++            ApplyUpdateUtil.TestCase(static () =>
++            {
++                const string ns = "System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties";
++                var assm = typeof(System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.ExistingClass).Assembly;
++
++                // Baseline: only ExistingClass
++                var existingTy = assm.GetType($"{ns}.ExistingClass");
++                Assert.NotNull(existingTy);
++                Assert.Null(assm.GetType($"{ns}.NewClassWithProperties"));
++
++                // Generation 1: adds NewClassWithProperties with properties
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                var newTy = assm.GetType($"{ns}.NewClassWithProperties");
++                Assert.NotNull(newTy);
++
++                // Verify properties exist
++                var titleProp = newTy.GetProperty("Title");
++                Assert.NotNull(titleProp);
++                Assert.NotNull(titleProp.GetGetMethod());
++                Assert.NotNull(titleProp.GetSetMethod());
++
++                var priceProp = newTy.GetProperty("Price");
++                Assert.NotNull(priceProp);
++
++                var isActiveProp = newTy.GetProperty("IsActive");
++                Assert.NotNull(isActiveProp);
++
++                // Create instance and verify
++                var obj = Activator.CreateInstance(newTy);
++                Assert.Equal("Default", titleProp.GetValue(obj));
++
++                // Generation 2: modifies the same type (adds a method, changes default)
++                // This re-emits PROPERTYMAP/PROPERTY/FIELD tokens with is_addition=false.
++                // Before the fix, this would crash.
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                // Verify properties still work after gen 2
++                var obj2 = Activator.CreateInstance(newTy);
++                Assert.Equal("Updated", titleProp.GetValue(obj2));
++
++                // Verify the new method from gen 2
++                var getSummary = newTy.GetMethod("GetSummary");
++                Assert.NotNull(getSummary);
++            });
++        }
++
+         [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
+         public static void TestReflectionAddNewMethod()
+         {
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index c557f7e3b4a..891545bf721 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -78,6 +78,7 @@
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddStaticLambda\System.Reflection.Metadata.ApplyUpdate.Test.AddStaticLambda.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.StaticLambdaRegression\System.Reflection.Metadata.ApplyUpdate.Test.StaticLambdaRegression.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewType\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewType.csproj" />
++    <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewTypeWithProperties.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewMethod\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionAddNewMethod.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionDeleteMember\System.Reflection.Metadata.ApplyUpdate.Test.ReflectionDeleteMember.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.GenericAddStaticField\System.Reflection.Metadata.ApplyUpdate.Test.GenericAddStaticField.csproj" />
 diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
 index e5614bb0788..ff2ea665159 100644
 --- a/src/mono/mono/component/hot_reload.c
