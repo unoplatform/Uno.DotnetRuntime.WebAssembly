@@ -3,7 +3,7 @@
 	<!-- Property overrides -->
 	<PropertyGroup>
 		<_UnoNetCoreAppRuntimeBasePath>$(MSBuildThisFileDirectory)../data/singlethread/</_UnoNetCoreAppRuntimeBasePath>
-		<_UnoNetCoreAppRuntimeTaskPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)..\tasks\net9.0\</_UnoNetCoreAppRuntimeTaskPath>
+		<_UnoNetCoreAppRuntimeTaskPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)..\tasks\net10.0\</_UnoNetCoreAppRuntimeTaskPath>
 		<_UnoNetCoreAppRuntimeTaskPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_UnoNetCoreAppRuntimeBasePath)..\tasks\net472\</_UnoNetCoreAppRuntimeTaskPath>
 
 		<WasmAppBuilderTasksAssemblyPath>$(_UnoNetCoreAppRuntimeTaskPath)WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
@@ -16,9 +16,9 @@
 	<PropertyGroup>
 		<MicrosoftNetCoreAppRuntimePackDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackDir>
 		<MicrosoftNetCoreAppRuntimePackRidDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\</MicrosoftNetCoreAppRuntimePackRidDir>
-		<MicrosoftNetCoreAppRuntimePackRidLibTfmDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\lib\net9.0\</MicrosoftNetCoreAppRuntimePackRidLibTfmDir>
+		<MicrosoftNetCoreAppRuntimePackRidLibTfmDir>$(_UnoNetCoreAppRuntimeBasePath)runtimes\browser-wasm\lib\net10.0\</MicrosoftNetCoreAppRuntimePackRidLibTfmDir>
 
-		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)tasks\net9.0\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
+		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' == 'Core'">$(_UnoNetCoreAppRuntimeBasePath)tasks\net10.0\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
 		<WasmAppBuilderTasksAssemblyPath Condition="'$(MSBuildRuntimeType)' != 'Core'">$(_UnoNetCoreAppRuntimeBasePath)tasks\net472\WasmAppBuilder.dll</WasmAppBuilderTasksAssemblyPath>
 	</PropertyGroup>
 
