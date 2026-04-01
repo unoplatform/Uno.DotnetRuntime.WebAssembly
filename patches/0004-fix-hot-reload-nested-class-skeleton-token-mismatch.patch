@@ -1,0 +1,231 @@
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass.cs
+new file mode 100644
+index 00000000000..ea6feabae0d
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass.cs
+@@ -0,0 +1,14 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeWithNestedClass
++    {
++        public string TestMethod()
++        {
++            return "baseline";
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v1.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v1.cs
+new file mode 100644
+index 00000000000..ec0c09ddaea
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v1.cs
+@@ -0,0 +1,39 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeWithNestedClass
++    {
++        public string TestMethod()
++        {
++            var container = new NewContainer();
++            return container.GetValue();
++        }
++    }
++
++    public class NewContainer
++    {
++        public int Id { get; set; } = 42;
++        public string Name { get; set; } = "Container";
++
++        public string GetValue()
++        {
++            var inner = new InnerHelper();
++            var detail = new InnerDetail();
++            return Name + ":" + inner.Compute(Id) + ":" + detail.Tag;
++        }
++
++        public class InnerHelper
++        {
++            public int Factor { get; set; } = 10;
++            public string Compute(int value) => (value * Factor).ToString();
++        }
++
++        public class InnerDetail
++        {
++            public string Tag { get; set; } = "detail-v1";
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v2.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v2.cs
+new file mode 100644
+index 00000000000..e1c8b2561bb
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/AddNewTypeWithNestedClass_v2.cs
+@@ -0,0 +1,39 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeWithNestedClass
++    {
++        public string TestMethod()
++        {
++            var container = new NewContainer();
++            return container.GetValue();
++        }
++    }
++
++    public class NewContainer
++    {
++        public int Id { get; set; } = 99;
++        public string Name { get; set; } = "Updated";
++
++        public string GetValue()
++        {
++            var inner = new InnerHelper();
++            var detail = new InnerDetail();
++            return Name + ":" + inner.Compute(Id) + ":" + detail.Tag;
++        }
++
++        public class InnerHelper
++        {
++            public int Factor { get; set; } = 5;
++            public string Compute(int value) => (value * Factor).ToString();
++        }
++
++        public class InnerDetail
++        {
++            public string Tag { get; set; } = "detail-v2";
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass.csproj b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass.csproj
+new file mode 100644
+index 00000000000..59147d67cda
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <RootNamespace>System.Runtime.Loader.Tests</RootNamespace>
++    <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <TestRuntime>true</TestRuntime>
++    <DeltaScript>deltascript.json</DeltaScript>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="AddNewTypeWithNestedClass.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/deltascript.json b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/deltascript.json
+new file mode 100644
+index 00000000000..7505941ec8c
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass/deltascript.json
+@@ -0,0 +1,6 @@
++{
++    "changes": [
++        {"document": "AddNewTypeWithNestedClass.cs", "update": "AddNewTypeWithNestedClass_v1.cs"},
++        {"document": "AddNewTypeWithNestedClass.cs", "update": "AddNewTypeWithNestedClass_v2.cs"}
++    ]
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+index f7f451c54ca..4f43181b200 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+@@ -1014,6 +1014,40 @@ public static void TestAddNewTypeModifyField()
+             });
+         }
+ 
++        [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
++        public static void TestAddNewTypeWithNestedClass()
++        {
++            // Regression test: adding a brand-new enclosing type WITH nested classes
++            // in a single delta.  Before the fix, pass2_context_is_skeleton compared
++            // bare NestedClass RIDs against full tokens stored in skeletons — the
++            // comparison always failed, causing premature class creation for skeleton
++            // types and crashing in mono_metadata_decode_row_raw.
++            ApplyUpdateUtil.TestCase(static () =>
++            {
++                var assm = typeof(System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass).Assembly;
++
++                var x = new System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass();
++                Assert.Equal("baseline", x.TestMethod());
++
++                // Gen 1: adds NewContainer with two nested classes (InnerHelper, InnerDetail)
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                var result = x.TestMethod();
++                Assert.Equal("Container:420:detail-v1", result);
++
++                var containerTy = assm.GetType("System.Reflection.Metadata.ApplyUpdate.Test.NewContainer");
++                Assert.NotNull(containerTy);
++                Assert.NotNull(containerTy.GetNestedType("InnerHelper"));
++                Assert.NotNull(containerTy.GetNestedType("InnerDetail"));
++
++                // Gen 2: modifies the same types (is_addition=false for these tokens)
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                result = x.TestMethod();
++                Assert.Equal("Updated:495:detail-v2", result);
++            });
++        }
++
+         [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
+         public static void TestReflectionAddNewMethod()
+         {
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index 5d04d7bc2f5..ade1c22e7f7 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -86,6 +86,7 @@
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.NewMethodThrows\System.Reflection.Metadata.ApplyUpdate.Test.NewMethodThrows.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj" />
++    <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass.csproj" />
+   </ItemGroup>
+   <ItemGroup Condition="'$(TargetOS)' == 'browser'">
+     <WasmFilesToIncludeFromPublishDir Include="$(AssemblyName).dll" />
+diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
+index 8a24d0ebfee..0aeb929301d 100644
+--- a/src/mono/mono/component/hot_reload.c
++++ b/src/mono/mono/component/hot_reload.c
+@@ -1795,8 +1795,10 @@ add_nested_class_to_worklist (Pass2Context *ctx, MonoImage *image_base, uint32_t
+ {
+ 	uint32_t cols[MONO_TABLE_NESTEDCLASS];
+ 	mono_metadata_decode_row (&image_base->tables[MONO_TABLE_NESTEDCLASS], mono_metadata_token_index (log_token) - 1, cols, MONO_NESTED_CLASS_SIZE);
+-	/* if the enclosing clas hasn't been created yet, don't do anything.  mono_class_setup_nested_types() will pick up the new row */
+-	if (pass2_context_is_skeleton (ctx, cols[MONO_NESTED_CLASS_ENCLOSING]))
++	/* if the enclosing class hasn't been created yet, don't do anything.  mono_class_setup_nested_types() will pick up the new row.
++	 * Note: NestedClass columns are bare TypeDef RIDs — convert to full token for skeleton comparison. */
++	uint32_t enclosing_token = mono_metadata_make_token (MONO_TABLE_TYPEDEF, cols[MONO_NESTED_CLASS_ENCLOSING]);
++	if (pass2_context_is_skeleton (ctx, enclosing_token))
+ 		return;
+ 	mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: adding nested class row 0x%08x (enclosing: 0x%08x, nested: 0x%08x) to worklist", log_token, cols[MONO_NESTED_CLASS_ENCLOSING], cols[MONO_NESTED_CLASS_NESTED]);
+ 
+@@ -1821,12 +1823,14 @@ pass2_update_nested_classes (Pass2Context *ctx, MonoImage *image_base, MonoError
+ 
+ 		uint32_t cols[MONO_TABLE_NESTEDCLASS];
+ 		mono_metadata_decode_row (&image_base->tables[MONO_TABLE_NESTEDCLASS], mono_metadata_token_index (log_token) - 1, cols, MONO_NESTED_CLASS_SIZE);
+-		/* if the enclosing clas hasn't been created yet, don't do anything.  mono_class_setup_nested_types() will pick up the new row */
++		/* if the enclosing class hasn't been created yet, don't do anything.  mono_class_setup_nested_types() will pick up the new row.
++		 * Note: NestedClass columns are bare TypeDef RIDs — convert to full token for skeleton comparison. */
+ 		uint32_t enclosing_typedef_row = cols[MONO_NESTED_CLASS_ENCLOSING];
+-		if (pass2_context_is_skeleton (ctx, enclosing_typedef_row))
++		uint32_t enclosing_token = mono_metadata_make_token (MONO_TABLE_TYPEDEF, enclosing_typedef_row);
++		if (pass2_context_is_skeleton (ctx, enclosing_token))
+ 			continue;
+ 
+-		MonoClass *enclosing_klass = mono_class_get_checked (image_base, mono_metadata_make_token (MONO_TABLE_TYPEDEF, enclosing_typedef_row), error);
++		MonoClass *enclosing_klass = mono_class_get_checked (image_base, enclosing_token, error);
+ 		return_val_if_nok (error, FALSE);
+ 		g_assert (enclosing_klass);
+ 		/* enclosing class is set up, but noone asked for its nested classes yet.  Nothing to do here. */
