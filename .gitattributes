@@ -1,0 +1,2 @@
+# Patch files must keep LF line endings to avoid "corrupt patch" errors on Windows
+*.patch text eol=lf
