@@ -1,0 +1,215 @@
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField.cs
+new file mode 100644
+index 00000000000..0366b29b57e
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField.cs
+@@ -0,0 +1,14 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeModifyField
++    {
++        public string TestMethod()
++        {
++            return "baseline";
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v1.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v1.cs
+new file mode 100644
+index 00000000000..ddc5abe7855
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v1.cs
+@@ -0,0 +1,36 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeModifyField
++    {
++        public string TestMethod()
++        {
++            var s = new Settings();
++            return s.GetDescription();
++        }
++    }
++
++    /// <summary>
++    /// Generation 1: adds a new type with auto-properties (which produce
++    /// backing fields) and an explicit field.  These create Field entries
++    /// with a preceding ENC_FUNC_ADD_FIELD in the ENCLOG.
++    /// </summary>
++    public class Settings
++    {
++        public string Theme { get; set; } = "Light";
++        public int FontSize { get; set; } = 14;
++        public bool ShowLineNumbers { get; set; } = true;
++
++        // explicit field
++        internal string _cachedDescription;
++
++        public string GetDescription()
++        {
++            _cachedDescription = Theme + ":" + FontSize;
++            return _cachedDescription;
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v2.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v2.cs
+new file mode 100644
+index 00000000000..f17d98710b4
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/AddNewTypeModifyField_v2.cs
+@@ -0,0 +1,37 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test
++{
++    public class AddNewTypeModifyField
++    {
++        public string TestMethod()
++        {
++            var s = new Settings();
++            return s.GetDescription();
++        }
++    }
++
++    /// <summary>
++    /// Generation 2: modifies the method body and property defaults of the
++    /// same type added in gen 1.  The ENCLOG re-emits Field tokens for the
++    /// existing backing fields WITHOUT a preceding ENC_FUNC_ADD_FIELD entry
++    /// — the add_member_typedef context variable is zero.
++    /// Before the fix, g_assert(add_member_typedef) crashed here.
++    /// </summary>
++    public class Settings
++    {
++        public string Theme { get; set; } = "Dark";
++        public int FontSize { get; set; } = 16;
++        public bool ShowLineNumbers { get; set; } = false;
++
++        internal string _cachedDescription;
++
++        public string GetDescription()
++        {
++            _cachedDescription = Theme + ":" + FontSize + ":" + (ShowLineNumbers ? "ln" : "no-ln");
++            return _cachedDescription;
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj
+new file mode 100644
+index 00000000000..fb455276ee5
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <RootNamespace>System.Runtime.Loader.Tests</RootNamespace>
++    <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <TestRuntime>true</TestRuntime>
++    <DeltaScript>deltascript.json</DeltaScript>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="AddNewTypeModifyField.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/deltascript.json b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/deltascript.json
+new file mode 100644
+index 00000000000..905ee84bedb
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField/deltascript.json
+@@ -0,0 +1,6 @@
++{
++    "changes": [
++        {"document": "AddNewTypeModifyField.cs", "update": "AddNewTypeModifyField_v1.cs"},
++        {"document": "AddNewTypeModifyField.cs", "update": "AddNewTypeModifyField_v2.cs"}
++    ]
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+index 8506c146367..f7f451c54ca 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+@@ -979,6 +979,41 @@ public static void TestReflectionAddNewTypeWithProperties()
+             });
+         }
+ 
++        [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
++        public static void TestAddNewTypeModifyField()
++        {
++            // Regression test: adding a new type with auto-properties (backing fields)
++            // in gen 1, then modifying the type in gen 2.  Gen 2's ENCLOG re-emits
++            // Field entries without a preceding ENC_FUNC_ADD_FIELD, so add_member_typedef
++            // is zero.  Before the fix, g_assert(add_member_typedef) crashed here.
++            ApplyUpdateUtil.TestCase(static () =>
++            {
++                var assm = typeof(System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField).Assembly;
++
++                var x = new System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField();
++                Assert.Equal("baseline", x.TestMethod());
++
++                // Gen 1: adds Settings with auto-properties and explicit field
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                var result = x.TestMethod();
++                Assert.Equal("Light:14", result);
++
++                // Verify the type was created with properties
++                var settingsTy = assm.GetType("System.Reflection.Metadata.ApplyUpdate.Test.Settings");
++                Assert.NotNull(settingsTy);
++                Assert.NotNull(settingsTy.GetProperty("Theme"));
++                Assert.NotNull(settingsTy.GetProperty("FontSize"));
++
++                // Gen 2: modifies method body + defaults — re-emits Field tokens
++                // without add_member_typedef.  This is the crash point before fix 4.
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                result = x.TestMethod();
++                Assert.Equal("Dark:16:no-ln", result);
++            });
++        }
++
+         [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
+         public static void TestReflectionAddNewMethod()
+         {
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index 891545bf721..5d04d7bc2f5 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -85,6 +85,7 @@
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.GenericAddInstanceField\System.Reflection.Metadata.ApplyUpdate.Test.GenericAddInstanceField.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.NewMethodThrows\System.Reflection.Metadata.ApplyUpdate.Test.NewMethodThrows.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize.csproj" />
++    <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj" />
+   </ItemGroup>
+   <ItemGroup Condition="'$(TargetOS)' == 'browser'">
+     <WasmFilesToIncludeFromPublishDir Include="$(AssemblyName).dll" />
+diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
+index ff2ea665159..8a24d0ebfee 100644
+--- a/src/mono/mono/component/hot_reload.c
++++ b/src/mono/mono/component/hot_reload.c
+@@ -2041,11 +2041,13 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 			break;
+ 		}
+ 		case MONO_TABLE_FIELD: {
+-			/* is_addition can be false when the field token index falls within
+-			 * prev_gen_rows (e.g. adding properties to an existing type where
+-			 * the backing field reuses a token slot). The real guard is
+-			 * add_member_typedef which is set by the preceding ENC_FUNC_ADD_FIELD entry. */
+-			g_assert (add_member_typedef);
++			/* add_member_typedef is set by the preceding ENC_FUNC_ADD_FIELD entry.
++			 * When zero, the field is being re-processed in a later generation
++			 * without a new add-field signal — skip registration. */
++			if (!add_member_typedef) {
++				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "EnC: field token=0x%08x without add_member_typedef, skipping", log_token);
++				break;
++			}
+ 			if (pass2_context_is_skeleton (ctx, add_member_typedef)) {
+ 				mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_METADATA_UPDATE, "Adding new field 0x%08x to new class 0x%08x", log_token, add_member_typedef);
+ 				pass2_context_add_skeleton_member (ctx, add_member_typedef, log_token);
