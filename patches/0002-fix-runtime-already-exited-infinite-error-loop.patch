@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Studio Live <noreply@platform.uno>
+Date: Mon, 31 Mar 2026 00:00:00 +0000
+Subject: [PATCH] fix: prevent infinite "runtime already exited" error loop
+
+When the .NET WASM runtime exits, browser events (pointer, keyboard, etc.)
+continue to fire and call into the interop layer. Each call hits
+assert_runtime_running(), which throws via mono_assert -> nativeAbort.
+The thrown error propagates as an unhandled error, caught by fatal_handler,
+which calls mono_exit(1, reason) again, creating an infinite loop of
+cascading errors that flood the console.
+
+Replace the mono_assert call with a manual check that throws an error
+marked with silent=true. The fatal_handler already checks reason.silent
+before calling mono_exit, so this breaks the loop while still throwing
+to stop execution of the caller.
+
+---
+ src/mono/browser/runtime/loader/exit.ts | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/mono/browser/runtime/loader/exit.ts b/src/mono/browser/runtime/loader/exit.ts
+index 24bb821dd2f..20c3d4bb90c 100644
+--- a/src/mono/browser/runtime/loader/exit.ts
++++ b/src/mono/browser/runtime/loader/exit.ts
+@@ -15,7 +15,15 @@ export function is_runtime_running () {
+ }
+
+ export function assert_runtime_running () {
+-    mono_assert(!is_exited(), () => `.NET runtime already exited with ${loaderHelpers.exitCode} ${loaderHelpers.exitReason}. You can use runtime.runMain() which doesn't exit the runtime.`);
++    if (is_exited()) {
++        const message = `.NET runtime already exited with ${loaderHelpers.exitCode} ${loaderHelpers.exitReason}. You can use runtime.runMain() which doesn't exit the runtime.`;
++        const error = new Error("Assert failed: " + message);
++        // Mark as silent so that the unhandled error handler (fatal_handler)
++        // does not call mono_exit again, which would cause an infinite loop
++        // of "runtime already exited" errors from ongoing browser events.
++        (error as any).silent = true;
++        throw error;
++    }
+     if (WasmEnableThreads && ENVIRONMENT_IS_WORKER) {
+         mono_assert(runtimeHelpers.runtimeReady, "The WebWorker is not attached to the runtime. See https://github.com/dotnet/runtime/blob/main/src/mono/wasm/threads.md#JS-interop-on-dedicated-threads");
+     } else {
+--
+2.43.0
+
