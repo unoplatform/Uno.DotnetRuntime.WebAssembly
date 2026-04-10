@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Studio Live <noreply@platform.uno>
+Date: Wed, 09 Apr 2026 00:00:00 +0000
+Subject: [PATCH] fix: handle NULL method in LMF during WASM exception
+ unwinding
+
+During hot reload or ALC (AssemblyLoadContext) unloading, LMF (Last
+Managed Frame) entries can have a NULL method pointer — the method may
+have been invalidated by a metadata delta or collected when the ALC was
+unloaded.  The existing code crashes with g_assert((*lmf)->method) in
+mono_arch_unwind_frame (exceptions-wasm.c:66).
+
+WASM is the only architecture that hard-asserts on the method field.
+x86 handles this gracefully:
+  if (!(*lmf)->method) return FALSE;
+AMD64 and ARM64 do not depend on the method field at all.
+
+Follow the x86 pattern: when an LMF entry has a NULL method, advance
+the LMF chain past the bad entry and return FALSE to stop unwinding
+gracefully.  This prevents a hard runtime abort while allowing the
+runtime to continue operating.
+
+Fixes: unoplatform/studio.live#1406
+---
+ src/mono/mono/mini/exceptions-wasm.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/mono/mono/mini/exceptions-wasm.c b/src/mono/mono/mini/exceptions-wasm.c
+index 4bf30f05162..dc3853e7c3f 100644
+--- a/src/mono/mono/mini/exceptions-wasm.c
++++ b/src/mono/mono/mini/exceptions-wasm.c
+@@ -62,8 +62,13 @@ mono_arch_unwind_frame (MonoJitTlsData *jit_tls,
+ 		if (*lmf == jit_tls->first_lmf)
+ 			return FALSE;
+
+-		/* This will compute the original method address */
+-		g_assert ((*lmf)->method);
++		/* LMF entry with NULL method can occur during hot reload
++		 * (method invalidated) or ALC unloading (assembly collected).
++		 * Skip the bad entry and stop unwinding, matching x86 behavior. */
++		if (!(*lmf)->method) {
++			*lmf = (MonoLMF *)(((guint64)(*lmf)->previous_lmf) & ~3);
++			return FALSE;
++		}
+ 		gpointer addr = mono_compile_method_checked ((*lmf)->method, error);
+ 		mono_error_assert_ok (error);
+
+--
+2.43.0
+
