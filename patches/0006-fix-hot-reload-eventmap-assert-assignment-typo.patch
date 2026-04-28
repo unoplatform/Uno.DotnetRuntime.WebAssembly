@@ -1,0 +1,212 @@
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents.cs
+new file mode 100644
+index 00000000000..78d9e7fcfdb
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents.cs
+@@ -0,0 +1,10 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v1.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v1.cs
+new file mode 100644
+index 00000000000..39329728876
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v1.cs
+@@ -0,0 +1,24 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// New type added in generation 1 with events.
++/// This produces EVENTMAP, EVENT, METHODSEMANTICS, and FIELD ENCLOG entries
++/// via the ENC_FUNC_ADD_EVENT code path.
++/// </summary>
++public class NewClassWithEvents
++{
++    public event EventHandler<string> NameChanged;
++    public event EventHandler Closed;
++
++    public void OnNameChanged(string name) => NameChanged?.Invoke(this, name);
++    public void OnClosed() => Closed?.Invoke(this, EventArgs.Empty);
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v2.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v2.cs
+new file mode 100644
+index 00000000000..e0a430fa3c8
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/AddNewTypeWithEvents_v2.cs
+@@ -0,0 +1,27 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++using System;
++
++namespace System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents;
++
++public class ExistingClass
++{
++    public static void ExistingMethod () {}
++}
++
++/// <summary>
++/// Generation 2: Same type as v1, but with a new method added.
++/// This re-emits EVENTMAP, EVENT, METHODSEMANTICS, and FIELD entries
++/// where the ENC_FUNC_ADD_EVENT handler assertion previously corrupted
++/// token_table with assignment (=) instead of comparison (==).
++/// </summary>
++public class NewClassWithEvents
++{
++    public event EventHandler<string> NameChanged;
++    public event EventHandler Closed;
++
++    public void OnNameChanged(string name) => NameChanged?.Invoke(this, name);
++    public void OnClosed() => Closed?.Invoke(this, EventArgs.Empty);
++
++    public string GetStatus() => "active";
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents.csproj b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents.csproj
+new file mode 100644
+index 00000000000..0aa78acf6f1
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <RootNamespace>System.Runtime.Loader.Tests</RootNamespace>
++    <TargetFramework>$(NetCoreAppCurrent)</TargetFramework>
++    <TestRuntime>true</TestRuntime>
++    <DeltaScript>deltascript.json</DeltaScript>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="AddNewTypeWithEvents.cs" />
++  </ItemGroup>
++</Project>
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/deltascript.json b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/deltascript.json
+new file mode 100644
+index 00000000000..56c90273c68
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdate/System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents/deltascript.json
+@@ -0,0 +1,12 @@
++{
++  "changes": [
++    {
++      "document": "AddNewTypeWithEvents.cs",
++      "update": "AddNewTypeWithEvents_v1.cs"
++    },
++    {
++      "document": "AddNewTypeWithEvents.cs",
++      "update": "AddNewTypeWithEvents_v2.cs"
++    }
++  ]
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+index 4f43181b200..866d3556e8b 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ApplyUpdateTest.cs
+@@ -979,6 +979,68 @@ public static void TestReflectionAddNewTypeWithProperties()
+             });
+         }
+ 
++        [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
++        public static void TestAddNewTypeWithEvents()
++        {
++            // Regression test: the ENC_FUNC_ADD_EVENT handler used assignment (=) instead
++            // of comparison (==) in its g_assert, silently corrupting token_table to
++            // MONO_TABLE_EVENTMAP.  This caused the subsequent switch(token_table) to
++            // route to the wrong case, leading to out-of-bounds row access and a crash.
++            // Generation 1 adds a type with events (exercising ENC_FUNC_ADD_EVENT).
++            // Generation 2 modifies the same type, re-emitting event tokens.
++            ApplyUpdateUtil.TestCase(static () =>
++            {
++                const string ns = "System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents";
++                var assm = typeof(System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents.ExistingClass).Assembly;
++
++                // Baseline: only ExistingClass
++                var existingTy = assm.GetType($"{ns}.ExistingClass");
++                Assert.NotNull(existingTy);
++                Assert.Null(assm.GetType($"{ns}.NewClassWithEvents"));
++
++                // Generation 1: adds NewClassWithEvents with events
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                var newTy = assm.GetType($"{ns}.NewClassWithEvents");
++                Assert.NotNull(newTy);
++
++                // Verify events exist
++                var nameChangedEvt = newTy.GetEvent("NameChanged");
++                Assert.NotNull(nameChangedEvt);
++                Assert.NotNull(nameChangedEvt.GetAddMethod());
++                Assert.NotNull(nameChangedEvt.GetRemoveMethod());
++
++                var closedEvt = newTy.GetEvent("Closed");
++                Assert.NotNull(closedEvt);
++                Assert.NotNull(closedEvt.GetAddMethod());
++                Assert.NotNull(closedEvt.GetRemoveMethod());
++
++                // Subscribe and fire to verify events work
++                var obj = Activator.CreateInstance(newTy);
++                string received = null;
++                nameChangedEvt.AddEventHandler(obj, new EventHandler<string>((s, e) => received = e));
++                newTy.GetMethod("OnNameChanged").Invoke(obj, new object[] { "test" });
++                Assert.Equal("test", received);
++
++                // Generation 2: modifies the same type (adds a method)
++                // This re-emits EVENTMAP/EVENT tokens — before the fix, the corrupted
++                // token_table caused a runtime crash here.
++                ApplyUpdateUtil.ApplyUpdate(assm);
++
++                // Verify events still work after gen 2
++                var obj2 = Activator.CreateInstance(newTy);
++                string received2 = null;
++                nameChangedEvt.AddEventHandler(obj2, new EventHandler<string>((s, e) => received2 = e));
++                newTy.GetMethod("OnNameChanged").Invoke(obj2, new object[] { "after-update" });
++                Assert.Equal("after-update", received2);
++
++                // Verify the new method from gen 2
++                var getStatus = newTy.GetMethod("GetStatus");
++                Assert.NotNull(getStatus);
++                Assert.Equal("active", getStatus.Invoke(obj2, null));
++            });
++        }
++
+         [ConditionalFact(typeof(ApplyUpdateUtil), nameof(ApplyUpdateUtil.IsSupported))]
+         public static void TestAddNewTypeModifyField()
+         {
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index ade1c22e7f7..fba550cf17d 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -87,6 +87,7 @@
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize\System.Reflection.Metadata.ApplyUpdate.Test.IncreaseMetadataRowSize.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeModifyField.csproj" />
+     <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithNestedClass.csproj" />
++    <ProjectReference Include="ApplyUpdate\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents\System.Reflection.Metadata.ApplyUpdate.Test.AddNewTypeWithEvents.csproj" />
+   </ItemGroup>
+   <ItemGroup Condition="'$(TargetOS)' == 'browser'">
+     <WasmFilesToIncludeFromPublishDir Include="$(AssemblyName).dll" />
+diff --git a/src/mono/mono/component/hot_reload.c b/src/mono/mono/component/hot_reload.c
+index 0aeb929301d..c68fad462a1 100644
+--- a/src/mono/mono/component/hot_reload.c
++++ b/src/mono/mono/component/hot_reload.c
+@@ -1947,7 +1947,7 @@ apply_enclog_pass2 (Pass2Context *ctx, MonoImage *image_base, BaselineInfo *base
+ 		}
+ 
+ 		case ENC_FUNC_ADD_EVENT: {
+-			g_assert (token_table = MONO_TABLE_EVENTMAP);
++			g_assert (token_table == MONO_TABLE_EVENTMAP);
+ 			add_event_eventmap = log_token;
+ 			break;
+ 		}
