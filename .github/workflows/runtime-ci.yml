@@ -382,7 +382,13 @@ jobs:
         path: ci-artifacts
 
   package_job:
-    needs: [build_linux_job]
+    # AOT cross jobs must produce their nupkgs before this job runs, because
+    # the main override pack now has direct PackageReference dependencies on
+    # them (Uno.NETCore.App.Runtime.AOT.<host>.Cross.browser-wasm). NuGet
+    # restore inside `dotnet pack` would otherwise hit nuget.org and fail
+    # with NU1101/NU1103 since these aren't published yet for the current
+    # SemVer2.
+    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job]
     runs-on: ubuntu-latest
 
     steps:
@@ -413,7 +419,25 @@ jobs:
           path: nuget
           merge-multiple: true
 
+    # Pull every AOT cross pack (.nupkg) into a single local folder that
+    # serves as the restore source for the main pack below. Each AOT job
+    # uploads a "nuget-aot-*" artifact containing a Uno.NETCore.App.Runtime.AOT.<rid>.Cross.browser-wasm.<SemVer2>.nupkg.
+    - name: Download AOT cross packs
+      uses: actions/download-artifact@v4
+      with:
+          pattern: nuget-aot-*
+          path: aot-packs
+          merge-multiple: true
+
     - name: Create NuGet SDK Packages
+      # Two version pieces wire together here:
+      #   1. -p:UnoCrossPackVersion=<SemVer2> forces the PackageReference Version
+      #      constraint on the cross packs to match what the AOT jobs just
+      #      published. Without this, NBGV's late-bound $(Version) leaves restore
+      #      asking for ">=1.0.0" and resolution falls through to nuget.org.
+      #   2. -p:RestoreAdditionalProjectSources points the restore at the
+      #      just-downloaded local nupkgs so the cross packs can actually be
+      #      resolved (they don't exist on nuget.org until publish_dev runs).
       run: |
         cd nuget
 
@@ -423,7 +447,10 @@ jobs:
         # Unzip all packages in separate folders
         find . -name '*.zip' -exec sh -c 'unzip -d "${1%.*}" "$1"' _ {} \;
 
-        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output
+        dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj \
+          /p:OutputPath=$GITHUB_WORKSPACE/ci-output \
+          /p:UnoCrossPackVersion=${{ steps.nbgv.outputs.SemVer2 }} \
+          /p:RestoreAdditionalProjectSources=$GITHUB_WORKSPACE/aot-packs
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
