@@ -177,6 +177,94 @@ jobs:
         path: ci-output
 
   ##
+  ## Build macOS AOT Cross
+  ##
+  build_aot_macos_job:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    # macos-latest is currently macOS 14 on Apple Silicon, so
+    # $(NETCoreSdkPortableRuntimeIdentifier) resolves to osx-arm64 and the
+    # produced pack id is Uno.NETCore.App.Runtime.AOT.osx-arm64.Cross.browser-wasm
+    # — which matches the PackageReference in the main override pack.
+    runs-on: macos-latest
+
+    strategy:
+      matrix:
+       BUILD_CONFIGURATION: [Release]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version:  ${{ env.DOTNETSDK_VERSION }}
+
+    - name: Install dependencies
+      # macos-latest already ships python3, cmake and ninja, but we install
+      # llvm@18 via Homebrew so the dotnet/runtime cross-compile picks up the
+      # same major LLVM version the Linux job uses. Apple Clang in Xcode is
+      # too old/divergent for some Mono LLVM IR emitter paths.
+      run: |
+        set -e
+        brew update
+        brew install ninja llvm@18
+        # Surface llvm@18 binaries (clang, clang++, llvm-config, …) for the
+        # subsequent build step. brew install does not touch PATH on its own.
+        echo "$(brew --prefix llvm@18)/bin" >> $GITHUB_PATH
+
+    - name: Set Variable from current Commit
+      run: |
+        set -e
+        echo "BUILD_CONFIGURATION=${{ matrix.BUILD_CONFIGURATION }}" >> $GITHUB_ENV
+
+    - name: Clone dotnet/runtime
+      run: |
+        git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Build Wasm Runtime
+      # Same target as the Linux job: build only the Mono runtime + cross
+      # compiler for browser-wasm. The build script auto-detects emscripten
+      # via the bundled emsdk submodule under runtime/.
+      run: |
+        set -e
+        cd runtime
+        ./build.sh mono.runtime -arch wasm -os browser -c $BUILD_CONFIGURATION $ADDITIONAL_BUILD_ARGS /p:TestAssemblies=false
+
+    - name: Create NuGet Package
+      run: |
+        set -e
+        mkdir -p $GITHUB_WORKSPACE/nuget/tools
+        mkdir -p $GITHUB_WORKSPACE/ci-output
+
+        # Mark AOT generation binaries executable
+        chmod -R +x $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/*
+
+        # Flat layout mirrors the Linux job — the buildTransitive props
+        # template probes tools/mono-aot-cross first.
+        cp -R $GITHUB_WORKSPACE/runtime/artifacts/bin/mono/browser.wasm.Release/cross/browser-wasm/* $GITHUB_WORKSPACE/nuget/tools
+
+        cd $GITHUB_WORKSPACE/nuget
+        dotnet pack Uno.NETCore.App.Runtime.AOT.Cross.browser-wasm.csproj /p:OutputPath=$GITHUB_WORKSPACE/ci-output
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: nuget-aot-macos
+        path: ci-output
+
+  ##
   ## Build Job
   ##
   build_linux_job:
@@ -352,7 +440,7 @@ jobs:
     permissions:
       id-token: write # Required for requesting the JWT
 
-    needs: [package_job,build_aot_windows_job,build_aot_linux_job]
+    needs: [package_job,build_aot_windows_job,build_aot_linux_job,build_aot_macos_job]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

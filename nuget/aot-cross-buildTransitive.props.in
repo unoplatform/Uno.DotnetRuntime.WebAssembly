@@ -1,0 +1,31 @@
+<!--
+    Auto-imported by NuGet when this AOT-cross pack is restored. Tokens
+    __RID__ and __EXE__ are substituted at pack time by the csproj
+    (_UnoGenerateAotCrossProps target). The generated file is shipped at
+    buildTransitive/uno.netcore.app.runtime.aot.<RID>.cross.browser-wasm.props
+    inside each AOT-cross pack; the file name matches the lowercased
+    PackageId so NuGet's auto-import picks it up.
+
+    Activation rule: contribute $(_UnoMonoAotCrossCompilerPath) only when
+    the consumer's $(NETCoreSdkPortableRuntimeIdentifier) matches this
+    pack's host RID. With all three RID-specific cross packs declared as
+    PackageReference dependencies on the main override pack
+    (Uno.NETCore.App.Runtime.Mono.browser-wasm), every consumer restores
+    all three but only the one matching their host activates.
+
+    Layout probing: the Linux CI job flattens cross/browser-wasm/* into
+    nuget/tools/ before packing, so the binary lands at tools/__EXE__.
+    The Windows CI job moves the whole cross/ directory, so the binary
+    lands at tools/cross/browser-wasm/__EXE__. We probe both. The first
+    that exists wins. Once the CI is normalized to a single layout this
+    can be simplified.
+-->
+<Project>
+  <PropertyGroup Condition=" '$(NETCoreSdkPortableRuntimeIdentifier)' == '__RID__' ">
+    <_UnoMonoAotCrossCompilerCandidateFlat>$([System.IO.Path]::GetFullPath($([System.IO.Path]::Combine('$(MSBuildThisFileDirectory)', '..', 'tools', '__EXE__'))))</_UnoMonoAotCrossCompilerCandidateFlat>
+    <_UnoMonoAotCrossCompilerCandidateNested>$([System.IO.Path]::GetFullPath($([System.IO.Path]::Combine('$(MSBuildThisFileDirectory)', '..', 'tools', 'cross', 'browser-wasm', '__EXE__'))))</_UnoMonoAotCrossCompilerCandidateNested>
+
+    <_UnoMonoAotCrossCompilerPath Condition=" Exists('$(_UnoMonoAotCrossCompilerCandidateFlat)') ">$(_UnoMonoAotCrossCompilerCandidateFlat)</_UnoMonoAotCrossCompilerPath>
+    <_UnoMonoAotCrossCompilerPath Condition=" '$(_UnoMonoAotCrossCompilerPath)' == '' AND Exists('$(_UnoMonoAotCrossCompilerCandidateNested)') ">$(_UnoMonoAotCrossCompilerCandidateNested)</_UnoMonoAotCrossCompilerPath>
+  </PropertyGroup>
+</Project>
