@@ -19,30 +19,33 @@
 	<!--
 		Declare the per-host AOT cross packs as direct dependencies so consumers
 		restore all of them and the matching host's pack's buildTransitive props
-		activates (gated on $(NETCoreSdkPortableRuntimeIdentifier)). $(Version)
-		comes from Nerdbank.GitVersioning so the deps lock-step with the main
-		pack's version, which is how all packs in this repo are built together.
+		activates (gated on $(NETCoreSdkPortableRuntimeIdentifier)).
+
+		Version comes from $(UnoCrossPackVersion). Passing it explicitly from CI
+		(/p:UnoCrossPackVersion=$SemVer2) is necessary because NBGV publishes
+		$(Version) via an MSBuild target that runs AFTER NuGet restore — so a
+		PackageReference Version="$(Version)" would evaluate to the project's
+		default 1.0.0 during restore and fail to resolve.
 
 		PrivateAssets="none" makes the dependency flow transitively to consumers
-		(SL → main pack → cross packs). Without this, NuGet would treat the
-		cross packs as dev-time-only and not restore them in the consumer.
-
-		osx-arm64 is included even though the macOS CI job is not yet wired up;
-		the dep currently points at a not-yet-published pack and will fail
-		restore on macOS hosts until that build is added. On Linux and Windows
-		hosts the resolution still succeeds because NuGet treats the missing
-		osx-arm64 pack as an error only on macOS hosts (it is still listed in
-		the nuspec, so a stricter resolver might warn — track and revisit).
+		(consumer → main pack → cross packs). Without this, NuGet would treat
+		the cross packs as dev-time-only and not restore them in the consumer.
 	-->
+	<PropertyGroup>
+		<!-- Fallback so local `dotnet pack` (without CI passing the property)
+		     still produces a nuspec — the resulting deps just won't resolve
+		     unless a matching cross pack happens to exist at that version. -->
+		<UnoCrossPackVersion Condition=" '$(UnoCrossPackVersion)' == '' ">$(Version)</UnoCrossPackVersion>
+	</PropertyGroup>
 	<ItemGroup>
 		<PackageReference Include="Uno.NETCore.App.Runtime.AOT.linux-x64.Cross.browser-wasm"
-						  Version="$(Version)"
+						  Version="$(UnoCrossPackVersion)"
 						  PrivateAssets="none" />
 		<PackageReference Include="Uno.NETCore.App.Runtime.AOT.win-x64.Cross.browser-wasm"
-						  Version="$(Version)"
+						  Version="$(UnoCrossPackVersion)"
 						  PrivateAssets="none" />
 		<PackageReference Include="Uno.NETCore.App.Runtime.AOT.osx-arm64.Cross.browser-wasm"
-						  Version="$(Version)"
+						  Version="$(UnoCrossPackVersion)"
 						  PrivateAssets="none" />
 	</ItemGroup>
 
