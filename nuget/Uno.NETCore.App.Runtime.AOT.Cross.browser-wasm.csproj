@@ -21,6 +21,46 @@
 		<None Include="tools/**" Pack="true" PackagePath="tools" />
 	</ItemGroup>
 
+	<!--
+		Generate a per-RID buildTransitive props that contributes
+		$(_UnoMonoAotCrossCompilerPath) only when the consumer's host RID matches
+		this pack's RID. The file name is the lowercased package id, which makes
+		NuGet auto-import it on restore. RID + exe extension are baked at pack
+		time from $(NETCoreSdkPortableRuntimeIdentifier), so each built cross
+		pack activates only on its own host platform.
+
+		Source template: aot-cross-buildTransitive.props.in (checked in next to
+		this csproj). Tokens __RID__ and __EXE__ are replaced at pack time via
+		a simple string Replace, avoiding the MSBuild escape gymnastics needed
+		to emit literal $() expressions through WriteLinesToFile.
+	-->
+	<PropertyGroup>
+		<_UnoCrossPackRid>$(NETCoreSdkPortableRuntimeIdentifier)</_UnoCrossPackRid>
+		<_UnoCrossPackExe Condition=" '$(OS)' == 'Windows_NT' ">mono-aot-cross.exe</_UnoCrossPackExe>
+		<_UnoCrossPackExe Condition=" '$(_UnoCrossPackExe)' == '' ">mono-aot-cross</_UnoCrossPackExe>
+		<_UnoCrossPackPropsName>uno.netcore.app.runtime.aot.$(_UnoCrossPackRid).cross.browser-wasm.props</_UnoCrossPackPropsName>
+		<_UnoCrossPackPropsTemplate>$(MSBuildThisFileDirectory)aot-cross-buildTransitive.props.in</_UnoCrossPackPropsTemplate>
+		<_UnoCrossPackPropsOutputPath>$(IntermediateOutputPath)$(_UnoCrossPackPropsName)</_UnoCrossPackPropsOutputPath>
+	</PropertyGroup>
+
+	<Target Name="_UnoGenerateAotCrossProps"
+			BeforeTargets="GenerateNuspec;_GetPackageFiles"
+			Inputs="$(_UnoCrossPackPropsTemplate);$(MSBuildProjectFile)"
+			Outputs="$(_UnoCrossPackPropsOutputPath)">
+
+		<MakeDir Directories="$(IntermediateOutputPath)" />
+
+		<WriteLinesToFile File="$(_UnoCrossPackPropsOutputPath)"
+						  Lines="$([System.IO.File]::ReadAllText('$(_UnoCrossPackPropsTemplate)').Replace('__RID__', '$(_UnoCrossPackRid)').Replace('__EXE__', '$(_UnoCrossPackExe)'))"
+						  Overwrite="true" />
+
+		<ItemGroup>
+			<None Include="$(_UnoCrossPackPropsOutputPath)"
+				  Pack="true"
+				  PackagePath="buildTransitive/$(_UnoCrossPackPropsName)" />
+		</ItemGroup>
+	</Target>
+
 	<Target Name="DownloadAndSetPackageIcon" BeforeTargets="_GetPackageFiles">
 		<PropertyGroup>
 			<IconUrl>https://uno-assets.platform.uno/logos/uno.png</IconUrl>

@@ -29,9 +29,38 @@
 	<ItemGroup>
 		<PackageConflictPreferredPackages Include="Uno.NETCore.App.Runtime.Mono.browser-wasm" />
 
-		<MonoAotCrossCompiler Include="$(_MonoAotCrossCompilerPath)" RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />
-
 		<FrameworkReference Remove="Microsoft.AspNetCore.App" IsImplicitlyDefined="true" />
+	</ItemGroup>
+
+	<!--
+		AOT cross-compiler override.
+
+		The stock .NET WASM SDK populates $(_MonoAotCrossCompilerPath) by
+		filtering the MonoAotCrossCompiler item by $(RuntimeIdentifier)
+		(== "browser-wasm" for a wasm publish). It points at
+		/usr/share/dotnet/packs/Microsoft.NETCore.App.Runtime.AOT.<host>.Cross.browser-wasm/<v>/tools/mono-aot-cross
+		— the unmodified Microsoft cross compiler.
+
+		The Uno cross packs (Uno.NETCore.App.Runtime.AOT.<host-RID>.Cross.browser-wasm)
+		each ship a buildTransitive props that sets
+		$(_UnoMonoAotCrossCompilerPath) when their RID matches the consumer's
+		host. When that property is non-empty, we register OUR cross compiler
+		as the MonoAotCrossCompiler item for RuntimeIdentifier=browser-wasm.
+
+		Fallback: when $(_UnoMonoAotCrossCompilerPath) is empty (no Uno cross
+		pack restored, or none matching the host — e.g. on a host RID we do
+		not yet ship a cross pack for), we register the stock
+		$(_MonoAotCrossCompilerPath) so AOT still works against the
+		unmodified compiler. This preserves the previous behavior for any
+		host RID we do not yet ship a cross pack for.
+	-->
+	<ItemGroup Condition=" '$(_UnoMonoAotCrossCompilerPath)' != '' AND Exists('$(_UnoMonoAotCrossCompilerPath)') ">
+		<MonoAotCrossCompiler Include="$(_UnoMonoAotCrossCompilerPath)"
+							  RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />
+	</ItemGroup>
+	<ItemGroup Condition=" '$(_UnoMonoAotCrossCompilerPath)' == '' OR !Exists('$(_UnoMonoAotCrossCompilerPath)') ">
+		<MonoAotCrossCompiler Include="$(_MonoAotCrossCompilerPath)"
+							  RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />
 	</ItemGroup>
 
 	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)Sdk\MonoTargetsTasks.props"/>
