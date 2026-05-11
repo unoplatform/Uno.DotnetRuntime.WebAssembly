@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <noreply@platform.uno>
+Date: Mon, 11 May 2026 00:00:00 +0000
+Subject: [PATCH] fix: emit gsharedvt_out_sig wrappers for cfg->signatures
+ alongside gsharedvt_in_sig in LLVMOnly+Interp profile-guided AOT
+
+In LLVMOnly+Interp mode (the WASM worker scenario), the AOT compiler
+walks each compiled method's `cfg->signatures` — signatures observed
+when emitting indirect calls through rgctx method ftndescs, delegate
+Invoke, etc. — and emits only the matching `gsharedvt_in_sig` wrapper
+per signature.  The comment said "These only need in wrappers".
+
+That assumption was wrong for the interp→AOT direction.  When a generic
+method instantiation is reachable only from the interpreter side
+(because the only AOT-compiled method that mentions the signature does
+so as an indirect-call sig rather than as its own `cfg->method`
+signature), no AOT-compiled method matches the gsharedvt-form of that
+signature, so the corresponding `gsharedvt_out_sig` wrapper at line
+9742 never gets emitted.
+
+At runtime, when the interpreter has to call an AOT'd method with that
+signature, `init_jit_call_info` (`mono/mini/interp/interp.c:2735`)
+calls `mini_get_gsharedvt_out_sig_wrapper(sig)`, then
+`mono_jit_compile_method_jit_only` on the wrapper.  Because the wrapper
+isn't in any AOT image and we are in aot-only mode, the compile fails
+with "Attempting to JIT compile method ... while running in aot-only
+mode" and the runtime asserts.
+
+Symmetric emission — both `gsharedvt_in` and `gsharedvt_out` — for
+`cfg->signatures` closes the gap with a single extra wrapper per
+signature.  Build-size impact is bounded by the existing `cfg->signatures`
+walk; the wrappers themselves are very small (sig-keyed marshaling IL).
+
+Concrete repro from the Roslyn worker (Roslyn-hosting,
+profile-guided AOT, .NET 10):
+
+  [MONO] * Assertion at .../mono/mini/interp/interp.c:2737,
+  condition `is_ok (error)' not met, function: init_jit_call_info,
+  Attempting to JIT compile method
+    '(wrapper other) void object:gsharedvt_out_sig
+      (intptr, Microsoft.CodeAnalysis.CompoundUseSiteInfo`1<object>&,
+       object&, object&, intptr)'
+  while running in aot-only mode.
+
+`llvm-nm` on the AOT'd worker wasm confirms the asymmetry: 11,011
+`gsharedvt_out_sig` wrappers total, 8+ `gsharedvt_in_sig` wrappers for
+`CompoundUseSiteInfo<object>` signatures, but **zero** `gsharedvt_out_sig`
+wrappers for any `CompoundUseSiteInfo<object>` signature.  The 21.7 MB
+profile mentions `CompoundUseSiteInfo` 329 times.
+
+---
+ src/mono/mono/mini/aot-compiler.c | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/mono/mono/mini/aot-compiler.c b/src/mono/mono/mini/aot-compiler.c
+index 8e9cdc6120f..a6dd7ec085b 100644
+--- a/src/mono/mono/mini/aot-compiler.c
++++ b/src/mono/mono/mini/aot-compiler.c
+@@ -9744,8 +9744,31 @@ compile_method (MonoAotCompile *acfg, MonoMethod *method)
+ 		for (l = cfg->signatures; l; l = l->next) {
+ 			MonoMethodSignature *sig = mono_metadata_signature_dup ((MonoMethodSignature*)l->data);
+
+-			/* These only need in wrappers */
+-			add_gsharedvt_wrappers (acfg, sig, TRUE, FALSE, FALSE);
++			/*
++			 * Emit both gsharedvt_in and gsharedvt_out wrappers for indirect-call
++			 * signatures observed during method compilation.
++			 *
++			 * Historically only gsharedvt_in was emitted here, on the assumption that
++			 * gsharedvt_out coverage from cfg->method's own signature (above) was
++			 * sufficient. That assumption breaks in LLVMOnly+Interp (profile-guided
++			 * AOT) when a generic method instantiation is reached only via the
++			 * interpreter side: the AOT compiler observes the signature in
++			 * cfg->signatures of some other method (indirect call through rgctx
++			 * ftndesc, delegate.Invoke, etc.) but never compiles a method whose
++			 * cfg->method signature matches, so no gsharedvt_out_sig wrapper is
++			 * emitted. The interpreter then asserts in init_jit_call_info
++			 * (interp/interp.c) when calling into the AOT'd target, because
++			 * mono_jit_compile_method_jit_only on the wrapper returns the
++			 * "Attempting to JIT compile method ... while running in aot-only mode"
++			 * error.
++			 *
++			 * Concrete repro using Roslyn (Roslyn-hosting worker, .NET 10):
++			 *   gsharedvt_out_sig (intptr, Microsoft.CodeAnalysis.CompoundUseSiteInfo`1<object>&,
++			 *                      object&, object&, intptr)
++			 * The same signature already gets a gsharedvt_in wrapper from this loop;
++			 * emitting the out wrapper symmetrically closes the gap.
++			 */
++			add_gsharedvt_wrappers (acfg, sig, TRUE, TRUE, FALSE);
+ 			if (mono_aot_mode_is_interp (&acfg->aot_opts) && sig->param_count > MAX_INTERP_ENTRY_ARGS)
+ 				/* See below */
+ 				add_gsharedvt_wrappers (acfg, sig, FALSE, FALSE, TRUE);
+--
+2.43.0
