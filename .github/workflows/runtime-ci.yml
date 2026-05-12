@@ -409,8 +409,18 @@ jobs:
 
     - name: Get version
       id: nbgv
+      # NuGetPackageVersion (hyphen form, e.g. 10.0.0-dev-0018-g3b404b2069)
+      # is what NBGV bakes into <package>.nupkg filenames and the <version>
+      # element of each pack's nuspec when no version is overridden. SemVer2
+      # (period form, e.g. 10.0.0-dev.18.g3b404b2069) is a different string
+      # that won't match the cross packs at restore time. We use both:
+      #   - SemVer2 for the $buildversion$ token in buildTransitive props
+      #     (existing convention).
+      #   - NuGetPackageVersion for the cross-pack dependency constraint so it
+      #     matches the actual nupkg version produced by the AOT jobs.
       run: |
         echo "SemVer2=$(nbgv get-version -v SemVer2)" >> $GITHUB_OUTPUT
+        echo "NuGetPackageVersion=$(nbgv get-version -v NuGetPackageVersion)" >> $GITHUB_OUTPUT
 
     - name: Download package
       uses: actions/download-artifact@v4
@@ -449,7 +459,7 @@ jobs:
 
         dotnet pack Uno.NETCore.App.Runtime.Mono.browser-wasm.csproj \
           /p:OutputPath=$GITHUB_WORKSPACE/ci-output \
-          /p:UnoCrossPackVersion=${{ steps.nbgv.outputs.SemVer2 }} \
+          /p:UnoCrossPackVersion=${{ steps.nbgv.outputs.NuGetPackageVersion }} \
           /p:RestoreAdditionalProjectSources=$GITHUB_WORKSPACE/aot-packs
 
     - uses: actions/upload-artifact@v4

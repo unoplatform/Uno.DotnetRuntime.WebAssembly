@@ -48,6 +48,74 @@
 		</PropertyGroup>
 	</Target>
 
+	<!--
+		Override the resolved AOT cross compiler to point at the Uno-built
+		mono-aot-cross binary (carries the gsharedvt_out_sig wrapper fix for
+		cfg->signatures — see patches/0007-fix-aot-emit-gsharedvt-out-wrappers-for-cfg-signatures.patch
+		and specs/051-aot-profile-worker in the consuming repo).
+
+		The Uno.NETCore.App.Runtime.AOT.<host-RID>.Cross.browser-wasm cross packs
+		ship a buildTransitive props that contributes two per-RID candidate
+		properties (uniquely-named because PropertyGroups inside auto-imported
+		buildTransitive .props evaluate before $(NETCoreSdkPortableRuntimeIdentifier)
+		is set, so we cannot condition on it at import time):
+
+		  _UnoMonoAotCrossCompilerPath_FlatCandidate_<rid_underscored>
+		  _UnoMonoAotCrossCompilerPath_NestedCandidate_<rid_underscored>
+
+		At target-execution time, $(NETCoreSdkPortableRuntimeIdentifier) IS set
+		— so this target picks the candidate matching the current host, probes
+		both layouts (Linux/macOS CI flattens cross/browser-wasm/* into tools/;
+		Windows CI moves the cross/ directory unmodified), and replaces the
+		MonoAotCrossCompiler item the stock SDK populated.
+
+		Runs after ResolveFrameworkReferences for proximity to _UnoOverrideRuntimePack
+		(symmetric override pattern), but before _WasmAotCompileApp which is when
+		the SDK consumes the item.
+	-->
+	<Target Name="_UnoOverrideMonoAotCrossCompiler"
+			AfterTargets="ResolveFrameworkReferences"
+			BeforeTargets="_WasmAotCompileApp">
+
+		<PropertyGroup>
+			<_UnoHostRidUnderscore>$(NETCoreSdkPortableRuntimeIdentifier.Replace('-', '_'))</_UnoHostRidUnderscore>
+
+			<!--
+				MSBuild can't index a property by another property's value (no
+				eval-of-eval). So switch on the RID explicitly. Add new arms
+				when new cross packs are added.
+			-->
+			<_UnoMonoAotCrossCompilerPath_Flat Condition=" '$(_UnoHostRidUnderscore)' == 'linux_x64' ">$(_UnoMonoAotCrossCompilerPath_FlatCandidate_linux_x64)</_UnoMonoAotCrossCompilerPath_Flat>
+			<_UnoMonoAotCrossCompilerPath_Nested Condition=" '$(_UnoHostRidUnderscore)' == 'linux_x64' ">$(_UnoMonoAotCrossCompilerPath_NestedCandidate_linux_x64)</_UnoMonoAotCrossCompilerPath_Nested>
+
+			<_UnoMonoAotCrossCompilerPath_Flat Condition=" '$(_UnoHostRidUnderscore)' == 'win_x64' ">$(_UnoMonoAotCrossCompilerPath_FlatCandidate_win_x64)</_UnoMonoAotCrossCompilerPath_Flat>
+			<_UnoMonoAotCrossCompilerPath_Nested Condition=" '$(_UnoHostRidUnderscore)' == 'win_x64' ">$(_UnoMonoAotCrossCompilerPath_NestedCandidate_win_x64)</_UnoMonoAotCrossCompilerPath_Nested>
+
+			<_UnoMonoAotCrossCompilerPath_Flat Condition=" '$(_UnoHostRidUnderscore)' == 'osx_arm64' ">$(_UnoMonoAotCrossCompilerPath_FlatCandidate_osx_arm64)</_UnoMonoAotCrossCompilerPath_Flat>
+			<_UnoMonoAotCrossCompilerPath_Nested Condition=" '$(_UnoHostRidUnderscore)' == 'osx_arm64' ">$(_UnoMonoAotCrossCompilerPath_NestedCandidate_osx_arm64)</_UnoMonoAotCrossCompilerPath_Nested>
+
+			<_UnoMonoAotCrossCompilerPath Condition=" Exists('$(_UnoMonoAotCrossCompilerPath_Flat)') ">$(_UnoMonoAotCrossCompilerPath_Flat)</_UnoMonoAotCrossCompilerPath>
+			<_UnoMonoAotCrossCompilerPath Condition=" '$(_UnoMonoAotCrossCompilerPath)' == '' AND Exists('$(_UnoMonoAotCrossCompilerPath_Nested)') ">$(_UnoMonoAotCrossCompilerPath_Nested)</_UnoMonoAotCrossCompilerPath>
+		</PropertyGroup>
+
+		<Message Text="[Uno] Overriding MonoAotCrossCompiler with $(_UnoMonoAotCrossCompilerPath) (host=$(NETCoreSdkPortableRuntimeIdentifier))"
+				 Importance="high"
+				 Condition=" '$(_UnoMonoAotCrossCompilerPath)' != '' " />
+		<Message Text="[Uno] No Uno mono-aot-cross found for host $(NETCoreSdkPortableRuntimeIdentifier); falling back to stock SDK cross compiler."
+				 Importance="high"
+				 Condition=" '$(_UnoMonoAotCrossCompilerPath)' == '' " />
+
+		<ItemGroup Condition=" '$(_UnoMonoAotCrossCompilerPath)' != '' ">
+			<!-- Drop every stock MonoAotCrossCompiler entry the SDK populated
+			     so only the Uno-patched binary survives the
+			     ->WithMetadataValue('RuntimeIdentifier', browser-wasm) filter
+			     used downstream by _WasmAotCompileApp. -->
+			<MonoAotCrossCompiler Remove="@(MonoAotCrossCompiler)" />
+			<MonoAotCrossCompiler Include="$(_UnoMonoAotCrossCompilerPath)"
+								  RuntimeIdentifier="browser-wasm" />
+		</ItemGroup>
+	</Target>
+
 	<Target Name="_UnoAdjustPreferredPackages" AfterTargets="ResolveTargetingPackAssets">
 		<PropertyGroup>
 			<!-- Adjust the preferred list in order for assets deduplication to choose our package assets -->

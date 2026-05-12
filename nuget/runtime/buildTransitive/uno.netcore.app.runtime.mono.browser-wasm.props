@@ -34,34 +34,17 @@
 
 	<!--
 		AOT cross-compiler override.
+		See _UnoOverrideMonoAotCrossCompiler in the sibling .targets file. The
+		override must run inside a target — $(NETCoreSdkPortableRuntimeIdentifier)
+		is not yet populated when NuGet auto-imports buildTransitive .props
+		files (.nuget.g.props runs at the very top of the SDK chain, before
+		Microsoft.NETCoreSdk.BundledVersions.props sets the host RID).
 
-		The stock .NET WASM SDK populates $(_MonoAotCrossCompilerPath) by
-		filtering the MonoAotCrossCompiler item by $(RuntimeIdentifier)
-		(== "browser-wasm" for a wasm publish). It points at
-		/usr/share/dotnet/packs/Microsoft.NETCore.App.Runtime.AOT.<host>.Cross.browser-wasm/<v>/tools/mono-aot-cross
-		— the unmodified Microsoft cross compiler.
-
-		The Uno cross packs (Uno.NETCore.App.Runtime.AOT.<host-RID>.Cross.browser-wasm)
-		each ship a buildTransitive props that sets
-		$(_UnoMonoAotCrossCompilerPath) when their RID matches the consumer's
-		host. When that property is non-empty, we register OUR cross compiler
-		as the MonoAotCrossCompiler item for RuntimeIdentifier=browser-wasm.
-
-		Fallback: when $(_UnoMonoAotCrossCompilerPath) is empty (no Uno cross
-		pack restored, or none matching the host — e.g. on a host RID we do
-		not yet ship a cross pack for), we register the stock
-		$(_MonoAotCrossCompilerPath) so AOT still works against the
-		unmodified compiler. This preserves the previous behavior for any
-		host RID we do not yet ship a cross pack for.
+		The stock .NET WASM SDK's existing MonoAotCrossCompiler items remain
+		(pointing at /usr/share/dotnet/packs/Microsoft.NETCore.App.Runtime.AOT.*/tools/mono-aot-cross).
+		_UnoOverrideMonoAotCrossCompiler removes them and inserts the Uno-built
+		cross compiler instead, when one is available for the current host.
 	-->
-	<ItemGroup Condition=" '$(_UnoMonoAotCrossCompilerPath)' != '' AND Exists('$(_UnoMonoAotCrossCompilerPath)') ">
-		<MonoAotCrossCompiler Include="$(_UnoMonoAotCrossCompilerPath)"
-							  RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />
-	</ItemGroup>
-	<ItemGroup Condition=" '$(_UnoMonoAotCrossCompilerPath)' == '' OR !Exists('$(_UnoMonoAotCrossCompilerPath)') ">
-		<MonoAotCrossCompiler Include="$(_MonoAotCrossCompilerPath)"
-							  RuntimeIdentifier="$(TargetOS)-$(TargetArchitecture.ToLowerInvariant())" />
-	</ItemGroup>
 
 	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)Sdk\MonoTargetsTasks.props"/>
 	<Import Project="$(_UnoNetCoreAppRuntimeBasePath)Sdk\WasmApp.Common.props"/>
