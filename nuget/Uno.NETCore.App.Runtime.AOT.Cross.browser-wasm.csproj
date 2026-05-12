@@ -36,6 +36,13 @@
 	-->
 	<PropertyGroup>
 		<_UnoCrossPackRid>$(NETCoreSdkPortableRuntimeIdentifier)</_UnoCrossPackRid>
+		<!--
+			MSBuild property names cannot contain hyphens, so derive an
+			underscore-separated form of the RID for use as a token in the
+			generated property names (e.g. linux-x64 → linux_x64). The main
+			override pack references these via the same convention.
+		-->
+		<_UnoCrossPackRidUnderscore>$(_UnoCrossPackRid.Replace('-', '_'))</_UnoCrossPackRidUnderscore>
 		<_UnoCrossPackExe Condition=" '$(OS)' == 'Windows_NT' ">mono-aot-cross.exe</_UnoCrossPackExe>
 		<_UnoCrossPackExe Condition=" '$(_UnoCrossPackExe)' == '' ">mono-aot-cross</_UnoCrossPackExe>
 		<_UnoCrossPackPropsName>uno.netcore.app.runtime.aot.$(_UnoCrossPackRid).cross.browser-wasm.props</_UnoCrossPackPropsName>
@@ -51,7 +58,7 @@
 		<MakeDir Directories="$(IntermediateOutputPath)" />
 
 		<WriteLinesToFile File="$(_UnoCrossPackPropsOutputPath)"
-						  Lines="$([System.IO.File]::ReadAllText('$(_UnoCrossPackPropsTemplate)').Replace('__RID__', '$(_UnoCrossPackRid)').Replace('__EXE__', '$(_UnoCrossPackExe)'))"
+						  Lines="$([System.IO.File]::ReadAllText('$(_UnoCrossPackPropsTemplate)').Replace('__RID_USCORE__', '$(_UnoCrossPackRidUnderscore)').Replace('__RID__', '$(_UnoCrossPackRid)').Replace('__EXE__', '$(_UnoCrossPackExe)'))"
 						  Overwrite="true" />
 
 		<ItemGroup>
