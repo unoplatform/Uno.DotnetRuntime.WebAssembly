@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jerome Laban <noreply@platform.uno>
+Date: Tue, 12 May 2026 00:00:00 +0000
+Subject: [PATCH] fix: interpreter fallback when gsharedvt_out_sig wrapper
+ is missing in aot-only mode
+
+The AOT-side widening in patch 0007 closes the gsharedvt_out_sig
+coverage gap for signatures observed during compilation
+(cfg->signatures and cfg->interp_in_signatures). It cannot help
+signatures the AOT compiler never observed at compile time — for
+example signatures synthesised by the interpreter at runtime from
+method metadata.
+
+A concrete instance from a WASM worker hosting Roslyn (.NET 10):
+
+  [MONO] * Assertion at .../mono/mini/interp/interp.c,
+    function: init_jit_call_info,
+    Attempting to JIT compile method '(wrapper other) void object:
+      gsharedvt_out_sig (intptr,
+        Microsoft.CodeAnalysis.CompoundUseSiteInfo`1<object>&,
+        object&, object&, intptr)'
+    while running in aot-only mode.
+
+Symbol scan of the AOT-built worker wasm confirms: with patch 0007
+applied, IN wrappers for 9 CompoundUseSiteInfo<object>-bearing
+signatures are present, but the failing 5-param shape itself appears
+in NEITHER the IN nor the OUT direction. No widening loop can catch
+it because the AOT compiler never observed it.
+
+This patch adds a runtime-side fallback. When
+mono_jit_compile_method_jit_only fails on the OUT wrapper, ask the
+interpreter for an entry trampoline for the WRAPPER (not the target
+method) via
+mini_get_interp_callbacks ()->create_method_pointer_llvmonly. That
+returns a MonoFtnDesc whose .addr is a gsharedvt_in_sig wrapper for
+the OUT wrapper's signature, and whose .arg is an inner ftndesc
+containing the interp entry_func and the InterpMethod for the
+OUT wrapper. Because the OUT wrapper's signature is all-pointer
+(explicit vret + byref params + ftndesc), its IN wrapper passes the
+call-site args straight through to the interpreter entry, which
+then runs the OUT wrapper's IL. The IL performs the byref-deref /
+box steps and calli's the underlying method through the rgctx
+ftndesc.
+
+Splice into the wrapped jit_call_cb path the same way the native
+OUT wrapper would have been wired: cinfo->wrapper = IN wrapper addr;
+cinfo->addr / cinfo->extra_arg = inner ftndesc. jit_call_cb assembles
+{addr, extra_arg} on the stack as a MonoFtnDesc and passes it as the
+final argument — matching the call shape jit_call_cb already uses
+for the native wrapped path.
+
+Why this works where a previous attempt (splicing the IN wrapper for
+the TARGET method into the no_wrapper path) did NOT: the no_wrapper
+path passes args sized to the target method's signature, while the
+target method's IN wrapper expects a different arg count when the
+gsharedvt-shaping differs. Using the OUT wrapper's IN wrapper
+preserves the OUT wrapper's calling convention end-to-end.
+
+A g_warning is logged on every fallback so silent drifts in AOT-side
+wrapper coverage do not regress into a slower interpreter path
+unnoticed.
+
+Trade-offs:
+- Slower than calling the AOT-compiled method through a native
+  gsharedvt_out_sig wrapper. Correct, and avoids a g_assert-driven
+  runtime exit.
+- Requires the IN wrapper for the OUT wrapper's signature to exist
+  in the AOT image. The OUT wrapper's signature is fully
+  pointer-typed, so its IN wrapper is almost always present (it is
+  emitted from many paths). If it is also missing,
+  interp_create_method_pointer_llvmonly asserts internally — at
+  that point the original abort behaviour is the floor.
+
+Fixes: downstream WASM worker AOT path (LLVMOnly+Interp).
+---
+ src/mono/mono/mini/interp/interp.c | 64 ++++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index 0a12875dcce..ad6c739a6bc 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -2731,17 +2731,73 @@ init_jit_call_info (InterpMethod *rmethod, MonoError *error)
+ 	}
+ 
+ 	gpointer jit_wrapper = NULL;
++	gboolean interp_fallback = FALSE;
+ 	if (need_wrapper) {
+ 		MonoMethod *wrapper = mini_get_gsharedvt_out_sig_wrapper (sig);
+ 		jit_wrapper = mono_jit_compile_method_jit_only (wrapper, error);
+-		mono_error_assert_ok (error);
++		if (!is_ok (error)) {
++			/*
++			 * The gsharedvt_out_sig wrapper for this signature is not in the
++			 * AOT image and we cannot JIT it in aot-only mode (LLVMOnly+Interp
++			 * on WASM). This happens for signatures the AOT compiler never
++			 * observed at compile time (cfg->signatures, cfg->interp_in_signatures)
++			 * and synthesised by the interpreter at runtime from method metadata.
++			 *
++			 * Fallback: route the call through the interpreter executing the
++			 * gsharedvt_out_sig wrapper's IL. The IL does the byref-deref /
++			 * box steps and then calli's the underlying method via the rgctx
++			 * ftndesc. Interpreting it avoids the missing native wrapper.
++			 *
++			 * `interp_create_method_pointer_llvmonly (wrapper, ...)` returns a
++			 * MonoFtnDesc { addr = gsharedvt_in_sig wrapper for the OUT
++			 * wrapper's signature, arg = inner ftndesc { entry_func,
++			 * InterpMethod } }. The OUT wrapper's signature is fully
++			 * pointer-typed (vret + byref params + ftndesc), so its IN wrapper
++			 * passes the call-site args straight through to the interpreter
++			 * entry, which then runs the OUT wrapper's IL.
++			 *
++			 * Splice into the wrapped jit_call_cb path: cinfo->wrapper holds
++			 * the IN wrapper's addr; cinfo->addr / cinfo->extra_arg form the
++			 * inner ftndesc that jit_call_cb assembles and passes as the
++			 * final argument. This is the same plumbing the wrapped path
++			 * already uses for the native OUT wrapper.
++			 *
++			 * Requires: a gsharedvt_in_sig wrapper for the OUT wrapper's
++			 * signature exists in the AOT image. Because the OUT wrapper's
++			 * signature is all-pointer, this IN wrapper is almost always
++			 * present (the AOT compiler emits IN wrappers from many paths).
++			 * If it is also missing, interp_create_method_pointer_llvmonly
++			 * asserts internally — that is the floor of this fallback.
++			 *
++			 * Log a warning so future drifts in AOT-side wrapper coverage do
++			 * not silently regress into the slower interpreter path.
++			 */
++			mono_error_cleanup (error);
++			error_init (error);
++
++			MonoFtnDesc *interp_ftndesc = mini_get_interp_callbacks ()->create_method_pointer_llvmonly (wrapper, FALSE, error);
++			mono_error_assert_ok (error);
++			g_assert (interp_ftndesc);
++			MonoFtnDesc *inner = (MonoFtnDesc*)interp_ftndesc->arg;
++			g_assert (inner);
++
++			g_warning ("Falling back to interpreter for missing gsharedvt_out_sig wrapper of '%s' (signature not observed at AOT compile time).",
++				mono_method_full_name (method, TRUE));
++
++			jit_wrapper = interp_ftndesc->addr;
++			cinfo->addr = inner->addr;
++			cinfo->extra_arg = inner->arg;
++			interp_fallback = TRUE;
++		}
+ 	}
+ 
+-	if (mono_llvm_only) {
+-		gboolean caller_gsharedvt = !need_wrapper;
+-		cinfo->addr = mini_llvmonly_add_method_wrappers (method, addr, caller_gsharedvt, FALSE, &cinfo->extra_arg);
+-	} else {
+-		cinfo->addr = addr;
++	if (!interp_fallback) {
++		if (mono_llvm_only) {
++			gboolean caller_gsharedvt = !need_wrapper;
++			cinfo->addr = mini_llvmonly_add_method_wrappers (method, addr, caller_gsharedvt, FALSE, &cinfo->extra_arg);
++		} else {
++			cinfo->addr = addr;
++		}
+ 	}
+ 
+ 	cinfo->sig = sig;
+--
+2.43.0
