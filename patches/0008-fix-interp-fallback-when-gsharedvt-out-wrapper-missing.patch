@@ -65,11 +65,11 @@ Trade-offs:
 
 Fixes: downstream WASM worker AOT path (LLVMOnly+Interp).
 ---
- src/mono/mono/mini/interp/interp.c | 83 +++++++++++++++++++++++++++++++++++++-
- 1 file changed, 82 insertions(+), 1 deletion(-)
+ src/mono/mono/mini/interp/interp.c | 100 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 99 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index 0a12875dcce..b4f9f5c8be9 100644
+index 0a12875dcce..bb04bc1ec6a 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -2690,6 +2690,13 @@ struct _JitCallInfo {
@@ -119,7 +119,24 @@ index 0a12875dcce..b4f9f5c8be9 100644
  	}
  
  	if (mono_llvm_only) {
-@@ -2814,6 +2845,56 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
+@@ -2794,6 +2825,16 @@ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
+ }
+ #endif
+ 
++/* Forward declaration: defined further down in this file. Needed by the
++ * interpreter-fallback path in do_jit_call when a gsharedvt_out_sig wrapper
++ * is missing from the AOT image and we route the call through interp. */
++static MONO_ALWAYS_INLINE gboolean
++method_entry (ThreadContext *context, InterpFrame *frame,
++#if DEBUG_INTERP
++	int *out_tracing,
++#endif
++	MonoException **out_ex);
++
+ static MONO_NEVER_INLINE void
+ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame *frame, InterpMethod *rmethod, MonoError *error)
+ {
+@@ -2814,6 +2855,56 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
  
  	cinfo = (JitCallInfo*)rmethod->jit_call_info;
  
