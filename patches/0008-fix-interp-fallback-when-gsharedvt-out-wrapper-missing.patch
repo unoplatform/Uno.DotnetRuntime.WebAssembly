@@ -64,25 +64,21 @@ of its own), while jit_call_cb supplies only param_count args plus
 extra_arg -- off by one. The current patch sidesteps the calling
 convention entirely by skipping jit_call_cb on the fallback path.
 
-A g_warning is logged on each fallback so AOT-side coverage
-regressions do not silently turn into slow interpreter executions.
-
 Trade-offs:
 - Slower than calling the AOT-compiled method through a native
   gsharedvt_out_sig wrapper. Correct, and avoids a g_assert-driven
   runtime exit.
 - The target method runs through the interpreter for this call
   site, not its AOT code path. Reachable from any call site whose
-  signature the AOT compiler never observed; the warning makes
-  regressions visible.
+  signature the AOT compiler never observed.
 
 Fixes: downstream WASM worker AOT path (LLVMOnly+Interp).
 ---
- src/mono/mono/mini/interp/interp.c | 82 +++++++++++++++++++++++++++++++++++++-
- 1 file changed, 81 insertions(+), 1 deletion(-)
+ src/mono/mono/mini/interp/interp.c | 77 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 76 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index 0a12875dcce..80c8ec4c0b5 100644
+index 0a12875dcce..b4f917526ba 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -2690,6 +2690,13 @@ struct _JitCallInfo {
@@ -99,7 +95,7 @@ index 0a12875dcce..80c8ec4c0b5 100644
  #if HOST_BROWSER
  	int hit_count;
  	WasmJitCallThunk jiterp_thunk;
-@@ -2734,7 +2741,31 @@ init_jit_call_info (InterpMethod *rmethod, MonoError *error)
+@@ -2734,7 +2741,26 @@ init_jit_call_info (InterpMethod *rmethod, MonoError *error)
  	if (need_wrapper) {
  		MonoMethod *wrapper = mini_get_gsharedvt_out_sig_wrapper (sig);
  		jit_wrapper = mono_jit_compile_method_jit_only (wrapper, error);
@@ -119,20 +115,15 @@ index 0a12875dcce..80c8ec4c0b5 100644
 +			 * missing native wrapper, calling mono_interp_exec_method
 +			 * directly. The args at sp are already in interpreter stackval
 +			 * form for the target method, so no arg translation is needed.
-+			 *
-+			 * Log a warning on each fallback so AOT-side coverage regressions
-+			 * do not silently turn into slow interpreter executions.
 +			 */
 +			mono_error_cleanup (error);
 +			error_init (error);
 +			cinfo->interp_fallback = TRUE;
-+			g_warning ("init_jit_call_info: gsharedvt_out_sig wrapper missing in AOT image for '%s'; falling back to interpreter.",
-+				mono_method_full_name (method, TRUE));
 +		}
  	}
  
  	if (mono_llvm_only) {
-@@ -2814,6 +2845,51 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
+@@ -2814,6 +2840,51 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
  
  	cinfo = (JitCallInfo*)rmethod->jit_call_info;
  
