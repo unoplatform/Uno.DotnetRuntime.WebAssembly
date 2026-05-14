@@ -39,8 +39,21 @@ method, since the same call site could just as well have been
 emitted as MINT_CALL (which consumes args from the same locals
 offset). MINT_JIT_CALL is purely an optimisation that hands the
 args to compiled AOT code via the gsharedvt_out_sig wrapper; when
-that wrapper is unavailable we route to the same interp path
-MINT_CALL would have used, just from inside do_jit_call.
+that wrapper is unavailable we route to the same interp state
+MINT_CALL would have produced -- but from inside do_jit_call.
+
+Critical: the child frame's parent MUST be NULL. MINT_JIT_CALL
+sets the outer frame's state.ip before calling do_jit_call. If
+child_frame.parent linked back to the outer frame, the inner
+mono_interp_exec_method's exit_frame would see parent->state.ip
+set and continue the inner loop on the outer's frame, executing
+the outer's IL from the saved ip -- corrupting state and tripping
+the resume-label assertion in the outer exec_method later. With
+parent=NULL, the inner returns cleanly; exception propagation
+still works because the inner sets context->has_resume_state,
+which the outer's MINT_JIT_CALL handler observes via
+CHECK_RESUME_STATE after do_jit_call returns. This mirrors
+interp_runtime_invoke's invocation pattern.
 
 A prior attempt at this fallback spliced an
 `interp_create_method_pointer_llvmonly`-produced interp entry into
@@ -65,11 +78,11 @@ Trade-offs:
 
 Fixes: downstream WASM worker AOT path (LLVMOnly+Interp).
 ---
- src/mono/mono/mini/interp/interp.c | 100 +++++++++++++++++++++++++++++++++++-
- 1 file changed, 99 insertions(+), 1 deletion(-)
+ src/mono/mono/mini/interp/interp.c | 82 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 81 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index 0a12875dcce..bb04bc1ec6a 100644
+index 0a12875dcce..80c8ec4c0b5 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -2690,6 +2690,13 @@ struct _JitCallInfo {
@@ -119,24 +132,7 @@ index 0a12875dcce..bb04bc1ec6a 100644
  	}
  
  	if (mono_llvm_only) {
-@@ -2794,6 +2825,16 @@ mono_jiterp_register_jit_call_thunk (void *cinfo, WasmJitCallThunk thunk) {
- }
- #endif
- 
-+/* Forward declaration: defined further down in this file. Needed by the
-+ * interpreter-fallback path in do_jit_call when a gsharedvt_out_sig wrapper
-+ * is missing from the AOT image and we route the call through interp. */
-+static MONO_ALWAYS_INLINE gboolean
-+method_entry (ThreadContext *context, InterpFrame *frame,
-+#if DEBUG_INTERP
-+	int *out_tracing,
-+#endif
-+	MonoException **out_ex);
-+
- static MONO_NEVER_INLINE void
- do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame *frame, InterpMethod *rmethod, MonoError *error)
- {
-@@ -2814,6 +2855,56 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
+@@ -2814,6 +2845,51 @@ do_jit_call (ThreadContext *context, stackval *ret_sp, stackval *sp, InterpFrame
  
  	cinfo = (JitCallInfo*)rmethod->jit_call_info;
  
@@ -144,42 +140,36 @@ index 0a12875dcce..bb04bc1ec6a 100644
 +		/*
 +		 * The gsharedvt_out_sig wrapper this call site needs is not present
 +		 * in the AOT image (see init_jit_call_info). Run rmethod->method
-+		 * through the interpreter directly. The args at sp are already laid
-+		 * out in stackval form for this method (the interpreter compiler
-+		 * placed them there for this call), so we can build a child frame
-+		 * pointing at the same stack region and execute it.
++		 * through the interpreter directly. The args at sp are already in
++		 * stackval form for this method (the interpreter compiler placed
++		 * them there for this call), so a child frame can point at the same
++		 * region without arg translation.
++		 *
++		 * parent MUST be NULL: this is a nested mono_interp_exec_method
++		 * invocation from C, not a continuation of the outer interp loop.
++		 * If parent were set to the outer frame, the inner exec_method's
++		 * exit_frame would see parent->state.ip (saved by MINT_JIT_CALL)
++		 * and continue the inner loop on the outer's frame -- corrupting
++		 * state. With parent=NULL, exit_frame falls into exit_clause and
++		 * the inner returns cleanly. Exception unwind also works via
++		 * context->has_resume_state, which the outer's MINT_JIT_CALL
++		 * handler checks via CHECK_RESUME_STATE after this function
++		 * returns. This mirrors interp_runtime_invoke's pattern.
 +		 */
 +		InterpFrame child_frame;
 +		memset (&child_frame, 0, sizeof (child_frame));
-+		reinit_frame (&child_frame, frame, rmethod, ret_sp, sp);
++		reinit_frame (&child_frame, NULL, rmethod, ret_sp, sp);
 +
++		MonoMethodSignature *target_sig = mono_method_signature_internal (rmethod->method);
 +		guchar *saved_stack_pointer = context->stack_pointer;
++		/* Bump stack_pointer past the args so the called method's transform / locals
++		 * don't clobber them. The real top of stack is set by mono_interp_exec_method
++		 * once the method is transformed; this is just a conservative pre-bump. */
++		stackval *post_args = sp + (target_sig->hasthis ? 1 : 0) + target_sig->param_count + 1;
++		context->stack_pointer = (guchar*)post_args;
++		g_assert (context->stack_pointer < context->stack_end);
 +
-+		MonoException *call_ex;
-+		if (method_entry (context, &child_frame,
-+#if DEBUG_INTERP
-+			NULL,
-+#endif
-+			&call_ex)) {
-+			if (call_ex) {
-+				mono_error_set_exception_instance (error, call_ex);
-+				context->stack_pointer = saved_stack_pointer;
-+				return;
-+			}
-+		}
-+
-+		context->stack_pointer = (guchar*)child_frame.stack + rmethod->alloca_size;
-+		if (G_UNLIKELY (context->stack_pointer >= context->stack_end)) {
-+			context->stack_end = context->stack_real_end;
-+			mono_error_set_exception_instance (error, mono_domain_get ()->stack_overflow_ex);
-+			context->stack_pointer = saved_stack_pointer;
-+			return;
-+		}
-+		mono_compiler_barrier ();
-+
-+		MONO_ENTER_GC_UNSAFE;
 +		mono_interp_exec_method (&child_frame, context, NULL);
-+		MONO_EXIT_GC_UNSAFE;
 +
 +		context->stack_pointer = saved_stack_pointer;
 +
@@ -187,6 +177,7 @@ index 0a12875dcce..bb04bc1ec6a 100644
 +			if (mono_aot_mode == MONO_AOT_MODE_LLVMONLY_INTERP)
 +				mono_llvm_start_native_unwind ();
 +		}
++		(void)frame;
 +		return;
 +	}
 +
