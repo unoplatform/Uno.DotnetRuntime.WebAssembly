@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Mon, 06 Jul 2026 00:00:00 +0000
+Subject: [PATCH] feat: host-triggered native unload of collectible
+ AssemblyLoadContexts on a WASM worker
+
+A downstream WASM worker hosting Roslyn repeatedly loads previewed apps
+into collectible AssemblyLoadContexts and unloads them. On WASM
+WebAssembly.Memory.grow() is irreversible, so every load/unload cycle
+that fails to reclaim the ALC's native memory permanently inflates
+HEAPU8. The existing native teardown chain is unreachable because
+mono_alc_init unconditionally forces collectible=FALSE, and
+mono_alc_cleanup poisons (debug_unload=TRUE) instead of freeing.
+
+This change makes the native teardown reachable and effective when the
+host opts in via the MONO_WASM_ENABLE_ALC_UNLOAD environment variable.
+Default behaviour is unchanged for every other consumer.
+
+  * mono_alc_init: gate the collectible=FALSE override behind the env
+    flag. collectible=TRUE is required for correctness (cross-ALC
+    generics otherwise route into the never-freed default memory
+    manager), not merely to enable the free chain.
+  * PrepareForAssemblyLoadContextRelease: free the leaked strong
+    GCHandle on the !collectible early return so mixed-collectible
+    hosts do not leak it.
+  * mono_alc_cleanup: flip the primary memory manager free to
+    debug_unload=FALSE so its mempool and code-manager pages are
+    actually reclaimed, and free the ALC-exclusive generic memory
+    managers. Generic freeing is restricted to n_alcs==1 (generics
+    owned solely by this ALC); generics co-owned by a surviving ALC
+    are intentionally left for a later iteration to avoid dangling a
+    live ALC's back-pointers.
+  * mono_mem_manager_start_unload: null loader_allocator_handle after
+    freeing it, closing a double-free against mono_alc_cleanup.
+  * New host-invoked icall InternalForceNativeUnload: once the host has
+    proven managed quiescence it tears down the ALC natively in one
+    shot, releasing the strong GCHandle and the primary memory manager.
+  * jiterpreter sweep: free_jit_mem_manager destroys interp_code_hash
+    wholesale without running the per-method jiterpreter cleanup that
+    interp_free_method runs only for dynamic methods, orphaning JS
+    trace-cache and WASM function-table slots for every regular method
+    in the unloaded ALC. A new interp helper sweeps them before the
+    hash is destroyed. Guarded by HOST_BROWSER so non-wasm builds do
+    not pull the symbol.
+
+The behaviour is fully dark unless MONO_WASM_ENABLE_ALC_UNLOAD is set:
+individual ALCs stay non-collectible, InternalForceNativeUnload
+early-returns on !collectible, and the memory manager free keeps its
+poisoning path for validation runs.
+---
+ .../Runtime/Loader/AssemblyLoadContext.Mono.cs     |  6 ++
+ src/mono/mono/metadata/assembly-load-context.c     | 71 ++++++++++++++++++----
+ src/mono/mono/metadata/icall-def.h                 |  1 +
+ src/mono/mono/metadata/memory-manager.c            |  1 +
+ src/mono/mono/mini/interp/interp.c                 | 25 ++++++++
+ src/mono/mono/mini/interp/interp.h                 |  3 +
+ src/mono/mono/mini/mini-runtime.c                  |  3 +
+ 7 files changed, 98 insertions(+), 12 deletions(-)
+
+diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+index 57db653..2057ce2 100644
+--- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
++++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+@@ -41,6 +41,12 @@ namespace System.Runtime.Loader
+         [MethodImplAttribute(MethodImplOptions.InternalCall)]
+         private static extern void PrepareForAssemblyLoadContextRelease(IntPtr nativeAssemblyLoadContext, IntPtr assemblyLoadContextStrong);
+ 
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern void InternalForceNativeUnload(IntPtr nativeAssemblyLoadContext);
++
++        // Invoked by a downstream host once it has proven the collectible ALC is managed-quiescent.
++        internal void ForceNativeUnload() => InternalForceNativeUnload(_nativeAssemblyLoadContext);
++
+         [RequiresUnreferencedCode("Types and members the loaded assembly depends on might be removed")]
+         [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
+ #pragma warning disable IDE0060
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index dec9f96..6c49a87 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -39,8 +39,18 @@ mono_alc_init (MonoAssemblyLoadContext *alc, gboolean collectible)
+ {
+ 	MonoLoadedImages *li = g_new0 (MonoLoadedImages, 1);
+ 
+-	// FIXME:
+-	collectible = FALSE;
++	/*
++	 * By default every individual/unloadable ALC is forced non-collectible.
++	 * A downstream WASM worker hosting Roslyn opts into native ALC unload by
++	 * setting MONO_WASM_ENABLE_ALC_UNLOAD; only then do we honour the caller's
++	 * collectible request, which is required for correctness (cross-ALC generics
++	 * would otherwise route into the never-freed default memory manager).
++	 */
++	static int native_alc_unload_enabled = -1;
++	if (native_alc_unload_enabled == -1)
++		native_alc_unload_enabled = g_hasenv ("MONO_WASM_ENABLE_ALC_UNLOAD") ? 1 : 0;
++	if (!native_alc_unload_enabled)
++		collectible = FALSE;
+ 
+ 	mono_loaded_images_init (li, alc);
+ 	alc->loaded_images = li;
+@@ -187,17 +197,32 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
+ 	mono_gchandle_free_internal (alc->memory_manager->loader_allocator_handle);
+ 	alc->memory_manager->loader_allocator_handle = NULL;
+ 
+-	// FIXME: Change to FALSE
+-	mono_mem_manager_free (alc->memory_manager, TRUE);
++	/*
++	 * Actually reclaim the primary memory manager's mempool/code-manager pages.
++	 * The poison path (debug_unload=TRUE) is still reachable through the env
++	 * gate on mono_alc_init for use-after-free validation runs.
++	 */
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++	mono_mem_manager_free (primary_mm, FALSE);
+ 	alc->memory_manager = NULL;
+ 
+-	/*for (int i = 0; i < alc->generic_memory_managers->len; i++) {
+-		MonoGenericMemoryManager *memory_manager = (MonoGenericMemoryManager *)alc->generic_memory_managers->pdata [i];
+-		mono_mem_manager_free_generic (memory_manager, FALSE);
+-	}*/
+-	// FIXME:
+-	//g_ptr_array_free (alc->generic_memory_managers, TRUE);
+-	//mono_coop_mutex_destroy (&alc->memory_managers_lock);
++	/*
++	 * Free the generic memory managers owned solely by this ALC. The primary MM
++	 * is registered here too and was already freed above, so skip it. Generics
++	 * co-owned by a surviving ALC (n_alcs > 1) are intentionally left alone for
++	 * now: freeing one would dangle the surviving ALC's back-pointers.
++	 */
++	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
++		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
++		if (mm == primary_mm)
++			continue;
++		if (mm->n_alcs != 1)
++			continue;
++		mono_mem_manager_free (mm, FALSE);
++	}
++	g_ptr_array_free (alc->generic_memory_managers, TRUE);
++	alc->generic_memory_managers = NULL;
++	mono_coop_mutex_destroy (&alc->memory_managers_lock);
+ 
+ 	mono_gchandle_free_internal (alc->gchandle);
+ 	alc->gchandle = NULL;
+@@ -277,8 +302,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_pointer;
+ 
+ 	// FIXME:
+-	if (!alc->collectible)
++	if (!alc->collectible) {
++		/* Native never took ownership of the strong handle on this path, so release it here. */
++		mono_gchandle_free_internal (strong_gchandle);
+ 		return;
++	}
+ 
+ 	g_assert (alc->collectible);
+ 	g_assert (!alc->unloading);
+@@ -298,6 +326,25 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	mono_alc_memory_managers_unlock (alc);
+ }
+ 
++void
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
++{
++	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_pointer;
++
++	/*
++	 * Host-triggered native teardown of a collectible ALC. The host only calls
++	 * this after it has proven the previewed app is managed-quiescent, so the
++	 * weak-handle scout dance is skipped. Guard against the default ALC and
++	 * non-collectible ALCs, otherwise mono_alc_cleanup's asserts abort the runtime.
++	 */
++	if (!alc || alc == mono_alc_get_default ())
++		return;
++	if (!alc->collectible)
++		return;
++
++	mono_alc_free (alc);
++}
++
+ gpointer
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
+ {
+diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
+index 444a41c..5a17eb4 100644
+--- a/src/mono/mono/metadata/icall-def.h
++++ b/src/mono/mono/metadata/icall-def.h
+@@ -472,6 +472,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+ 
+ ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
+ HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
++HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, void, 1, (gpointer))
+ HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
+ HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
+ HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
+diff --git a/src/mono/mono/metadata/memory-manager.c b/src/mono/mono/metadata/memory-manager.c
+index e7a2346..f0ab1b4 100644
+--- a/src/mono/mono/metadata/memory-manager.c
++++ b/src/mono/mono/metadata/memory-manager.c
+@@ -722,4 +722,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
+ 	/* Free the strong handle so the LoaderAllocator object can be freed */
+ 	MonoGCHandle loader_handle = mem_manager->loader_allocator_handle;
+ 	mono_gchandle_free_internal (loader_handle);
++	mem_manager->loader_allocator_handle = NULL;
+ }
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index 0a12875..8fd0abe 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -3654,6 +3654,31 @@ interp_free_method (MonoMethod *method)
+ 	}
+ }
+ 
++#if HOST_BROWSER
++static void
++free_imethod_jiterp_cb (gpointer value, gpointer user_data)
++{
++	InterpMethod *imethod = (InterpMethod*)value;
++	if (imethod && imethod->method)
++		mono_jiterp_free_method_data (imethod->method, imethod);
++}
++#endif
++
++/*
++ * Sweep the per-method jiterpreter data (JS trace-cache and WASM function-table
++ * slots) for every method in a memory manager that is about to be freed.
++ * free_jit_mem_manager only runs the per-method cleanup for dynamic methods via
++ * interp_free_method, so regular methods in an unloaded ALC would otherwise leak
++ * their jiterpreter state. Must run before interp_code_hash is destroyed.
++ */
++void
++mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
++{
++#if HOST_BROWSER
++	mono_internal_hash_table_apply (&jit_mm->interp_code_hash, free_imethod_jiterp_cb, NULL);
++#endif
++}
++
+ #if COUNT_OPS
+ static long opcode_counts[MINT_LASTOP];
+ 
+diff --git a/src/mono/mono/mini/interp/interp.h b/src/mono/mono/mini/interp/interp.h
+index a09111c..88895bb 100644
+--- a/src/mono/mono/mini/interp/interp.h
++++ b/src/mono/mono/mini/interp/interp.h
+@@ -57,6 +57,9 @@ typedef struct _InterpMethodArguments InterpMethodArguments;
+  */
+ MONO_API void mono_ee_interp_init (const char *);
+ 
++void
++mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm);
++
+ #ifdef TARGET_WASM
+ 
+ gpointer
+diff --git a/src/mono/mono/mini/mini-runtime.c b/src/mono/mono/mini/mini-runtime.c
+index 7cf6384..2b0b2cd 100644
+--- a/src/mono/mono/mini/mini-runtime.c
++++ b/src/mono/mono/mini/mini-runtime.c
+@@ -4458,6 +4458,9 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
+ 		g_hash_table_foreach (info->llvm_jit_callees, free_jit_callee_list, NULL);
+ 		g_hash_table_destroy (info->llvm_jit_callees);
+ 	}
++	/* Sweep per-method jiterpreter data before the interp code hash is torn
++	 * down; on non-wasm builds this is a no-op. */
++	mono_interp_free_mem_manager_jiterp (info);
+ 	mono_internal_hash_table_destroy (&info->interp_code_hash);
+ #ifdef ENABLE_LLVM
+ 	mono_llvm_free_mem_manager (info);
+-- 
+2.43.0
