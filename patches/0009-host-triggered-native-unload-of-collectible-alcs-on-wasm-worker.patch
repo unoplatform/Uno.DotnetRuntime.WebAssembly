@@ -256,13 +256,15 @@ diff --git a/src/mono/mono/mini/mini-runtime.c b/src/mono/mono/mini/mini-runtime
 index 7cf6384..2b0b2cd 100644
 --- a/src/mono/mono/mini/mini-runtime.c
 +++ b/src/mono/mono/mini/mini-runtime.c
-@@ -4458,6 +4458,9 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
+@@ -4458,6 +4458,11 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
  		g_hash_table_foreach (info->llvm_jit_callees, free_jit_callee_list, NULL);
  		g_hash_table_destroy (info->llvm_jit_callees);
  	}
-+	/* Sweep per-method jiterpreter data before the interp code hash is torn
-+	 * down; on non-wasm builds this is a no-op. */
++	/* Sweep per-method jiterpreter data before the interp code hash is torn down.
++	 * Browser-only: the sweep symbol is not linked into the AOT cross compiler. */
++#if HOST_BROWSER
 +	mono_interp_free_mem_manager_jiterp (info);
++#endif
  	mono_internal_hash_table_destroy (&info->interp_code_hash);
  #ifdef ENABLE_LLVM
  	mono_llvm_free_mem_manager (info);
