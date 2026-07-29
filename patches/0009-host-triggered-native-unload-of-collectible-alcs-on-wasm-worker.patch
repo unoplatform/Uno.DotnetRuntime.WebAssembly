@@ -48,20 +48,20 @@ individual ALCs stay non-collectible, InternalForceNativeUnload
 early-returns on !collectible, and the memory manager free keeps its
 poisoning path for validation runs.
 ---
- .../Runtime/Loader/AssemblyLoadContext.Mono.cs     |  6 ++
+ .../Runtime/Loader/AssemblyLoadContext.Mono.cs     | 16 +++
  src/mono/mono/metadata/assembly-load-context.c     | 71 ++++++++++++++++++----
  src/mono/mono/metadata/icall-def.h                 |  1 +
  src/mono/mono/metadata/memory-manager.c            |  1 +
  src/mono/mono/mini/interp/interp.c                 | 25 ++++++++
  src/mono/mono/mini/interp/interp.h                 |  3 +
  src/mono/mono/mini/mini-runtime.c                  |  3 +
- 7 files changed, 98 insertions(+), 12 deletions(-)
+ 7 files changed, 108 insertions(+), 12 deletions(-)
 
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 index 57db653..2057ce2 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -41,6 +41,12 @@ namespace System.Runtime.Loader
+@@ -41,6 +41,22 @@ namespace System.Runtime.Loader
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
          private static extern void PrepareForAssemblyLoadContextRelease(IntPtr nativeAssemblyLoadContext, IntPtr assemblyLoadContextStrong);
  
@@ -69,7 +69,17 @@ index 57db653..2057ce2 100644
 +        private static extern void InternalForceNativeUnload(IntPtr nativeAssemblyLoadContext);
 +
 +        // Invoked by a downstream host once it has proven the collectible ALC is managed-quiescent.
-+        internal void ForceNativeUnload() => InternalForceNativeUnload(_nativeAssemblyLoadContext);
++        // Idempotent: the native handle is atomically exchanged to zero so a second call (or a call
++        // after the ALC was already freed by another path) becomes a no-op instead of a native
++        // double-free/use-after-free. The native icall additionally guards a null/default ALC.
++        internal void ForceNativeUnload()
++        {
++            IntPtr handle = System.Threading.Interlocked.Exchange(ref _nativeAssemblyLoadContext, IntPtr.Zero);
++            if (handle != IntPtr.Zero)
++            {
++                InternalForceNativeUnload(handle);
++            }
++        }
 +
          [RequiresUnreferencedCode("Types and members the loaded assembly depends on might be removed")]
          [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
