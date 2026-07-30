@@ -1,52 +1,53 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
 Date: Mon, 06 Jul 2026 00:00:00 +0000
-Subject: [PATCH] fix: rehash MonoWeakHashTable on a single-threaded no-safepoints runtime
+Subject: [PATCH] fix: rehash MonoWeakHashTable on a no-safepoints runtime
 
-The MonoWeakHashTable rehash path was gated behind g_assert_not_reached for
-the configuration where thread safepoints are disabled
-(mono_threads_are_safepoints_enabled() == FALSE), with an untested
-mono_gc_invoke_with_gc_lock fallback that never ran. On a single-threaded
-runtime with safepoints disabled - e.g. a browser-wasm worker - this is the
-branch taken, so the first time a weak table needs to grow the runtime aborts.
+The MonoWeakHashTable rehash path aborted (g_assert_not_reached) for the
+configuration where thread safepoints are disabled
+(mono_threads_are_safepoints_enabled() == FALSE), leaving an untested
+mono_gc_invoke_with_gc_lock fallback that never ran. On a browser-wasm
+worker this is the branch taken, so the first time a weak table needs to
+grow the runtime aborts.
 
-This surfaces once collectible AssemblyLoadContexts are enabled: they populate
-the collectible weak bookkeeping, and the first reflection over such an ALC's
-modules inserts enough entries to cross the load factor and trigger a rehash.
+This surfaces once collectible AssemblyLoadContexts are enabled: they
+populate the collectible weak bookkeeping, and the first reflection over
+such an ALC's modules inserts enough entries to cross the load factor and
+trigger a rehash.
 
-do_rehash performs no managed allocation - it only fills the already-allocated
-replacement arrays - so no GC can run inside it and there is nothing to preempt
-it on a single-threaded runtime. Call it directly in that configuration,
-matching the safepoints-enabled branch.
+Fix conservatively: remove only the abort and keep the GC-lock fallback,
+exactly matching the sibling MonoGHashTable rehash (mono-hash.c) on the
+same no-safepoints branch. No-safepoints does not by itself prove
+single-threaded execution, and do_rehash publishes table_size and the
+replacement holder arrays, so the GC lock is retained to prevent an
+asynchronous GC from observing a partial rehash. A direct fast path can
+be added later behind an actual single-thread proof if profiling ever
+justifies it.
 
 ---
- src/mono/mono/metadata/weak-hash.c | 17 +++++++++++------
- 1 file changed, 9 insertions(+), 8 deletions(-)
+ src/mono/mono/metadata/weak-hash.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
 --- a/src/mono/mono/metadata/weak-hash.c
 +++ b/src/mono/mono/metadata/weak-hash.c
-@@ -255,14 +255,15 @@
+@@ -255,11 +255,17 @@
  		data.values = g_new0 (MonoObject*, data.new_size);
  	}
  
--	if (!mono_threads_are_safepoints_enabled ()) {
+ 	if (!mono_threads_are_safepoints_enabled ()) {
 -		// FIXME: Does this work ?
 -		g_assert_not_reached ();
--		mono_gc_invoke_with_gc_lock (do_rehash, &data);
--	} else {
--		/* We cannot be preempted */
--		do_rehash (&data);
--	}
-+	/*
-+	 * do_rehash performs no managed allocation (it only fills the already-allocated
-+	 * replacement arrays via find-slot + array set/get), so no GC can run inside it and
-+	 * there is nothing to preempt it on a single-threaded runtime with safepoints disabled
-+	 * (e.g. browser-wasm). The former no-safepoints branch here was an unreachable
-+	 * g_assert_not_reached, which aborted the runtime the first time a collectible
-+	 * AssemblyLoadContext grew this weak table on such a runtime.
-+	 */
-+	do_rehash (&data);
- 
- 	if (!(hash->gc_type & MONO_HASH_KEY_GC))
- 		g_free (old_keys);
++		/*
++		 * Take the GC lock so an asynchronous GC cannot observe a partially-published
++		 * rehash (table_size and the replacement holder arrays), matching the sibling
++		 * MonoGHashTable rehash (mono-hash.c) on this same no-safepoints branch. The
++		 * previous g_assert_not_reached aborted the runtime the first time a collectible
++		 * AssemblyLoadContext grew this weak table (e.g. reflection over its modules) on
++		 * a no-safepoints configuration such as a single-threaded browser-wasm worker.
++		 */
+ 		mono_gc_invoke_with_gc_lock (do_rehash, &data);
+ 	} else {
+ 		/* We cannot be preempted */
+ 		do_rehash (&data);
+ 	}
