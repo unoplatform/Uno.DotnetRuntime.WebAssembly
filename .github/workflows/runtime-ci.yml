@@ -465,8 +465,17 @@ jobs:
       run: |
         set -e
         cd runtime
+        # InstallV8ForTests provisions the PINNED V8 (wasm-provisioning.targets, stamp-guarded)
+        # for this single suite — deterministic, no cross-project race.
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
-          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true
+        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
+        # Executed-test sentinel: a vacuous run (0 executed) must fail, not pass silently.
+        total=$(grep -oE 'total="[0-9]+"' "$results" | head -1 | grep -oE '[0-9]+')
+        echo "flag OFF: total=$total"
+        test "${total:-0}" -ge 10
 
     - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
       run: |
@@ -474,14 +483,21 @@ jobs:
         cd runtime
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1"
+        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
+        total=$(grep -oE 'total="[0-9]+"' "$results" | head -1 | grep -oE '[0-9]+')
+        echo "flag ON: total=$total"
+        test "${total:-0}" -ge 10
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
       with:
         name: loader-wasm-test-logs
         path: |
-          runtime/artifacts/bin/**/testResults.xml
+          loader-results-flag-off.xml
+          loader-results-flag-on.xml
           runtime/artifacts/log/**
 
   package_job:
