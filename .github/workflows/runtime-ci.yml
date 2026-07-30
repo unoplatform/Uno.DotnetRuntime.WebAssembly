@@ -450,19 +450,16 @@ jobs:
         wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
         sudo tar --strip-components=1 -xz -C /usr/local
 
-    - name: Install V8 (jsvu)
-      run: |
-        set -e
-        npm install -g jsvu
-        jsvu --os=linux64 --engines=v8
-        echo "$HOME/.jsvu/bin" >> $GITHUB_PATH
-
-    - name: Build libraries + test host (browser-wasm)
+    - name: Build runtime + libraries (browser-wasm)
       run: |
         set -e
         cd runtime
-        ./build.sh mono+libs -os browser -c Release $ADDITIONAL_BUILD_ARGS
-        ./build.sh libs.tests -test -os browser -c Release
+        # V8 is auto-provisioned by the per-suite test build below
+        # (eng/testing/wasm-provisioning.targets). We deliberately do NOT run the whole
+        # `build.sh libs.tests` tree: that builds 700+ test projects which race to provision the
+        # same shared V8 zip in parallel ("file is being used by another process"). Building only
+        # the single Loader test suite via `/t:Test` provisions V8 exactly once, no race.
+        ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS
 
     - name: Run System.Runtime.Loader tests (flag OFF — default ALC regression)
       run: |
