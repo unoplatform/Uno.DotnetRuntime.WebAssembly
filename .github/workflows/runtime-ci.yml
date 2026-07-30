@@ -381,6 +381,112 @@ jobs:
         name: wasm-sdk-${{ matrix.MONO_WASM_THREADS }}
         path: ci-artifacts
 
+  # Non-blocking validation of the ALC-unload patches (0009 host-triggered native unload,
+  # 0010 weak-hash rehash). Builds the libraries + their test host for browser-wasm against the
+  # patched runtime and runs System.Runtime.Loader.Tests under V8 in two modes:
+  #   * default (flag off) — the general (non-collectible) AssemblyLoadContext surface must be
+  #     unregressed: the "does not break anything" guard. (The upstream collectible-unload tests are
+  #     [ActiveIssue dotnet/runtime#34072, TestRuntimes.Mono] and RemoteExecutor-based, so they
+  #     self-skip on wasm; the collectible reclaim path is exercised in-process by the downstream
+  #     consumer's runtime tests.)
+  #   * MONO_WASM_ENABLE_ALC_UNLOAD=1 — the same surface must stay green with the flag enabled.
+  # continue-on-error while the harness stabilizes; intentionally NOT in the sign/publish chain.
+  test_loader_wasm:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    container: 'mcr.microsoft.com/dotnet/sdk:10.0-noble'
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        set -e
+        apt-get update
+        apt-get install -y sudo
+        sudo apt-get install -y python3-pip locales p7zip-full zip nodejs npm
+        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
+          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+        sudo locale-gen en_US.UTF-8
+
+    - name: Install LLVM
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
+
+    - name: Clone dotnet/runtime
+      run: git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Install cmake
+      run: |
+        set -e
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
+        sudo tar --strip-components=1 -xz -C /usr/local
+
+    - name: Install V8 (jsvu)
+      run: |
+        set -e
+        npm install -g jsvu
+        jsvu --os=linux64 --engines=v8
+        echo "$HOME/.jsvu/bin" >> $GITHUB_PATH
+
+    - name: Build libraries + test host (browser-wasm)
+      run: |
+        set -e
+        cd runtime
+        ./build.sh mono+libs -os browser -c Release $ADDITIONAL_BUILD_ARGS
+        ./build.sh libs.tests -test -os browser -c Release
+
+    - name: Run System.Runtime.Loader tests (flag OFF — default ALC regression)
+      run: |
+        set -e
+        cd runtime
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release
+
+    - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
+      run: |
+        set -e
+        cd runtime
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1"
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: loader-wasm-test-logs
+        path: |
+          runtime/artifacts/bin/**/testResults.xml
+          runtime/artifacts/log/**
+
   package_job:
     # AOT cross jobs must produce their nupkgs before this job runs, because
     # the main override pack now has direct PackageReference dependencies on
