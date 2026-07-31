@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Thu, 31 Jul 2026 00:00:00 +0000
+Subject: [PATCH] test: in-process lifecycle tests for host-triggered native ALC unload
+
+Adds ForcedNativeUnloadTests to System.Runtime.Loader.Tests, exercising the
+opt-in native unload protocol in-process (no RemoteExecutor, so they run on
+browser-wasm where the upstream collectible tests self-skip):
+
+  * repeated collectible load -> cross-ALC generic instantiation (creates a
+    shared {default, collectible} generic memory manager, exercising the
+    scout-protocol detach in mono_alc_cleanup) -> reflection over the loaded
+    assembly (grows the collectible weak hashes, exercising the rehash fix)
+    -> managed Unload -> ForceNativeUnload invoked twice (idempotence);
+  * two collectible siblings sharing a generic instantiation: forcing one
+    down must leave the sibling fully usable (instantiation, generics,
+    reflection) before it is unloaded too;
+  * with MONO_WASM_ENABLE_ALC_UNLOAD set, the forced-down ALC objects must
+    become unreachable (WeakReference dies under GC).
+
+The tests run in BOTH env modes: with the flag unset they validate that the
+bridge is a safe no-op (native guards reject non-terminal/non-collectible
+state); with the flag set they validate the full teardown protocol. On
+runtimes without the opt-in patch (no ForceNativeUnload member) they no-op.
+
+---
+ .../System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs | 176 +++
+ src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj | 1 +
+ 2 files changed, 177 insertions(+)
+
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+new file mode 100644
+index 0000000..2b6a9f1
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -0,0 +1,176 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using Xunit;
++
++namespace System.Runtime.Loader.Tests
++{
++    /// <summary>
++    /// In-process lifecycle tests for the host-triggered native unload of collectible
++    /// AssemblyLoadContexts (opt-in via MONO_WASM_ENABLE_ALC_UNLOAD). They are written to run in
++    /// BOTH env modes: with the flag unset, ForceNativeUnload must be a safe no-op (the native
++    /// guards reject non-collectible / non-terminal state); with the flag set, the full
++    /// managed-Unload -> forced-native-teardown protocol must not crash, must be idempotent,
++    /// must keep sibling collectible contexts usable, and must let the managed ALC object die.
++    /// On runtimes without the opt-in patch (no ForceNativeUnload member) the tests no-op.
++    /// </summary>
++    [Collection(nameof(DisableParallelization))]
++    public class ForcedNativeUnloadTests
++    {
++        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
++        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
++
++        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
++            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
++
++        private static bool FlagEnabled
++        {
++            get
++            {
++                string value = Environment.GetEnvironmentVariable("MONO_WASM_ENABLE_ALC_UNLOAD");
++                return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
++            }
++        }
++
++        [Fact]
++        public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
++        {
++            if (s_forceNativeUnload == null)
++            {
++                // Runtime without the opt-in native-unload patch — nothing to exercise.
++                return;
++            }
++
++            const int Cycles = 5;
++            var refs = new WeakReference[Cycles];
++            for (int i = 0; i < Cycles; i++)
++            {
++                refs[i] = LoadExerciseUnloadAndForce();
++            }
++
++            if (FlagEnabled)
++            {
++                // The forced-down contexts must be reclaimable: the native teardown released the
++                // runtime's strong handle, so nothing pins the managed ALC objects any more.
++                CollectAndAssertDead(refs);
++            }
++        }
++
++        [Fact]
++        public void ForcedUnload_LeavesSiblingCollectibleContextUsable()
++        {
++            if (s_forceNativeUnload == null)
++            {
++                return;
++            }
++
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            // A generic instantiation whose arguments span BOTH collectible contexts creates a
++            // shared generic memory manager owned by {A, B} (+ the default context of the open
++            // generic). Forcing A down deletes that manager via the owner-detachment protocol;
++            // B must remain fully usable afterwards.
++            object crossPair = Activator.CreateInstance(
++                typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB));
++            Assert.NotNull(crossPair);
++
++            contextA.Unload();
++            s_forceNativeUnload.Invoke(contextA, null);
++
++            // Sibling usability: instantiation, fresh generic instantiation and reflection must
++            // all still work after A's forced teardown (no dangling shared-manager state).
++            object instanceB = Activator.CreateInstance(typeB);
++            Assert.NotNull(instanceB);
++            object listB = Activator.CreateInstance(typeof(List<>).MakeGenericType(typeB));
++            Assert.NotNull(listB);
++            Assert.NotEmpty(asmB.GetTypes());
++
++            contextB.Unload();
++            s_forceNativeUnload.Invoke(contextB, null);
++        }
++
++        [Fact]
++        public void ForceNativeUnload_WithoutManagedUnload_IsRejected()
++        {
++            if (s_forceNativeUnload == null)
++            {
++                return;
++            }
++
++            // Forced teardown is a terminal transition: without a prior managed Unload the native
++            // icall must reject the request (alc->unloading is false), leaving the context alive
++            // and fully usable regardless of the env flag.
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++
++            s_forceNativeUnload.Invoke(context, null);
++
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotNull(Activator.CreateInstance(type));
++
++            context.Unload();
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference LoadExerciseUnloadAndForce()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++
++            // Reflection over the loaded assembly grows the collectible weak bookkeeping tables
++            // (the rehash path), and a default-ALC open generic instantiated over a collectible
++            // type argument creates a shared {default, collectible} generic memory manager (the
++            // owner-detachment path in the native cleanup).
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++            var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
++            list.Add(Activator.CreateInstance(type));
++            Assert.Equal(1, list.Count);
++
++            context.Unload();
++            s_forceNativeUnload.Invoke(context, null);
++            // Idempotence: a second forced teardown of the same context must be a no-op.
++            s_forceNativeUnload.Invoke(context, null);
++
++            return new WeakReference(context);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void CollectAndAssertDead(WeakReference[] refs)
++        {
++            for (int attempt = 0; attempt < 10; attempt++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++
++                bool anyAlive = false;
++                foreach (WeakReference weakRef in refs)
++                {
++                    anyAlive |= weakRef.IsAlive;
++                }
++
++                if (!anyAlive)
++                {
++                    return;
++                }
++            }
++
++            foreach (WeakReference weakRef in refs)
++            {
++                Assert.False(weakRef.IsAlive,
++                    "A forced-down collectible AssemblyLoadContext should be reclaimable once the native teardown released the runtime's strong handle.");
++            }
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index 39c917e..7ac01d5 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -31,6 +31,7 @@
+     <Compile Include="SatelliteAssemblies.cs" />
+     <Compile Include="LoaderLinkTest.cs" />
+     <Compile Include="AssemblyResolutionDowngradeTest.cs" />
++    <Compile Include="ForcedNativeUnloadTests.cs" />
+     <Compile Include="$(CommonTestPath)TestUtilities\System\DisableParallelization.cs" Link="Common\TestUtilities\System\DisableParallelization.cs" />
+   </ItemGroup>
+ 
