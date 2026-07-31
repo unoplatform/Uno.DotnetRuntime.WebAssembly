@@ -390,12 +390,12 @@ jobs:
   #     self-skip on wasm; the collectible reclaim path is exercised in-process by the downstream
   #     consumer's runtime tests.)
   #   * MONO_WASM_ENABLE_ALC_UNLOAD=1 — the same surface must stay green with the flag enabled.
-  # continue-on-error while the harness stabilizes; intentionally NOT in the sign/publish chain.
+  # Blocking validation gate (stabilized); intentionally NOT in the sign/publish chain.
   test_loader_wasm:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     container: 'mcr.microsoft.com/dotnet/sdk:10.0-noble'
-    continue-on-error: true
+    # Blocking gate since 2 consecutive green runs (was continue-on-error while stabilizing).
 
     steps:
     - uses: actions/checkout@v4
