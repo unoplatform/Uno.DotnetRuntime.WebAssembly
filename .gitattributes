@@ -1,2 +1,5 @@
 # Patch files must keep LF line endings to avoid "corrupt patch" errors on Windows
 *.patch text eol=lf
+
+# Shell scripts must keep LF so they run on the Linux CI containers
+*.sh text eol=lf

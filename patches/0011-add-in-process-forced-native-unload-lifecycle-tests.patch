@@ -5,35 +5,47 @@ Subject: [PATCH] test: in-process lifecycle tests for host-triggered native ALC 
 
 Adds ForcedNativeUnloadTests to System.Runtime.Loader.Tests, exercising the
 opt-in native unload protocol in-process (no RemoteExecutor, so they run on
-browser-wasm where the upstream collectible tests self-skip):
+browser-wasm where the upstream collectible tests self-skip). The bridge is
+outcome-based (ForceNativeUnload returns Completed / NotQuiescent / Rejected),
+so the tests assert the outcomes, not just "does not crash":
 
-  * repeated collectible load -> cross-ALC generic instantiation (creates a
-    shared {default, collectible} generic memory manager, exercising the
-    scout-protocol detach in mono_alc_cleanup) -> reflection over the loaded
-    assembly (grows the collectible weak hashes, exercising the rehash fix)
-    -> managed Unload -> ForceNativeUnload invoked twice (idempotence);
-  * two collectible siblings sharing a generic instantiation: forcing one
-    down must leave the sibling fully usable (instantiation, generics,
-    reflection) before it is unloaded too;
-  * with MONO_WASM_ENABLE_ALC_UNLOAD set, the forced-down ALC objects must
-    become unreachable (WeakReference dies under GC).
+  * RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible:
+    repeated collectible load -> cross-ALC generic instantiation (shared
+    {default, collectible} generic memory manager) -> reflection (grows the
+    collectible weak hashes) -> managed Unload -> force. With the flag on the
+    force must eventually Complete once the exercised state is collected (the
+    NotQuiescent retries must not be consumed) and repeats are a Completed
+    no-op; the ALC objects must then die under GC.
+  * ForcedUnload_LeavesSiblingCollectibleContextUsable: two collectible
+    siblings share a generic instantiation; forcing one down (owner-detach of
+    the shared manager) must leave the sibling fully usable.
+  * ForceNativeUnload_WithoutManagedUnload_IsRejected: a force with no prior
+    managed Unload must return Rejected and leave the context usable AND, with
+    the flag on, a later force after a proper Unload + GC must still Complete
+    (the Rejected outcome did not consume the once-only latch).
+  * ForcedUnload_OnlyCompletesOnceQuiescent: force while a loaded Type is still
+    rooted -> NotQuiescent (the ALC is NOT freed, its WeakReference stays
+    alive); drop the root, GC in a NoInlining frame, force again -> Completed
+    and the ALC WeakReference dies.
 
-The tests run in BOTH env modes: with the flag unset they validate that the
-bridge is a safe no-op (native guards reject non-terminal/non-collectible
-state); with the flag set they validate the full teardown protocol. On
-runtimes without the opt-in patch (no ForceNativeUnload member) they no-op.
+The tests run in BOTH env modes. With the flag unset, collectible ALCs are
+forced non-collectible natively, so every force is Rejected and nothing is
+reclaimed — the tests then assert only the safe no-op surface. With the flag
+set they assert the full teardown protocol. On a genuinely unpatched runtime
+(no ForceNativeUnload member) they no-op, EXCEPT when CI sets
+MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
+trim/rooting regression and fails loudly instead of silently self-skipping.
 
 ---
- .../System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs | 176 +++
- src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj | 1 +
- 2 files changed, 177 insertions(+)
-
+ src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 402 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
+2 files changed, 403 insertions(+)
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..2b6a9f1
+index 0000000..93d9595
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,402 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -48,18 +60,35 @@ index 0000000..2b6a9f1
 +{
 +    /// <summary>
 +    /// In-process lifecycle tests for the host-triggered native unload of collectible
-+    /// AssemblyLoadContexts (opt-in via MONO_WASM_ENABLE_ALC_UNLOAD). They are written to run in
-+    /// BOTH env modes: with the flag unset, ForceNativeUnload must be a safe no-op (the native
-+    /// guards reject non-collectible / non-terminal state); with the flag set, the full
-+    /// managed-Unload -> forced-native-teardown protocol must not crash, must be idempotent,
-+    /// must keep sibling collectible contexts usable, and must let the managed ALC object die.
-+    /// On runtimes without the opt-in patch (no ForceNativeUnload member) the tests no-op.
++    /// AssemblyLoadContexts (opt-in via MONO_WASM_ENABLE_ALC_UNLOAD). They run in BOTH env modes.
++    ///
++    /// The native bridge is OUTCOME-BASED: AssemblyLoadContext.ForceNativeUnload returns
++    /// Completed (0) / NotQuiescent (1) / Rejected (2). The gist exercised here:
++    ///   * Rejected  — the force was refused up front (no prior managed Unload, or the ALC is
++    ///     non-collectible, which is the case for EVERY ALC when the opt-in flag is off). The
++    ///     context stays fully usable and the once-only latch is NOT consumed.
++    ///   * NotQuiescent — a managed root into the collectible ALC is still alive, so the native
++    ///     teardown declines to free (it would reclaim live memory). Nothing is freed; a retry
++    ///     after the root is collected must still be able to complete.
++    ///   * Completed — the LoaderAllocator has been collected; the ALC is freed and its runtime
++    ///     strong handle released, so the managed ALC object finally becomes collectible.
++    ///
++    /// With the flag OFF, collectible ALCs are forced non-collectible natively, so every force is
++    /// Rejected and nothing is ever reclaimed — the tests then only assert the safe no-op surface.
++    /// With the flag ON they assert the full managed-Unload -> quiescence -> forced-teardown
++    /// protocol, idempotence, sibling usability, and that the forced-down ALC objects die.
 +    /// </summary>
 +    [Collection(nameof(DisableParallelization))]
 +    public class ForcedNativeUnloadTests
 +    {
 +        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
 +        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
++
++        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult and the native
++        // ves_icall_..._InternalForceNativeUnload return codes.
++        private const int Completed = 0;
++        private const int NotQuiescent = 1;
++        private const int Rejected = 2;
 +
 +        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
 +            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -73,12 +102,70 @@ index 0000000..2b6a9f1
 +            }
 +        }
 +
++        // Set by CI (in BOTH env modes, since both run on the opt-in patched pack) to demand that
++        // the bridge member is actually present. When set, a missing member is a trim/rooting
++        // regression, not a legitimately unpatched runtime.
++        private static bool RequireBridge =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE") == "1";
++
++        // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
++        // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
++        // masking the regression.
++        private static bool BridgeMissing()
++        {
++            if (s_forceNativeUnload != null)
++            {
++                return false;
++            }
++
++            Assert.False(RequireBridge,
++                "AssemblyLoadContext.ForceNativeUnload is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
++            return true;
++        }
++
++        private static int Force(AssemblyLoadContext context)
++        {
++            // ForceNativeUnload returns the internal ForceNativeUnloadResult enum; read it as its
++            // underlying int (a boxed enum is IConvertible) since the enum type is not visible here.
++            object result = s_forceNativeUnload.Invoke(context, null);
++            return Convert.ToInt32(result);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void GcQuiesce()
++        {
++            for (int i = 0; i < 3; i++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++            }
++        }
++
++        // Retry the force across GCs. Each NotQuiescent attempt must leave the latch clear so a
++        // later attempt can still Complete — i.e. the single retry is never consumed by a premature
++        // or too-early force.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttempts)
++        {
++            int outcome = NotQuiescent;
++            for (int i = 0; i < maxAttempts; i++)
++            {
++                GcQuiesce();
++                outcome = Force(context);
++                if (outcome == Completed)
++                {
++                    break;
++                }
++            }
++
++            return outcome;
++        }
++
 +        [Fact]
 +        public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
 +        {
-+            if (s_forceNativeUnload == null)
++            if (BridgeMissing())
 +            {
-+                // Runtime without the opt-in native-unload patch — nothing to exercise.
 +                return;
 +            }
 +
@@ -91,7 +178,7 @@ index 0000000..2b6a9f1
 +
 +            if (FlagEnabled)
 +            {
-+                // The forced-down contexts must be reclaimable: the native teardown released the
++                // Every forced-down context must be reclaimable: the native teardown released the
 +                // runtime's strong handle, so nothing pins the managed ALC objects any more.
 +                CollectAndAssertDead(refs);
 +            }
@@ -100,86 +187,237 @@ index 0000000..2b6a9f1
 +        [Fact]
 +        public void ForcedUnload_LeavesSiblingCollectibleContextUsable()
 +        {
-+            if (s_forceNativeUnload == null)
++            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+
-+            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
-+            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
-+            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
-+            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
-+
-+            // A generic instantiation whose arguments span BOTH collectible contexts creates a
-+            // shared generic memory manager owned by {A, B} (+ the default context of the open
-+            // generic). Forcing A down deletes that manager via the owner-detachment protocol;
-+            // B must remain fully usable afterwards.
-+            object crossPair = Activator.CreateInstance(
-+                typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB));
-+            Assert.NotNull(crossPair);
-+
-+            contextA.Unload();
-+            s_forceNativeUnload.Invoke(contextA, null);
-+
-+            // Sibling usability: instantiation, fresh generic instantiation and reflection must
-+            // all still work after A's forced teardown (no dangling shared-manager state).
-+            object instanceB = Activator.CreateInstance(typeB);
-+            Assert.NotNull(instanceB);
-+            object listB = Activator.CreateInstance(typeof(List<>).MakeGenericType(typeB));
-+            Assert.NotNull(listB);
-+            Assert.NotEmpty(asmB.GetTypes());
-+
-+            contextB.Unload();
-+            s_forceNativeUnload.Invoke(contextB, null);
++            RunSiblingProtocol();
 +        }
 +
 +        [Fact]
 +        public void ForceNativeUnload_WithoutManagedUnload_IsRejected()
 +        {
-+            if (s_forceNativeUnload == null)
++            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            // Forced teardown is a terminal transition: without a prior managed Unload the native
-+            // icall must reject the request (alc->unloading is false), leaving the context alive
-+            // and fully usable regardless of the env flag.
-+            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            WeakReference weakRef = AssertRejectedWithoutUnloadThenComplete();
 +
-+            s_forceNativeUnload.Invoke(context, null);
++            if (FlagEnabled)
++            {
++                // The earlier Rejected force did not consume the retry: after a proper Unload() and
++                // GC the force completed, so the context object is now reclaimable.
++                CollectAndAssertDead(new[] { weakRef });
++            }
++        }
 +
-+            Type type = asm.GetType(TestClassName, throwOnError: true);
-+            Assert.NotNull(Activator.CreateInstance(type));
++        [Fact]
++        public void ForcedUnload_OnlyCompletesOnceQuiescent()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
 +
-+            context.Unload();
++            WeakReference weakRef = RunQuiescenceProtocol();
++
++            if (FlagEnabled)
++            {
++                CollectAndAssertDead(new[] { weakRef });
++            }
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static WeakReference LoadExerciseUnloadAndForce()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            var weakRef = new WeakReference(context);
++            ExerciseAndUnload(context);
 +
-+            // Reflection over the loaded assembly grows the collectible weak bookkeeping tables
-+            // (the rehash path), and a default-ALC open generic instantiated over a collectible
-+            // type argument creates a shared {default, collectible} generic memory manager (the
-+            // owner-detachment path in the native cleanup).
++            if (FlagEnabled)
++            {
++                // Eventually completes once the exercised state is collected — the earlier
++                // NotQuiescent attempts must not have consumed the retry.
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                // Idempotence: a second force after Completed is a Completed no-op, not a double free.
++                Assert.Equal(Completed, Force(context));
++            }
++            else
++            {
++                // Non-collectible when the opt-in is off: rejected and never freed, both times.
++                Assert.Equal(Rejected, Force(context));
++                Assert.Equal(Rejected, Force(context));
++            }
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseAndUnload(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
 +            Type type = asm.GetType(TestClassName, throwOnError: true);
 +            Assert.NotEmpty(asm.GetTypes());
++
++            // A default-ALC open generic instantiated over a collectible type argument creates a
++            // shared {default, collectible} generic memory manager (the owner-detach path in the
++            // native cleanup); reflection over the assembly grows the collectible weak bookkeeping
++            // tables (the rehash path, patch 0010). All locals are confined to this frame so the
++            // context can become quiescent once it returns.
 +            var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
 +            list.Add(Activator.CreateInstance(type));
 +            Assert.Equal(1, list.Count);
 +
 +            context.Unload();
-+            s_forceNativeUnload.Invoke(context, null);
-+            // Idempotence: a second forced teardown of the same context must be a no-op.
-+            s_forceNativeUnload.Invoke(context, null);
++        }
 +
-+            return new WeakReference(context);
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference AssertRejectedWithoutUnloadThenComplete()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            Type type = LoadReturningType(context);
++
++            // Forced teardown is a terminal transition: without a prior managed Unload the native
++            // icall rejects the request (alc->unloading is false), regardless of the env flag.
++            Assert.Equal(Rejected, Force(context));
++
++            // The context is still fully usable after a rejected force.
++            Assert.NotNull(Activator.CreateInstance(type));
++            GC.KeepAlive(type);
++            type = null;
++
++            context.Unload();
++
++            if (FlagEnabled)
++            {
++                // The rejected force did not latch the once-only flag, so a correct later force
++                // can still complete.
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                // Non-collectible when the opt-in is off: still rejected, never freed.
++                Assert.Equal(Rejected, Force(context));
++            }
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference RunQuiescenceProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            Type rooted = LoadUnloadReturningRootedType(context);
++
++            // GC cannot reclaim the LoaderAllocator while `rooted` references a type of this ALC.
++            GcQuiesce();
++
++            if (!FlagEnabled)
++            {
++                // Non-collectible when the opt-in is off: rejected regardless of roots.
++                Assert.Equal(Rejected, Force(context));
++                GC.KeepAlive(rooted);
++                context = null;
++                return weakRef;
++            }
++
++            // Flag on: a live managed root must block the native free.
++            Assert.Equal(NotQuiescent, Force(context));
++            Assert.True(weakRef.IsAlive, "The ALC must not be freed while a loaded type is still rooted.");
++
++            // Drop the root; only once the LoaderAllocator is collected may the teardown complete.
++            GC.KeepAlive(rooted);
++            rooted = null;
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunSiblingProtocol()
++        {
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            // A generic instantiation spanning BOTH collectible contexts creates a shared generic
++            // memory manager owned by {A, B} (+ the default ALC of the open generic). Forcing A down
++            // deletes that manager via the owner-detach protocol; B must remain fully usable. All
++            // A-side and cross refs are confined to the helper frame so A can become quiescent.
++            CreateCrossPair(contextA, contextB);
++
++            contextA.Unload();
++            if (FlagEnabled)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextA));
++            }
++
++            // Sibling usability after A's forced teardown: instantiation, a fresh generic
++            // instantiation and reflection over B must all still work (no dangling shared state).
++            Assert.NotNull(Activator.CreateInstance(typeB));
++            Assert.NotNull(Activator.CreateInstance(typeof(List<>).MakeGenericType(typeB)));
++            Assert.NotEmpty(asmB.GetTypes());
++
++            contextB.Unload();
++            if (FlagEnabled)
++            {
++                GC.KeepAlive(typeB);
++                typeB = null;
++                asmB = null;
++                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextB));
++            }
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void CreateCrossPair(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            object crossPair = Activator.CreateInstance(
++                typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB));
++            Assert.NotNull(crossPair);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static Type LoadReturningType(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++            return type;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static Type LoadUnloadReturningRootedType(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++            context.Unload();
++            return type;
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
@@ -211,12 +449,16 @@ index 0000000..2b6a9f1
 +    }
 +}
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-index 39c917e..7ac01d5 100644
+index fba550c..bbdad35 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-@@ -31,4 +31,5 @@
+@@ -31,6 +31,7 @@
      <Compile Include="SatelliteAssemblies.cs" />
      <Compile Include="LoaderLinkTest.cs" />
      <Compile Include="AssemblyResolutionDowngradeTest.cs" />
 +    <Compile Include="ForcedNativeUnloadTests.cs" />
      <Compile Include="$(CommonTestPath)TestUtilities\System\DisableParallelization.cs" Link="Common\TestUtilities\System\DisableParallelization.cs" />
+     <EmbeddedResource Include="MainStrings*.resx" />
+   </ItemGroup>
+-- 
+2.43.0

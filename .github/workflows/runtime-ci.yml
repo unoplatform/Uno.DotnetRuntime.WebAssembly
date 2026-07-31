@@ -461,6 +461,28 @@ jobs:
         # the single Loader test suite via `/t:Test` provisions V8 exactly once, no race.
         ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS
 
+    - name: Assert native-unload bridge is present in the built pack
+      run: |
+        set -e
+        cd runtime
+        # Trim/rooting regression guard: the opt-in managed bridge (patch 0009) MUST survive into
+        # the produced System.Private.CoreLib. If it were trimmed away or the patch failed to take,
+        # the in-process lifecycle tests would self-skip (missing member) and a rooting regression
+        # would read as green. Fail here, and again in-test via MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE.
+        corelib=$(find artifacts/bin -name System.Private.CoreLib.dll -path '*rowser*' | head -1)
+        if [ -z "$corelib" ]; then
+          echo "System.Private.CoreLib.dll not found under artifacts/bin"; exit 1
+        fi
+        echo "checking bridge metadata in: $corelib"
+        # Method names live as UTF-8 in the #Strings metadata heap, so a binary grep of the managed
+        # method names is a reliable presence check without a metadata reader.
+        for sym in ForceNativeUnload InternalForceNativeUnload; do
+          if ! grep -aq "$sym" "$corelib"; then
+            echo "MISSING: '$sym' metadata not found in System.Private.CoreLib — native-unload bridge was trimmed or not applied"; exit 1
+          fi
+          echo "  ok: found '$sym'"
+        done
+
     - name: Provision pinned V8 (wasm-provisioning.targets)
       run: |
         set -e
@@ -489,16 +511,15 @@ jobs:
         # default DOTNET_MODIFIABLE_ASSEMBLIES so the ApplyUpdate (hot-reload) tests self-skip —
         # they are out of this job's ALC charter and patch 0004's nested-class test fails on
         # wasm/V8 (tracked separately; this job gates the Loader/ALC surface only).
+        # MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes the lifecycle tests FAIL (not self-skip) if the
+        # ForceNativeUnload member is missing, so a trim/rooting regression cannot read as green.
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
         results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
-        # Executed-test sentinel: a vacuous run (0 executed) must fail, not pass silently.
-        total=$(grep -oE 'total="[0-9]+"' "$results" | head -1 | grep -oE '[0-9]+')
-        echo "flag OFF: total=$total"
-        test "${total:-0}" -ge 10
+        "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag OFF"
 
     - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
       run: |
@@ -507,12 +528,10 @@ jobs:
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
         results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
-        total=$(grep -oE 'total="[0-9]+"' "$results" | head -1 | grep -oE '[0-9]+')
-        echo "flag ON: total=$total"
-        test "${total:-0}" -ge 10
+        "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag ON"
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
