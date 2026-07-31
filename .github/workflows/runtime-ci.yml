@@ -461,12 +461,24 @@ jobs:
         # the single Loader test suite via `/t:Test` provisions V8 exactly once, no race.
         ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS
 
+    - name: Provision pinned V8 (wasm-provisioning.targets)
+      run: |
+        set -e
+        cd runtime
+        # Provision the PINNED V8 (stamp-guarded — deterministic, no cross-project race) in a
+        # dedicated step, because the generated run script resolves the `v8` binary from PATH:
+        # the provisioned directory must be exported to PATH before the test steps run.
+        ./dotnet.sh build src/libraries/System.Runtime.Loader/tests /t:DownloadAndInstallV8 \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true
+        v8dir=$(ls -d "$PWD"/artifacts/bin/v8-*/ | head -1)
+        echo "provisioned: $v8dir"; ls "$v8dir"
+        echo "${v8dir%/}" >> "$GITHUB_PATH"
+
     - name: Run System.Runtime.Loader tests (flag OFF — default ALC regression)
       run: |
         set -e
         cd runtime
-        # InstallV8ForTests provisions the PINNED V8 (wasm-provisioning.targets, stamp-guarded)
-        # for this single suite — deterministic, no cross-project race.
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true
