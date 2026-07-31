@@ -472,8 +472,14 @@ jobs:
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true
         v8dir=$(ls -d "$PWD"/artifacts/bin/v8-*/ | head -1)
-        echo "provisioned: $v8dir"; ls "$v8dir"
-        echo "${v8dir%/}" >> "$GITHUB_PATH"
+        v8dir="${v8dir%/}"
+        echo "provisioned: $v8dir"; ls -l "$v8dir"
+        # xharness resolves an executable literally named `v8`; provisioning may leave only d8.
+        if [ ! -x "$v8dir/v8" ]; then
+          printf '#!/bin/sh\nexec "%s/d8" "$@"\n' "$v8dir" > "$v8dir/v8"
+          chmod +x "$v8dir/v8"
+        fi
+        echo "$v8dir" >> "$GITHUB_PATH"
 
     - name: Run System.Runtime.Loader tests (flag OFF — default ALC regression)
       run: |
