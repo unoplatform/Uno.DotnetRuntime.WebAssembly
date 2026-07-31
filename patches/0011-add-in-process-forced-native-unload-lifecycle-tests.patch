@@ -214,11 +214,9 @@ diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tes
 index 39c917e..7ac01d5 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-@@ -31,6 +31,7 @@
+@@ -31,4 +31,5 @@
      <Compile Include="SatelliteAssemblies.cs" />
      <Compile Include="LoaderLinkTest.cs" />
      <Compile Include="AssemblyResolutionDowngradeTest.cs" />
 +    <Compile Include="ForcedNativeUnloadTests.cs" />
      <Compile Include="$(CommonTestPath)TestUtilities\System\DisableParallelization.cs" Link="Common\TestUtilities\System\DisableParallelization.cs" />
-   </ItemGroup>
- 
