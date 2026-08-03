@@ -521,7 +521,9 @@ jobs:
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
         results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
-        "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag OFF"
+        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
+        # file mode — a newly-added .sh may land without the executable bit on checkout.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag OFF"
 
     - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
       run: |
@@ -533,7 +535,9 @@ jobs:
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
         results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
-        "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag ON"
+        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
+        # file mode — a newly-added .sh may land without the executable bit on checkout.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag ON"
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
