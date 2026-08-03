@@ -54,6 +54,17 @@ Default behaviour is unchanged for every other consumer.
     bounded-memory goal on WASM.
   * mono_mem_manager_start_unload: null loader_allocator_handle after
     freeing it, closing a double-free against mono_alc_cleanup.
+  * mono_alc_cleanup weak-handle release (review): the quiescence gate
+    reads mm->loader_allocator_weak_handle (mono_gchandle_get_target_internal)
+    but nothing in the base ever frees that weak GCHandle -- start_unload
+    only drops the strong handle and memory_manager_delete never touches
+    either -- so every reclaimed manager leaked a weak GCHandle slot. The
+    real-free path now frees it (loader_allocator_weak_handle = NULL) for
+    both the primary manager and each shared-generic manager in the
+    owner-detach loop, before mono_mem_manager_free. memory_manager_delete
+    does not touch the field, so this is not a double-free; the disabled
+    LoaderAllocatorScout_Destroy returns FALSE up front and never
+    dereferences the freed manager, so there is no scout use-after-free.
   * New host-invoked icall InternalForceNativeUnload: once the host has
     proven managed quiescence it tears down the ALC natively. It is now
     OUTCOME-BASED, returning int (0=Completed, 1=NotQuiescent,
@@ -93,15 +104,15 @@ individual ALCs stay non-collectible, InternalForceNativeUnload returns
 Rejected on !collectible, and the memory manager free keeps its
 poisoning path for validation runs.
 ---
- src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs |  48 ++++++++++++++++++++++++++++++++++++++
- src/mono/mono/metadata/assembly-load-context.c                                        | 134 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs |  61 ++++++++++++++++++++++++++++++++++++++
+ src/mono/mono/metadata/assembly-load-context.c                                        | 144 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----------
  src/mono/mono/metadata/icall-def.h                                                    |   1 +
  src/mono/mono/metadata/loader-internals.h                                             |   3 +++
  src/mono/mono/metadata/memory-manager.c                                               |  22 ++++++++++++++++++
  src/mono/mono/mini/interp/interp.c                                                    |  25 ++++++++++++++++++++
  src/mono/mono/mini/interp/interp.h                                                    |   3 +++
  src/mono/mono/mini/mini-runtime.c                                                     |   5 ++++
-8 files changed, 229 insertions(+), 12 deletions(-)
+8 files changed, 252 insertions(+), 12 deletions(-)
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 index 57db653..98329d6 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
@@ -114,7 +125,7 @@ index 57db653..98329d6 100644
          private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
          {
              if (isCollectible)
-@@ -41,6 +42,53 @@ namespace System.Runtime.Loader
+@@ -41,6 +42,66 @@ namespace System.Runtime.Loader
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
          private static extern void PrepareForAssemblyLoadContextRelease(IntPtr nativeAssemblyLoadContext, IntPtr assemblyLoadContextStrong);
  
@@ -137,9 +148,13 @@ index 57db653..98329d6 100644
 +            Rejected = 2,
 +        }
 +
-+        // Set (via Interlocked) ONLY once the native teardown has actually completed, so the icall is
-+        // never re-entered against a freed ALC. A NotQuiescent/Rejected outcome intentionally leaves
-+        // this clear so a correct later call can still succeed (the retry is not consumed).
++        // Tri-state native-unload claim, updated via Interlocked (0 = idle, 1 = in-flight,
++        // 2 = completed). A caller claims the transition (0 -> 1) before invoking the icall so at
++        // most one caller is ever inside the native teardown for a given ALC; otherwise two callers
++        // could both free the same readonly native pointer (a mono_alc_free use-after-free). On
++        // Completed the claim latches at 2 (terminal — the native ALC is freed); on
++        // NotQuiescent/Rejected it is released back to 0 so a correct later call can re-enter. A
++        // concurrent caller that observes 1 backs off with NotQuiescent and never re-enters.
 +        private int _nativeUnloadForced;
 +
 +        // Invoked by a downstream host once it has proven the collectible ALC is managed-quiescent.
@@ -149,19 +164,28 @@ index 57db653..98329d6 100644
 +        // state (Rejected) and proves GC quiescence via the LoaderAllocator weak handle (NotQuiescent).
 +        internal ForceNativeUnloadResult ForceNativeUnload()
 +        {
-+            // A prior call already completed the teardown; the native ALC is gone. Do not re-enter
-+            // the icall (that would be a use-after-free) — report the terminal Completed outcome.
-+            if (System.Threading.Interlocked.CompareExchange(ref _nativeUnloadForced, 0, 0) != 0)
++            // Claim the transition before touching the native ALC: 0 (idle) -> 1 (in-flight). Only
++            // the winner of this claim may enter InternalForceNativeUnload for a given ALC — two
++            // callers must never free the same readonly native pointer (use-after-free).
++            int prior = System.Threading.Interlocked.CompareExchange(ref _nativeUnloadForced, 1, 0);
++            if (prior == 2)
 +            {
-+                return ForceNativeUnloadResult.Completed;
++                return ForceNativeUnloadResult.Completed; // already torn down
 +            }
 +
++            if (prior == 1)
++            {
++                // Another caller owns the in-flight attempt; do NOT call the icall again. Report
++                // NotQuiescent so the host retries later rather than assuming completion.
++                return ForceNativeUnloadResult.NotQuiescent;
++            }
++
++            // prior == 0: we won the claim and are the only caller in the icall.
 +            ForceNativeUnloadResult result = (ForceNativeUnloadResult)InternalForceNativeUnload(_nativeAssemblyLoadContext);
-+            if (result == ForceNativeUnloadResult.Completed)
-+            {
-+                System.Threading.Interlocked.Exchange(ref _nativeUnloadForced, 1);
-+            }
 +
++            // Completed is terminal (stays claimed at 2); NotQuiescent/Rejected release the claim so
++            // a legitimate later attempt can re-enter.
++            System.Threading.Interlocked.Exchange(ref _nativeUnloadForced, result == ForceNativeUnloadResult.Completed ? 2 : 0);
 +            return result;
 +        }
 +
@@ -213,7 +237,7 @@ index dec9f96..655d5fb 100644
  
  	mono_loaded_images_init (li, alc);
  	alc->loaded_images = li;
-@@ -187,17 +203,60 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
+@@ -187,17 +203,70 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
  	mono_gchandle_free_internal (alc->memory_manager->loader_allocator_handle);
  	alc->memory_manager->loader_allocator_handle = NULL;
  
@@ -225,6 +249,12 @@ index dec9f96..655d5fb 100644
 +	 * gate on mono_alc_init for use-after-free validation runs.
 +	 */
 +	MonoMemoryManager *primary_mm = alc->memory_manager;
++	/* Release the LoaderAllocator weak GCHandle before freeing: the quiescence gate reads it
++	 * (mono_gchandle_get_target_internal) but nothing in the base ever frees it — only the
++	 * strong handle is released (start_unload) — so a real free would leak one GCHandle slot
++	 * per reclaimed manager. memory_manager_delete never touches it, so this is not a double-free. */
++	mono_gchandle_free_internal (primary_mm->loader_allocator_weak_handle);
++	primary_mm->loader_allocator_weak_handle = NULL;
 +	mono_mem_manager_free (primary_mm, FALSE);
  	alc->memory_manager = NULL;
  
@@ -273,6 +303,10 @@ index dec9f96..655d5fb 100644
 +				g_ptr_array_remove (owner->generic_memory_managers, mm);
 +				mono_alc_memory_managers_unlock (owner);
 +			}
++			/* Release the shared manager's LoaderAllocator weak GCHandle before freeing it,
++			 * same rationale as the primary manager above (never freed elsewhere; no double-free). */
++			mono_gchandle_free_internal (mm->loader_allocator_weak_handle);
++			mm->loader_allocator_weak_handle = NULL;
 +			mono_mem_manager_free (mm, FALSE);
 +		}
 +		mono_loader_unlock ();

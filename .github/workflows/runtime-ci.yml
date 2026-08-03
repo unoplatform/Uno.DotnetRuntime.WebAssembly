@@ -390,7 +390,9 @@ jobs:
   #     self-skip on wasm; the collectible reclaim path is exercised in-process by the downstream
   #     consumer's runtime tests.)
   #   * MONO_WASM_ENABLE_ALC_UNLOAD=1 — the same surface must stay green with the flag enabled.
-  # Blocking validation gate (stabilized); intentionally NOT in the sign/publish chain.
+  # Blocking validation gate (stabilized). package_job (and transitively sign/publish, which
+  # need package_job) gate on this: packaging must not proceed unless the ALC lifecycle
+  # validation passed. This adds the libs+test wall-clock to the publish critical path by design.
   test_loader_wasm:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
@@ -549,7 +551,7 @@ jobs:
     # restore inside `dotnet pack` would otherwise hit nuget.org and fail
     # with NU1101/NU1103 since these aren't published yet for the current
     # SemVer2.
-    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job]
+    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job, test_loader_wasm]
     runs-on: ubuntu-latest
 
     steps:
