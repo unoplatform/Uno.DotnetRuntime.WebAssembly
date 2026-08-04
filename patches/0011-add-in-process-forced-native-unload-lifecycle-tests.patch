@@ -60,9 +60,13 @@ so the tests assert the outcomes, not just "does not crash":
     new GetScoutRetirementStats diagnostics bridge that each forced cycle
     strictly increases the terminal scout-destroy count and that the native
     retired-set drains back to zero once finalizers run (counter-based,
-    bounded GC/WaitForPendingFinalizers retries, no timing); with the flag
-    off the registry must not move, and on a threads-enabled runtime the
-    stats must consistently report unavailable (-1).
+    bounded retries; each pass collects and then awaits a JS event-loop
+    turn, because the single-threaded browser runtime has no finalizer
+    thread -- LAZY_GC_THREAD_CREATION makes WaitForPendingFinalizers an
+    immediate no-op and finalizers only run as a scheduled background job
+    on the event loop); with the flag off the registry must not move, and
+    on a threads-enabled runtime the stats must consistently report
+    unavailable (-1).
 
 The tests run in BOTH env modes and on BOTH runtime flavours. The protocol
 assertions key on the flag AND !PlatformDetection.IsThreadingSupported: with
@@ -78,15 +82,15 @@ MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
 trim/rooting regression and fails loudly instead of silently self-skipping.
 
 ---
- src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 687 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 699 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
- 2 files changed, 688 insertions(+)
+ 2 files changed, 700 insertions(+)
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..d76f6c7
+index 0000000..d8340df
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,687 @@
+@@ -0,0 +1,699 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -95,6 +99,7 @@ index 0000000..d76f6c7
 +using System.Collections.Generic;
 +using System.Reflection;
 +using System.Runtime.CompilerServices;
++using System.Threading.Tasks;
 +using Xunit;
 +
 +namespace System.Runtime.Loader.Tests
@@ -357,8 +362,10 @@ index 0000000..d76f6c7
 +        // population plateaus: each forced cycle terminally retires at least one scout (the primary
 +        // manager's LoaderAllocator is materialised eagerly, so every opted-in ALC has one) and the
 +        // retired-set drains back to zero once finalizers run — deterministic counters, no timing.
++        // Async on purpose: on single-threaded wasm finalizers never run synchronously inside a
++        // test method (see DrainRetiredScoutsAsync), so the drain must yield to the JS event loop.
 +        [Fact]
-+        public void ForcedUnload_ScoutFinalizerPopulation_Plateaus()
++        public async Task ForcedUnload_ScoutFinalizerPopulation_Plateaus()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -394,7 +401,7 @@ index 0000000..d76f6c7
 +            for (int i = 0; i < Cycles; i++)
 +            {
 +                LoadExerciseUnloadAndForce();
-+                DrainRetiredScouts();
++                await DrainRetiredScoutsAsync();
 +
 +                int terminalNow = ScoutStats(TerminalDestroyCount);
 +                Assert.True(terminalNow > previousTerminal,
@@ -421,13 +428,21 @@ index 0000000..d76f6c7
 +        }
 +
 +        // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
-+        // each pass collects (re-queuing any scouts that re-registered with FALSE last pass) and
-+        // waits for finalizers, so a scout whose manager is in the registry terminally dies within
-+        // a pass or two; the bound only guards against a hypothetical runaway.
++        // each pass collects (queueing/re-queueing any scouts whose LoaderAllocator is dead,
++        // including ones that re-registered with FALSE on an earlier pass) and then lets finalizers
++        // run, so a scout whose manager is in the registry terminally dies within a pass or two;
++        // the bound only guards against a hypothetical runaway.
++        //
++        // The finalizer step MUST yield to the JS event loop: on the single-threaded browser
++        // runtime there is no finalizer thread (LAZY_GC_THREAD_CREATION), so
++        // GC.WaitForPendingFinalizers returns immediately (gc.c bails when gc_thread is NULL) and
++        // mono_gc_finalize_notify merely schedules mono_runtime_do_background_work on the JS event
++        // loop (mono_main_thread_schedule_background_job). Finalizers therefore never run inside a
++        // synchronous test method — awaiting Task.Delay turns the event loop and runs the pump.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void DrainRetiredScouts()
++        private static async Task DrainRetiredScoutsAsync()
 +        {
-+            for (int attempt = 0; attempt < 10; attempt++)
++            for (int attempt = 0; attempt < 20; attempt++)
 +            {
 +                if (ScoutStats(RetiredSetSize) == 0)
 +                {
@@ -435,7 +450,8 @@ index 0000000..d76f6c7
 +                }
 +
 +                GC.Collect();
-+                GC.WaitForPendingFinalizers();
++                GC.WaitForPendingFinalizers(); // immediate no-op on single-threaded wasm; real wait elsewhere
++                await Task.Delay(1); // turn the JS event loop so the scheduled finalizer pump runs
 +            }
 +
 +            Assert.Equal(0, ScoutStats(RetiredSetSize));
