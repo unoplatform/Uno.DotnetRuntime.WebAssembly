@@ -381,7 +381,7 @@ jobs:
         name: wasm-sdk-${{ matrix.MONO_WASM_THREADS }}
         path: ci-artifacts
 
-  # Non-blocking validation of the ALC-unload patches (0009 host-triggered native unload,
+  # Blocking validation gate for the ALC-unload patches (0009 host-triggered native unload,
   # 0010 weak-hash rehash). Builds the libraries + their test host for browser-wasm against the
   # patched runtime and runs System.Runtime.Loader.Tests under V8 in two modes:
   #   * default (flag off) — the general (non-collectible) AssemblyLoadContext surface must be
@@ -390,9 +390,9 @@ jobs:
   #     self-skip on wasm; the collectible reclaim path is exercised in-process by the downstream
   #     consumer's runtime tests.)
   #   * MONO_WASM_ENABLE_ALC_UNLOAD=1 — the same surface must stay green with the flag enabled.
-  # Blocking validation gate (stabilized). package_job (and transitively sign/publish, which
-  # need package_job) gate on this: packaging must not proceed unless the ALC lifecycle
-  # validation passed. This adds the libs+test wall-clock to the publish critical path by design.
+  # package_job (and transitively sign/publish, which need package_job) gate on this: packaging
+  # must not proceed unless the ALC lifecycle validation passed. This adds the libs+test
+  # wall-clock to the publish critical path by design.
   test_loader_wasm:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
@@ -519,7 +519,13 @@ jobs:
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
-        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
+        # Deterministic selection: pick the newest results file (multiple can exist across
+        # configurations/reruns) and fail early when none was produced.
+        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -z "$results" ]; then
+          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+          exit 1
+        fi
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
         # Invoke via `bash` (not by path) so the step is robust regardless of the script's
         # file mode — a newly-added .sh may land without the executable bit on checkout.
@@ -533,7 +539,13 @@ jobs:
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
-        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml | head -1)
+        # Deterministic selection: pick the newest results file (multiple can exist across
+        # configurations/reruns) and fail early when none was produced.
+        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -z "$results" ]; then
+          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+          exit 1
+        fi
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
         # Invoke via `bash` (not by path) so the step is robust regardless of the script's
         # file mode — a newly-added .sh may land without the executable bit on checkout.
