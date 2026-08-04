@@ -11,6 +11,10 @@ on:
     branches:
       - main
       - release/**
+      # Stacked PRs: run the full validation (incl. the test_loader_wasm gate) for PRs that
+      # target an in-flight feature branch instead of main, so stacked work is compile- and
+      # test-gated before the base PR merges.
+      - dev/**
 
 env:
   DOTNETRUNTIME_COMMIT: 742e2f077a0c7d79bf57d6dd01d571a06f3a4738

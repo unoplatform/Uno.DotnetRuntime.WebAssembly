@@ -4,7 +4,9 @@ on:
   pull_request:
     branches:
       - main
-      - release/* 
+      - release/*
+      # Stacked PRs targeting an in-flight feature branch must pass the same commit-format gate.
+      - dev/**
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

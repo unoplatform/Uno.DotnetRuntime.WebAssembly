@@ -1,0 +1,845 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Wed, 5 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat: reclaim jiterpreter WASM function-table slots on forced
+ ALC unload
+
+A downstream host loading previewed apps into collectible
+AssemblyLoadContexts reclaims their managed/native heap through the
+opt-in forced native unload (MONO_WASM_ENABLE_ALC_UNLOAD, patch 0009).
+One residual remained: compiled jiterpreter trace functions stayed
+installed in the WASM indirect function table, and the table allocator
+(mono_jiterp_allocate_table_entry) only ever advances next_index --
+slots were never released or reused (upstream scoped table-entry reuse
+out in dotnet/runtime#89980). Repeated load/unload cycles therefore
+permanently consumed trace-table capacity; on exhaustion new traces
+stopped being installed and newly-hot paths stayed on the interpreter
+(performance-only degradation, but unbounded in a long-lived worker).
+
+This change makes the existing per-method unload sweep release and
+reuse those slots. It is dark by default and hard-gated exactly like
+the feature it serves: every new native/JS behavior requires the
+MONO_WASM_ENABLE_ALC_UNLOAD opt-in AND the single-threaded browser
+build (DISABLE_THREADS) -- on a threads-enabled build uninstalling a
+table entry would race concurrent indirect calls through it, so there
+every release is refused and the allocator is byte-for-byte the
+upstream monotonic one.
+
+  * Slot ownership derives from the EXISTING sweep, not a new
+    allocation-side structure: the TypeScript runtime already records
+    each compiled trace's installed slot (traceInfo[traceIndex].fnPtr),
+    and mono_wasm_free_method_data is already invoked once per trace
+    entry point of every method being freed -- by the patch-0009
+    memory-manager sweep (mono_interp_free_mem_manager_jiterp ->
+    mono_jiterp_free_method_data) on forced unload, and by
+    interp_free_method for dynamic methods. That callback now offers
+    the recorded slot back to the runtime.
+  * New EMSCRIPTEN_KEEPALIVE mono_jiterp_free_table_entry(type, index)
+    (jiterpreter.c, crossing the boundary via cwraps like the existing
+    mono_jiterp_allocate_table_entry): validates that the index is a
+    real allocation of that table (in [first_index, last_index] and
+    below next_index -- which also rejects the TRAINING/NOT_JITTED
+    sentinels 0/1) and pushes it onto a per-table free bitset. A
+    double release is structurally impossible: the second release sees
+    the bit already set and is refused (returns 0), mirroring the
+    idempotence discipline of the 0009 free path that drives it. The
+    JS caller only uninstalls the entry when the release was accepted.
+  * Safe stub, not a dangling pointer: the accepted slot is repointed
+    at mono_jiterp_placeholder_trace -- the exact fill value
+    threads-enabled builds pre-populate trace tables with. A stale
+    indirect call through a released slot therefore returns the
+    ENTER-opcode displacement and execution continues in the
+    interpreter (the "not jitted yet" semantics the interpreter
+    already handles) instead of trapping or invoking a freed trace.
+    This is defense-in-depth: patch 0009's whole-set quiescence gate
+    already guarantees no frame of the unloaded ALC is live when the
+    sweep runs, so no live call site can reference the slot.
+  * Reuse before growth: mono_jiterp_allocate_table_entry (in its
+    DISABLE_THREADS branch only) consumes the free set before
+    advancing next_index, so steady-state load/unload cycles stop
+    consuming fresh capacity. The TS traceTableIsFull latch is cleared
+    when a release is accepted, so trace generation resumes even after
+    the table had filled up (traces already tiered to NOP/NOT_JITTED
+    stay that way; only new trace entry points benefit).
+  * Measured, deterministic lifecycle assertion: a new diagnostic
+    icall InternalGetJiterpreterTableStat (on the same internal type
+    as InternalForceNativeUnload; returns -1 whenever reclamation is
+    unavailable or not opted in, so the surface is as dark as the
+    feature) exposes per-table {fresh next_index allocations, current
+    free count, monotonic total-freed, monotonic total-reused}. New
+    JiterpreterTableReclamationTests drive repeated
+    load / hot-loop / unload / force cycles against a trace-bait
+    method added to the loader test assembly (pure int arithmetic,
+    well above the 5000 hit-count threshold; trace compilation is
+    synchronous at the threshold on the single-threaded runtime) and
+    assert (a) every cycle's forced unload increases total-freed and
+    (b) released slots are consumed by later allocations
+    (total-reused increases). The assertions intentionally use the
+    monotonic counters, NOT an exact next_index plateau: trace entry
+    points in default-ALC code (CoreLib/xunit) accumulate hit counts
+    across cycles and can compile at unpredictable moments, so a
+    plateau assertion would be flaky while the counter assertions
+    cannot be. With the flag off the tests assert the surface stays
+    dark (stats -1, force Rejected) -- the zero-change guarantee.
+
+SCOPE / still not covered: only JITERPRETER_TABLE_TRACE slots are ever
+released (the sweep only knows trace ownership). The jit-call and
+interp-entry wrapper tables are sized 1 in non-AOT browser builds and
+only populated under AOT, so they are not a leak vector for the
+interpreter-based unload scenario; their slots remain unreclaimed.
+Trace INDEXES (the trace_info segment space, MAX_TRACE_SEGMENTS *
+TRACE_SEGMENT_SIZE) also remain monotonic -- only WASM function-table
+slots are reused. Both are pre-existing bounded residuals, unchanged
+for default consumers.
+
+Fixes https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
+Refs dotnet/runtime#89980.
+---
+ .../tests/ForcedNativeUnloadTests.cs          |  15 +-
+ .../tests/JiterpreterTableReclamationTests.cs | 304 ++++++++++++++++++
+ .../TestClass.cs                              |  34 ++
+ .../tests/System.Runtime.Loader.Tests.csproj  |   1 +
+ .../Loader/AssemblyLoadContext.Mono.cs        |  16 +
+ src/mono/browser/runtime/cwraps.ts            |   3 +
+ src/mono/browser/runtime/jiterpreter.ts       |  22 +-
+ .../mono/metadata/assembly-load-context.c     |  31 ++
+ src/mono/mono/metadata/icall-def.h            |   1 +
+ src/mono/mono/mini/interp/interp.c            |  20 +-
+ src/mono/mono/mini/interp/jiterpreter.c       | 133 ++++++++
+ 11 files changed, 559 insertions(+), 21 deletions(-)
+ create mode 100644 src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
+
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+index 6eae223ba..89807864e 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -167,16 +167,11 @@ private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttem
+             return outcome;
+         }
+ 
+-        // Known residual, tracked and NOT measured here: on browser-wasm the jiterpreter's
+-        // compiled trace functions stay installed in the WASM indirect function table after a
+-        // forced unload, and table slots are never released or reused (the allocator's next_index
+-        // is monotonic), so repeated cycles consume bounded table capacity; on exhaustion new
+-        // traces stop being installed and execution stays in the interpreter (performance-only
+-        // degradation). The jiterpreter occupancy counters (mono_jiterp_get_counter) are
+-        // EMSCRIPTEN_KEEPALIVE exports consumed by the TypeScript runtime only — there is no
+-        // managed-visible counter this suite could read without inventing new API surface — so
+-        // this suite records the residual instead of measuring it. Tracked:
+-        // https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
++        // Jiterpreter WASM function-table slots (formerly a tracked residual of
++        // https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166) are now
++        // reclaimed on forced unload when the opt-in flag is set, and that behavior is measured
++        // by JiterpreterTableReclamationTests via the GetJiterpreterTableStat diagnostic bridge.
++        // This suite keeps asserting the teardown protocol only.
+         [Fact]
+         public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
+         {
+diff --git a/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
+new file mode 100644
+index 000000000..315569387
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
+@@ -0,0 +1,304 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using Xunit;
++
++namespace System.Runtime.Loader.Tests
++{
++    /// <summary>
++    /// In-process lifecycle tests for jiterpreter WASM function-table slot reclamation on
++    /// host-triggered native unload of collectible AssemblyLoadContexts (opt-in via
++    /// MONO_WASM_ENABLE_ALC_UNLOAD). They complement ForcedNativeUnloadTests: that suite proves
++    /// the managed/native heap teardown protocol, this one proves the residual it documented —
++    /// compiled jiterpreter trace functions staying installed in the WASM indirect function
++    /// table forever — is fixed: a forced unload releases the trace-table slots owned by the
++    /// dying context's methods, and the allocator reuses released slots before consuming fresh
++    /// capacity.
++    ///
++    /// Measurement goes through the diagnostic bridge AssemblyLoadContext.GetJiterpreterTableStat
++    /// (table, kind), which surfaces per-table counters from the native allocator:
++    ///   kind 0 = fresh slots handed out by advancing next_index (excludes reused slots)
++    ///   kind 1 = slots currently sitting on the free set
++    ///   kind 2 = total slots ever released (monotonic)
++    ///   kind 3 = total released slots ever reused by the allocator (monotonic)
++    /// The bridge returns -1 whenever slot reclamation is unavailable (non-browser runtime,
++    /// threads-enabled build) or the opt-in flag is absent, so the surface is as dark by default
++    /// as the feature itself — which the tests assert too.
++    ///
++    /// Determinism: the assertions deliberately avoid an exact next_index plateau. Trace entry
++    /// points in default-ALC code (CoreLib, xunit) accumulate hit counts across cycles and can
++    /// cross the compile threshold at unpredictable moments, so next_index may legitimately
++    /// creep. Instead the tests assert the two facts that cannot be timing-dependent on the
++    /// single-threaded runtime (where trace compilation is synchronous at the hit threshold):
++    ///   * every forced-unload cycle of a context that provably compiled a trace increases the
++    ///     monotonic total-freed counter (the release happened), and
++    ///   * after slots have been released, a later allocation consumes one (the monotonic
++    ///     total-reused counter moves), because the allocator always prefers the free set.
++    /// </summary>
++    [Collection(nameof(DisableParallelization))]
++    public class JiterpreterTableReclamationTests
++    {
++        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
++        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
++
++        // JITERPRETER_TABLE_TRACE in jiterpreter.h / JiterpreterTable.Trace in the TS runtime.
++        private const int TraceTable = 0;
++
++        // Stat kinds; MUST match mono_jiterp_get_table_stat in jiterpreter.c.
++        private const int StatFreshAllocated = 0;
++        private const int StatFreeCount = 1;
++        private const int StatTotalFreed = 2;
++        private const int StatTotalReused = 3;
++
++        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult.
++        private const int Completed = 0;
++        private const int Rejected = 2;
++
++        // The default jiterpreter-minimum-trace-hit-count is 5000; use a comfortable margin so
++        // the hot loop's trace entry points are guaranteed to cross the compile threshold.
++        private const int HotCalls = 12_000;
++
++        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
++            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
++
++        private static readonly MethodInfo s_getJiterpreterTableStat = typeof(AssemblyLoadContext)
++            .GetMethod("GetJiterpreterTableStat", BindingFlags.NonPublic | BindingFlags.Static);
++
++        private static bool FlagEnabled
++        {
++            get
++            {
++                string value = Environment.GetEnvironmentVariable("MONO_WASM_ENABLE_ALC_UNLOAD");
++                return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
++            }
++        }
++
++        // Set by CI to demand that the bridge members are actually present (see
++        // ForcedNativeUnloadTests.RequireBridge): a missing member is then a trim/rooting
++        // regression, not a legitimately unpatched runtime.
++        private static bool RequireBridge =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE") == "1";
++
++        private static bool BridgeMissing()
++        {
++            if (s_forceNativeUnload != null && s_getJiterpreterTableStat != null)
++            {
++                return false;
++            }
++
++            Assert.False(RequireBridge,
++                "AssemblyLoadContext.ForceNativeUnload / GetJiterpreterTableStat is missing: the bridge was trimmed away, or the patch is not applied (trim/rooting regression).");
++            return true;
++        }
++
++        private static int Force(AssemblyLoadContext context)
++        {
++            object result = s_forceNativeUnload.Invoke(context, null);
++            return Convert.ToInt32(result);
++        }
++
++        private static int Stat(int table, int kind)
++        {
++            object result = s_getJiterpreterTableStat.Invoke(null, new object[] { table, kind });
++            return Convert.ToInt32(result);
++        }
++
++        private static int TraceStat(int kind) => Stat(TraceTable, kind);
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void GcQuiesce()
++        {
++            for (int i = 0; i < 3; i++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++            }
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttempts)
++        {
++            int outcome = -1;
++            for (int i = 0; i < maxAttempts; i++)
++            {
++                GcQuiesce();
++                outcome = Force(context);
++                if (outcome == Completed)
++                {
++                    break;
++                }
++            }
++
++            return outcome;
++        }
++
++        [Fact]
++        public void JiterpreterTableStat_SurfaceMatchesOptIn()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            // Invalid table/kind values are always refused, opted in or not.
++            Assert.Equal(-1, Stat(TraceTable, 99));
++            Assert.Equal(-1, Stat(99, StatFreshAllocated));
++            Assert.Equal(-1, Stat(-1, StatFreshAllocated));
++
++            if (!FlagEnabled || PlatformDetection.IsThreadingSupported)
++            {
++                // Feature dark: without the opt-in — or on a threads-enabled runtime, where slot
++                // reclamation is compiled out just like the forced unload it serves — every stat
++                // reports unavailable and nothing about the allocator is observable.
++                Assert.Equal(-1, TraceStat(StatFreshAllocated));
++                Assert.Equal(-1, TraceStat(StatFreeCount));
++                Assert.Equal(-1, TraceStat(StatTotalFreed));
++                Assert.Equal(-1, TraceStat(StatTotalReused));
++                return;
++            }
++
++            // Opted in on the single-threaded runtime: the stats must be live and coherent.
++            int fresh = TraceStat(StatFreshAllocated);
++            int free = TraceStat(StatFreeCount);
++            int totalFreed = TraceStat(StatTotalFreed);
++            int totalReused = TraceStat(StatTotalReused);
++
++            Assert.True(fresh >= 0, $"fresh allocation count must be available with the opt-in active (got {fresh})");
++            Assert.True(free >= 0, $"free count must be available with the opt-in active (got {free})");
++            Assert.True(totalFreed >= 0, $"total-freed must be available with the opt-in active (got {totalFreed})");
++            Assert.True(totalReused >= 0, $"total-reused must be available with the opt-in active (got {totalReused})");
++
++            // Only distinct previously-allocated slots can sit on the free set, and every reuse
++            // consumed a prior release.
++            Assert.True(free <= fresh, $"slots on the free set ({free}) cannot exceed distinct slots ever handed out fresh ({fresh})");
++            Assert.True(totalReused <= totalFreed, $"reuses ({totalReused}) cannot exceed releases ({totalFreed})");
++        }
++
++        [Fact]
++        public void ForcedUnload_ReclaimsJiterpreterTraceTableSlots()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!FlagEnabled || PlatformDetection.IsThreadingSupported)
++            {
++                // Feature dark (no opt-in, or threads-enabled runtime): the hot loop still runs,
++                // the force is Rejected as in ForcedNativeUnloadTests, and no reclamation state
++                // is observable — proving default consumers see zero change from this feature.
++                RunDarkModeCycle();
++                return;
++            }
++
++            const int Cycles = 3;
++            int reusedAtStart = TraceStat(StatTotalReused);
++            var refs = new WeakReference[Cycles];
++
++            for (int i = 0; i < Cycles; i++)
++            {
++                int freedBefore = TraceStat(StatTotalFreed);
++                refs[i] = LoadRunHotLoopUnloadAndForce();
++                int freedAfter = TraceStat(StatTotalFreed);
++
++                // The hot loop provably crossed the trace compile threshold inside the
++                // collectible assembly (compilation is synchronous on this runtime), so the
++                // forced teardown must have released at least one trace-table slot. total-freed
++                // is monotonic, so no concurrent allocation can mask the release.
++                Assert.True(freedAfter > freedBefore,
++                    $"cycle {i}: the forced unload must release at least one jiterpreter trace-table slot " +
++                    $"(totalFreed before={freedBefore} after={freedAfter}, fresh={TraceStat(StatFreshAllocated)}, " +
++                    $"free={TraceStat(StatFreeCount)}, totalReused={TraceStat(StatTotalReused)}). " +
++                    "If totalFreed did not move, either no trace was compiled for the hot loop (jiterpreter disabled in this host?) " +
++                    "or the unload sweep failed to release the trace's slot.");
++            }
++
++            // Reuse: after the first cycle released slot(s), the free set was non-empty, and the
++            // allocator always prefers it — so the later cycles' guaranteed trace compilations
++            // (or any interleaved allocation) must have consumed released slots. total-reused is
++            // monotonic, making this deterministic without asserting an exact plateau.
++            int reusedAtEnd = TraceStat(StatTotalReused);
++            Assert.True(reusedAtEnd > reusedAtStart,
++                $"released trace-table slots must be reused by later allocations before fresh capacity is consumed " +
++                $"(totalReused start={reusedAtStart} end={reusedAtEnd}, fresh={TraceStat(StatFreshAllocated)}, " +
++                $"free={TraceStat(StatFreeCount)}, totalFreed={TraceStat(StatTotalFreed)}).");
++
++            // The reclamation must not have disturbed the ALC teardown itself: the forced-down
++            // contexts stay reclaimable.
++            CollectAndAssertDead(refs);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunDarkModeCycle()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            RunHotLoop(context);
++            context.Unload();
++            GcQuiesce();
++
++            Assert.Equal(Rejected, Force(context));
++            Assert.Equal(-1, TraceStat(StatFreshAllocated));
++            Assert.Equal(-1, TraceStat(StatFreeCount));
++            Assert.Equal(-1, TraceStat(StatTotalFreed));
++            Assert.Equal(-1, TraceStat(StatTotalReused));
++            GC.KeepAlive(context);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference LoadRunHotLoopUnloadAndForce()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            RunHotLoop(context);
++            context.Unload();
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            context = null;
++            return weakRef;
++        }
++
++        // Drives the collectible assembly's trace bait over the jiterpreter's hit-count
++        // threshold. All reflection state is confined to this frame so the context can become
++        // quiescent once it returns.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunHotLoop(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            MethodInfo hotLoop = type.GetMethod("JiterpreterHotLoop", BindingFlags.Public | BindingFlags.Static);
++            Assert.NotNull(hotLoop);
++
++            object result = hotLoop.Invoke(null, new object[] { HotCalls });
++            Assert.IsType<int>(result);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void CollectAndAssertDead(WeakReference[] refs)
++        {
++            for (int attempt = 0; attempt < 10; attempt++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++
++                bool anyAlive = false;
++                foreach (WeakReference weakRef in refs)
++                {
++                    anyAlive |= weakRef.IsAlive;
++                }
++
++                if (!anyAlive)
++                {
++                    return;
++                }
++            }
++
++            foreach (WeakReference weakRef in refs)
++            {
++                Assert.False(weakRef.IsAlive,
++                    "A forced-down collectible AssemblyLoadContext should stay reclaimable after jiterpreter slot reclamation.");
++            }
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+index 5cad40171..300d21636 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Runtime.CompilerServices;
+ using System.Runtime.InteropServices;
+ 
+ namespace System.Runtime.Loader.Tests
+@@ -35,6 +36,39 @@ public static void TestDelegateMarshalling()
+         public class COMClass
+         {
+         }
++
++        // Deterministic jiterpreter trace bait for the function-table slot-reclamation
++        // lifecycle tests. Called once with `calls` above the jiterpreter's trace hit-count
++        // threshold, it guarantees at least one trace entry point in THIS assembly crosses
++        // the threshold and compiles (synchronously, on the single-threaded browser runtime):
++        //   * the loop head here is a backward-branch target hit `calls` times, and
++        //   * JiterpreterHotBody's method-entry point is also hit `calls` times (the call is
++        //     NoInlining so the interpreter cannot fold it away),
++        // so a trace compiles whichever entry-point kinds the jiterpreter has enabled.
++        // The body is pure int arithmetic on locals — no calls, no allocations — so trace
++        // compilation cannot abort before reaching the minimum-trace-value heuristic.
++        public static int JiterpreterHotLoop(int calls)
++        {
++            int acc = 17;
++            for (int i = 0; i < calls; i++)
++            {
++                acc ^= JiterpreterHotBody(acc, i);
++            }
++
++            return acc;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        public static int JiterpreterHotBody(int a, int i)
++        {
++            int b = a + i, c = a ^ i, d = i + 3;
++            a += b; b ^= c; c += d; d ^= a;
++            a += i; b += a; c ^= b; d += c;
++            a ^= d; b += i; c += a; d ^= b;
++            a += c; b ^= d; c += i; d += a;
++            a ^= b; b += c; c ^= d; d += i;
++            return a + b + c + d;
++        }
+     }
+ 
+     // Used to test LoaderAllocator used for a generic type instance allocation
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index bbdad35cc..09a06f1b3 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -32,6 +32,7 @@
+     <Compile Include="LoaderLinkTest.cs" />
+     <Compile Include="AssemblyResolutionDowngradeTest.cs" />
+     <Compile Include="ForcedNativeUnloadTests.cs" />
++    <Compile Include="JiterpreterTableReclamationTests.cs" />
+     <Compile Include="$(CommonTestPath)TestUtilities\System\DisableParallelization.cs" Link="Common\TestUtilities\System\DisableParallelization.cs" />
+     <EmbeddedResource Include="MainStrings*.resx" />
+   </ItemGroup>
+diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+index cc30e0cdb..8682a1521 100644
+--- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
++++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+@@ -37,6 +37,7 @@ internal IntPtr NativeALC
+         [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
+         [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
+         [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
++        [DynamicDependency(nameof(GetJiterpreterTableStat))] // trim-root: lifecycle tests invoke this bridge via reflection
+         private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
+         {
+             if (isCollectible)
+@@ -78,6 +79,21 @@ private static void KeepLoaderAllocator()
+         // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
+         internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
+ 
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalGetJiterpreterTableStat(int table, int kind);
++
++        // Diagnostic bridge for the jiterpreter function-table slot-reclamation lifecycle tests.
++        // Mirrors mono_jiterp_get_table_stat (jiterpreter.c): `table` is a JITERPRETER_TABLE_*
++        // value (0 = traces) and `kind` selects the statistic (0 = fresh slots allocated,
++        // 1 = slots currently free, 2 = total slots ever released, 3 = total released slots ever
++        // reused). Returns -1 whenever slot reclamation is unavailable (non-browser runtime,
++        // threads-enabled build) or the MONO_WASM_ENABLE_ALC_UNLOAD opt-in is absent, so this
++        // surface is as dark by default as the feature it observes.
++        internal static int GetJiterpreterTableStat(int table, int kind)
++        {
++            return InternalGetJiterpreterTableStat(table, kind);
++        }
++
+         // Outcome of a host-triggered native ALC teardown. The values MUST stay in sync with the
+         // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
+         // in the native assembly-load-context.c.
+diff --git a/src/mono/browser/runtime/cwraps.ts b/src/mono/browser/runtime/cwraps.ts
+index e693c5223..c02fbd777 100644
+--- a/src/mono/browser/runtime/cwraps.ts
++++ b/src/mono/browser/runtime/cwraps.ts
+@@ -120,6 +120,7 @@ const fn_signatures: SigLine[] = [
+     [true, "mono_jiterp_is_special_interface", "number", ["number"]],
+     [true, "mono_jiterp_initialize_table", "void", ["number", "number", "number"]],
+     [true, "mono_jiterp_allocate_table_entry", "number", ["number"]],
++    [true, "mono_jiterp_free_table_entry", "number", ["number", "number"]],
+     [true, "mono_jiterp_get_interp_entry_func", "number", ["number"]],
+     [true, "mono_jiterp_get_counter", "number", ["number"]],
+     [true, "mono_jiterp_modify_counter", "number", ["number", "number"]],
+@@ -248,6 +249,8 @@ export interface t_Cwraps {
+     mono_jiterp_is_special_interface(klass: number): number;
+     mono_jiterp_initialize_table(type: number, firstIndex: number, lastIndex: number): void;
+     mono_jiterp_allocate_table_entry(type: number): number;
++    // returns 1 when the slot was accepted for reuse (forced ALC unload reclamation), 0 when refused
++    mono_jiterp_free_table_entry(type: number, index: number): number;
+     mono_jiterp_get_interp_entry_func(type: number): number;
+     mono_jiterp_get_counter(counter: number): number;
+     mono_jiterp_modify_counter(counter: number, delta: number): number;
+diff --git a/src/mono/browser/runtime/jiterpreter.ts b/src/mono/browser/runtime/jiterpreter.ts
+index 6ba17a3ab..5e778f857 100644
+--- a/src/mono/browser/runtime/jiterpreter.ts
++++ b/src/mono/browser/runtime/jiterpreter.ts
+@@ -1088,8 +1088,26 @@ export function mono_wasm_free_method_data (
+         mono_wasm_profiler_free_method(method);
+     }
+ 
+-    // TODO: Uninstall the trace function pointer from the function pointer table,
+-    //  so that the compiled trace module can be freed by the browser eventually
++    // Uninstall the compiled trace function from the function pointer table and recycle
++    //  its slot, so repeated assembly-load-context unload cycles do not permanently
++    //  consume table capacity (and so the engine can eventually collect the trace module).
++    // mono_jiterp_free_table_entry only accepts the release when the runtime opted into
++    //  forced ALC unload (MONO_WASM_ENABLE_ALC_UNLOAD on a single-threaded build) and the
++    //  slot is a real, not-already-released allocation, so default configurations keep
++    //  the upstream monotonic allocator behavior unchanged.
++    const info = traceInfo[traceIndex];
++    if (info && info.fnPtr) {
++        if (cwraps.mono_jiterp_free_table_entry(JiterpreterTable.Trace, info.fnPtr) > 0) {
++            // Repoint the slot at the safe placeholder (the same fill value used when the
++            //  table was created), so a stale indirect call through it bails out to the
++            //  interpreter instead of invoking a trace whose method has been freed.
++            getWasmFunctionTable().set(info.fnPtr, getRawCwrap("mono_jiterp_placeholder_trace"));
++            // Capacity is available again, so re-enable trace generation if the table had
++            //  filled up. (Traces already tiered to NOT_JITTED/nop stay that way; only
++            //  newly-created trace entry points benefit.)
++            traceTableIsFull = false;
++        }
++    }
+     // Release the trace info object, if present
+     delete traceInfo[traceIndex];
+     // Remove any AOT data and queue entries associated with the method
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index 382247fa9..206c1a653 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -617,6 +617,37 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ #endif
+ }
+ 
++#if defined(HOST_BROWSER) && defined(DISABLE_THREADS)
++/*
++ * Implemented in mini/interp/jiterpreter.c, which is only built for the browser runtime
++ * (not the AOT cross compiler), hence the HOST_BROWSER guard on the reference here —
++ * same pattern as the jiterpreter sweep call in mini-runtime.c. Declared locally
++ * instead of including the mini-internal jiterpreter.h from metadata.
++ */
++extern gint32
++mono_jiterp_get_table_stat (int table, int kind);
++#endif
++
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetJiterpreterTableStat (int table, int kind, MonoError *error)
++{
++	/*
++	 * Diagnostic bridge for the jiterpreter function-table slot-reclamation lifecycle
++	 * tests (see mono_jiterp_get_table_stat in jiterpreter.c for the table/kind values).
++	 * Returns -1 whenever the reclamation feature is unavailable: non-browser runtimes,
++	 * threads-enabled builds (the feature is compiled out there, exactly like
++	 * InternalForceNativeUnload above), or the MONO_WASM_ENABLE_ALC_UNLOAD opt-in being
++	 * absent — so this surface is as dark by default as the feature it observes.
++	 */
++#if defined(HOST_BROWSER) && defined(DISABLE_THREADS)
++	return mono_jiterp_get_table_stat (table, kind);
++#else
++	(void)table;
++	(void)kind;
++	return -1;
++#endif
++}
++
+ gpointer
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
+ {
+diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
+index 4e1a93423..e4ca6f1d6 100644
+--- a/src/mono/mono/metadata/icall-def.h
++++ b/src/mono/mono/metadata/icall-def.h
+@@ -473,6 +473,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+ ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
+ HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
+ HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, int, 1, (gpointer))
++HANDLES(ALC_9, "InternalGetJiterpreterTableStat", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetJiterpreterTableStat, int, 2, (int, int))
+ HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
+ HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
+ HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index a47d81246..4db8b85bd 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -3743,15 +3743,17 @@ free_imethod_jiterp_cb (gpointer value, gpointer user_data)
+  * methods in an unloaded ALC would otherwise leak that metadata. Must run
+  * before interp_code_hash is destroyed.
+  *
+- * Scope: this does NOT reclaim WASM function-table slots. Compiled jiterpreter
+- * trace functions stay installed in the indirect function table, and the table
+- * allocator (mono_jiterp_allocate_table_entry) only ever advances next_index —
+- * slots are never released or reused — so repeated ALC load/unload cycles
+- * consume bounded table capacity. On exhaustion new traces simply stop being
+- * installed (allocate returns 0, logging "Jiterpreter table %d is out of
+- * space") and execution of those paths stays in the interpreter; installed
+- * traces keep working. Table-slot ownership/reuse is a tracked follow-up:
+- * https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
++ * Scope: WASM function-table slots owned by compiled traces of the swept
++ * methods are also reclaimed, but only when the runtime opted into forced ALC
++ * unload (MONO_WASM_ENABLE_ALC_UNLOAD on a single-threaded build): the JS side
++ * of the per-method sweep (mono_wasm_free_method_data) repoints each trace's
++ * slot at the safe placeholder and releases it to a per-table free set that
++ * mono_jiterp_allocate_table_entry consults before advancing next_index (see
++ * mono_jiterp_free_table_entry in jiterpreter.c). Without the opt-in the
++ * upstream monotonic allocator behavior is unchanged: slots are never released
++ * or reused, and on exhaustion new traces simply stop being installed
++ * (allocate returns 0, logging "Jiterpreter table %d is out of space") while
++ * execution of those paths stays in the interpreter.
+  */
+ void
+ mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
+diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
+index 887038ca4..b323e8fcd 100644
+--- a/src/mono/mono/mini/interp/jiterpreter.c
++++ b/src/mono/mono/mini/interp/jiterpreter.c
+@@ -1476,6 +1476,46 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
+ JiterpreterTableInfo tables[JITERPRETER_TABLE_LAST + 1] = { 0 };
+ int mono_jiterp_first_trace_fn_ptr = 0;
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Function-table slot reclamation for host-triggered native unload of collectible
++ * AssemblyLoadContexts (opt-in via MONO_WASM_ENABLE_ALC_UNLOAD, see mono_alc_init in
++ * assembly-load-context.c). The upstream allocator below is monotonic: slots owned by
++ * traces of unloaded methods were never released or reused (dotnet/runtime#89980 scoped
++ * table-entry reuse out), so a long-lived worker that repeatedly loads and unloads
++ * assemblies would permanently consume table capacity.
++ *
++ * Per table we keep a bitset of released slots (bit N <=> slot first_index + N is free)
++ * plus a live free count and two monotonic diagnostic counters. The bitset makes a
++ * double release structurally impossible (the second release sees the bit already set
++ * and is refused), matching the idempotence discipline of the forced-unload path that
++ * drives it. Like that path, the whole feature is hard-gated to the single-threaded
++ * build: uninstalling a table entry races concurrent indirect calls through it on a
++ * threads-enabled runtime, so there mono_jiterp_free_table_entry refuses every release
++ * and the allocator behaves exactly as before.
++ */
++static MonoBitSet *table_free_slots [JITERPRETER_TABLE_LAST + 1] = { NULL };
++static gint32 table_free_counts [JITERPRETER_TABLE_LAST + 1] = { 0 };
++static gint32 table_total_freed [JITERPRETER_TABLE_LAST + 1] = { 0 };
++static gint32 table_total_reused [JITERPRETER_TABLE_LAST + 1] = { 0 };
++
++static gboolean
++jiterp_table_reclamation_enabled (void) {
++	/*
++	 * Mirrors the explicit MONO_WASM_ENABLE_ALC_UNLOAD opt-in in mono_alc_init
++	 * (assembly-load-context.c): only "1"/"true" enable; unset/empty/"0"/"false"
++	 * keep the feature fully dark so default consumers see zero change.
++	 */
++	static int enabled = -1;
++	if (enabled == -1) {
++		char *val = g_getenv ("MONO_WASM_ENABLE_ALC_UNLOAD");
++		enabled = (val && (!g_ascii_strcasecmp (val, "1") || !g_ascii_strcasecmp (val, "true"))) ? 1 : 0;
++		g_free (val);
++	}
++	return enabled != 0;
++}
++#endif // DISABLE_THREADS
++
+ static void
+ atomically_set_value_once (gint32 *address, gint32 value) {
+ #ifdef DISABLE_THREADS
+@@ -1530,6 +1570,17 @@ mono_jiterp_allocate_table_entry (int type) {
+ #ifdef DISABLE_THREADS
+ 	if (table->next_index == 0)
+ 		table->next_index = table->first_index;
++	// Prefer a slot released by a forced AssemblyLoadContext unload over consuming fresh
++	//  capacity. The free set is only ever populated when the reclamation opt-in is active
++	//  (mono_jiterp_free_table_entry), so default configurations never take this path.
++	if (table_free_counts [type] > 0) {
++		int free_bit = mono_bitset_find_first (table_free_slots [type], -1);
++		g_assert (free_bit >= 0);
++		mono_bitset_clear (table_free_slots [type], free_bit);
++		table_free_counts [type]--;
++		table_total_reused [type]++;
++		return table->first_index + free_bit;
++	}
+ 	int index = table->next_index++;
+ #else
+ 	gint32 expected = 0;
+@@ -1546,6 +1597,88 @@ mono_jiterp_allocate_table_entry (int type) {
+ 	return index;
+ }
+ 
++/*
++ * Release a function-table slot that belonged to a trace of a method being freed, so a
++ * later allocation can reuse it. Returns 1 when the slot was accepted onto the free set,
++ * 0 when the release was refused; the JS caller (mono_wasm_free_method_data) only
++ * repoints the table entry at the safe placeholder when the release was accepted.
++ *
++ * Refusal is the SAFE outcome and covers: threads-enabled builds (uninstalling races
++ * concurrent indirect calls, so the feature is compiled out just like the forced ALC
++ * unload it serves); the MONO_WASM_ENABLE_ALC_UNLOAD opt-in being absent (default
++ * consumers keep the upstream monotonic allocator, zero behavior change); indexes that
++ * were never handed out by mono_jiterp_allocate_table_entry (out of range or beyond
++ * next_index, which also rejects the JITERPRETER_TRAINING/NOT_JITTED sentinel values 0/1
++ * because real slots start at first_index > 1); and slots that are already on the free
++ * set (double-release guard, mirroring the idempotence discipline of the forced-unload
++ * path that drives this).
++ */
++EMSCRIPTEN_KEEPALIVE int
++mono_jiterp_free_table_entry (int type, int index) {
++#ifndef DISABLE_THREADS
++	(void)type;
++	(void)index;
++	return 0;
++#else
++	if (!jiterp_table_reclamation_enabled ())
++		return 0;
++	if ((type < 0) || (type > JITERPRETER_TABLE_LAST))
++		return 0;
++	JiterpreterTableInfo *table = &tables[type];
++	if (table->first_index <= 0)
++		return 0;
++	if ((index < table->first_index) || (index > table->last_index) || (index >= table->next_index))
++		return 0;
++	guint32 bit = index - table->first_index;
++	if (!table_free_slots [type])
++		table_free_slots [type] = mono_bitset_new (table->last_index - table->first_index + 1, 0);
++	if (mono_bitset_test (table_free_slots [type], bit))
++		return 0;
++	mono_bitset_set (table_free_slots [type], bit);
++	table_free_counts [type]++;
++	table_total_freed [type]++;
++	return 1;
++#endif
++}
++
++/*
++ * Diagnostic bridge for the slot-reclamation lifecycle tests (reached through the
++ * InternalGetJiterpreterTableStat icall in assembly-load-context.c). Returns -1 when the
++ * reclamation feature is unavailable (threads-enabled build) or not opted into, so the
++ * stats surface stays as dark as the feature itself. The kind values MUST stay in sync
++ * with the managed test consumer:
++ *   0 = fresh slots handed out by advancing next_index (excludes reused slots)
++ *   1 = slots currently sitting on the free set
++ *   2 = total slots ever released (monotonic)
++ *   3 = total released slots ever reused by the allocator (monotonic)
++ */
++gint32
++mono_jiterp_get_table_stat (int type, int kind) {
++#ifndef DISABLE_THREADS
++	(void)type;
++	(void)kind;
++	return -1;
++#else
++	if (!jiterp_table_reclamation_enabled ())
++		return -1;
++	if ((type < 0) || (type > JITERPRETER_TABLE_LAST))
++		return -1;
++	JiterpreterTableInfo *table = &tables[type];
++	switch (kind) {
++		case 0:
++			return (table->first_index > 0) ? (table->next_index - table->first_index) : 0;
++		case 1:
++			return table_free_counts [type];
++		case 2:
++			return table_total_freed [type];
++		case 3:
++			return table_total_reused [type];
++		default:
++			return -1;
++	}
++#endif
++}
++
+ int
+ mono_jiterp_increment_counter (volatile int *counter) {
+ #ifdef DISABLE_THREADS
+-- 
+2.53.0.vfs.0.0
+
