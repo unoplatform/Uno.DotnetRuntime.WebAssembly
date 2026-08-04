@@ -29,10 +29,10 @@ justifies it.
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
+index 522b431..ef10af8 100644
 --- a/src/mono/mono/metadata/weak-hash.c
 +++ b/src/mono/mono/metadata/weak-hash.c
-@@ -255,11 +255,17 @@
- 		data.values = g_new0 (MonoObject*, data.new_size);
+@@ -283,8 +283,14 @@ rehash (MonoWeakHashTable *hash)
  	}
  
  	if (!mono_threads_are_safepoints_enabled ()) {
@@ -49,5 +49,5 @@ diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-ha
  		mono_gc_invoke_with_gc_lock (do_rehash, &data);
  	} else {
  		/* We cannot be preempted */
- 		do_rehash (&data);
- 	}
+-- 
+2.43.0

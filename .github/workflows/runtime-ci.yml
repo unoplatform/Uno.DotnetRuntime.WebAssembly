@@ -515,17 +515,32 @@ jobs:
         # wasm/V8 (tracked separately; this job gates the Loader/ALC surface only).
         # MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes the lifecycle tests FAIL (not self-skip) if the
         # ForceNativeUnload member is missing, so a trim/rooting regression cannot read as green.
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
-        # Deterministic selection: pick the newest results file (multiple can exist across
-        # configurations/reruns) and fail early when none was produced.
-        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-        if [ -z "$results" ]; then
-          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
           exit 1
         fi
+        results=$matches
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
         # Invoke via `bash` (not by path) so the step is robust regardless of the script's
         # file mode — a newly-added .sh may land without the executable bit on checkout.
@@ -535,17 +550,32 @@ jobs:
       run: |
         set -e
         cd runtime
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
-        # Deterministic selection: pick the newest results file (multiple can exist across
-        # configurations/reruns) and fail early when none was produced.
-        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-        if [ -z "$results" ]; then
-          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
           exit 1
         fi
+        results=$matches
         cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
         # Invoke via `bash` (not by path) so the step is robust regardless of the script's
         # file mode — a newly-added .sh may land without the executable bit on checkout.
@@ -696,18 +726,33 @@ jobs:
         #
         # --no-sandbox / --disable-dev-shm-usage: the job runs as root in a container with a small
         # /dev/shm; Chrome refuses to start as root with its sandbox and crashes on a tiny shm.
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:WasmEnableThreads=true /p:Scenario=WasmTestOnChrome /p:InstallChromeForTests=true \
           "/p:WasmXHarnessArgs=--browser-arg=--no-sandbox --browser-arg=--disable-dev-shm-usage" \
           "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=IsBrowserThreadingSupported=true"
-        # Deterministic selection: pick the newest results file (multiple can exist across
-        # configurations/reruns) and fail early when none was produced.
-        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-        if [ -z "$results" ]; then
-          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
           exit 1
         fi
+        results=$matches
         cp "$results" "$GITHUB_WORKSPACE/loader-results-threads-on.xml"
         # mode "mt": additionally REQUIRES ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected to
         # be present AND passed (not skipped) — the contract this leg exists to prove.

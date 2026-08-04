@@ -67,6 +67,39 @@ so the tests assert the outcomes, not just "does not crash":
     on the event loop); with the flag off the registry must not move, and
     on a threads-enabled runtime the stats must consistently report
     unavailable (-1).
+  * ReflectionHashInit_UnderGcPressure_StaysCoherent_AndHolderHandlesDoNotLeak
+    (independent audit; covers both reflection-hash findings in patch 0009):
+      - GC safety, BEST-EFFORT and labelled as such in the test's own doc
+        comment. Eight cycles, each on a FRESH collectible ALC so
+        mono_mem_manager_init_reflection_hashes re-runs from scratch (it
+        early-returns once weak_refobject_hash is set for a manager), with
+        unrooted nursery garbage shaped like the arrays it allocates injected
+        immediately before the first reflection touch and again between the
+        checks, and with a per-cycle-varying amount so the collection point
+        moves around inside the four-allocation window. It then asserts the
+        reflection cache stays COHERENT rather than merely "did not crash":
+        identity (Assert.Same) of the Type object across repeated lookups,
+        Assembly identity, the instance's GetType(), and every declared
+        member's DeclaringType, re-checked after a second pressure burst that
+        also drives the rehash path. This is stochastic coverage, NOT a
+        deterministic interleaving -- it cannot pin a collection to a chosen
+        instruction. No GC-stress CI knob is claimed: sgen's
+        collect-before-allocs is a MONO_GC_DEBUG option that collects on
+        essentially every allocation, which would make the whole test assembly
+        (runtime startup included) unusable even on a dedicated step.
+      - Handle ownership, EXACT. Reads the new key_value_handle ledger (stats
+        kinds 2/3) and asserts freed never exceeds taken (no double free), that
+        the cycles really did construct reflection hashes (taken grew by at
+        least 3 per cycle, so the test cannot pass vacuously), and that the
+        outstanding population (taken - freed) plateaus instead of growing --
+        the pre-fix behaviour was freed never moving at all and outstanding
+        growing by exactly 3 per cycle. A slack of two managers' worth absorbs
+        a straggler set while staying well under the 24-handle pre-fix leak.
+        With the flag off or on a threads-enabled runtime, every ALC is
+        natively non-collectible and only collectible managers build reflection
+        hashes, so the ledger must not move AT ALL -- asserted exactly.
+    Always-run [Fact] on both legs, so it is added to the CI sentinel's
+    required-tests list.
 
 The tests run in BOTH env modes and on BOTH runtime flavours. The protocol
 assertions key on the flag AND !PlatformDetection.IsThreadingSupported: with
@@ -82,15 +115,15 @@ MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
 trim/rooting regression and fails loudly instead of silently self-skipping.
 
 ---
- src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 699 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 874 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
- 2 files changed, 700 insertions(+)
+ 2 files changed, 875 insertions(+)
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..d8340df
+index 0000000..61655dd
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,874 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -147,6 +180,11 @@ index 0000000..d8340df
 +        // Stats kinds; MUST match ves_icall_..._InternalGetScoutRetirementStats.
 +        private const int RetiredSetSize = 0;
 +        private const int TerminalDestroyCount = 1;
++        // MonoWeakHashTable key_value_handle ownership ledger (available on every build, unlike
++        // kinds 0/1): handles taken over by mono_weak_hash_table_new vs. handles freed by
++        // mono_weak_hash_table_destroy, their owner.
++        private const int HolderHandlesTaken = 2;
++        private const int HolderHandlesFreed = 3;
 +
 +        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
 +            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -414,6 +452,95 @@ index 0000000..d8340df
 +            Assert.Equal(0, ScoutStats(RetiredSetSize));
 +            Assert.True(previousTerminal - baselineTerminal >= Cycles,
 +                $"Expected at least {Cycles} terminal scout destructions (one per forced cycle), got {previousTerminal - baselineTerminal}.");
++        }
++
++        /// <summary>
++        /// Reflection-hash initialization under GC pressure, plus the key_value_handle ownership
++        /// ledger.
++        ///
++        /// GC safety (what this does and does NOT prove): the pinned-handle fix in
++        /// mono_mem_manager_init_reflection_hashes protects a window of four consecutive
++        /// mono_array_new_checked calls during which the only other references to the arrays are
++        /// weak. This test drives that window many times over FRESH collectible ALCs with nursery
++        /// pressure applied immediately before and between the touches, and asserts the
++        /// reflection-cache stays coherent (identity of Type objects and of every declared
++        /// member's DeclaringType) rather than merely "did not crash". It is BEST-EFFORT
++        /// stochastic coverage, NOT a deterministic interleaving: it cannot pin a collection to a
++        /// chosen instruction. The pin gives us no supported knob at this runtime pin either —
++        /// sgen's collect-before-allocs is a MONO_GC_DEBUG option that collects on essentially
++        /// every allocation, which would make the whole test assembly (including runtime startup)
++        /// unusable, so no dedicated GC-stress CI step is claimed here.
++        ///
++        /// Handle ownership (what this DOES measure exactly): mono_weak_hash_table_new hands the
++        /// key_value_handle to the table and mono_weak_hash_table_destroy is now its sole owner.
++        /// The two counters are incremented at those two independent sites, so this asserts (a)
++        /// freed never exceeds taken — no double free, and (b) the outstanding population
++        /// (taken - freed) plateaus across cycles while taken grows by at least three per cycle.
++        /// Before the fix, freed never moved at all and outstanding grew by three per cycle. It
++        /// measures the runtime's own ownership ledger, NOT sgen handle-table occupancy: no cheap
++        /// occupancy counter is reachable at this pin (stat_gc_handles_allocated is
++        /// HEAVY_STATISTICS-only and sgen_gchandle_stats_report writes to a debug file behind
++        /// DISABLE_SGEN_DEBUG_HELPERS), and inventing a new sgen -> gc-internals -> icall counter
++        /// across all GC backends was judged out of proportion to the finding.
++        /// </summary>
++        [Fact]
++        public async Task ReflectionHashInit_UnderGcPressure_StaysCoherent_AndHolderHandlesDoNotLeak()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int takenBefore = ScoutStats(HolderHandlesTaken);
++            int freedBefore = ScoutStats(HolderHandlesFreed);
++
++            // Kinds 2/3 are NOT behind the DISABLE_THREADS gate (the ownership fix they observe is
++            // unconditional shared-runtime code), so they must be readable on every leg.
++            Assert.True(takenBefore >= 0,
++                $"The key_value_handle ownership ledger must be available on every build; kind {HolderHandlesTaken} returned {takenBefore}.");
++            Assert.True(freedBefore >= 0,
++                $"The key_value_handle ownership ledger must be available on every build; kind {HolderHandlesFreed} returned {freedBefore}.");
++            Assert.True(freedBefore <= takenBefore,
++                $"More key_value_handles freed ({freedBefore}) than taken ({takenBefore}) before the test even ran — that is a double free.");
++
++            const int Cycles = 8;
++            for (int i = 0; i < Cycles; i++)
++            {
++                ReflectionHashInitUnderPressureCycle(i);
++                GcQuiesce();
++                await DrainRetiredScoutsAsync();
++            }
++
++            GcQuiesce();
++
++            int takenAfter = ScoutStats(HolderHandlesTaken);
++            int freedAfter = ScoutStats(HolderHandlesFreed);
++
++            Assert.True(freedAfter <= takenAfter,
++                $"More key_value_handles freed ({freedAfter}) than taken ({takenAfter}): mono_weak_hash_table_destroy must free each handed-over handle exactly once.");
++
++            if (!ProtocolActive)
++            {
++                // Flag off, or threads-enabled runtime: every ALC is natively non-collectible, and
++                // mono_mem_manager_init_reflection_hashes early-returns for non-collectible
++                // managers, so no reflection-hash table is ever built and the ledger must not move.
++                Assert.Equal(takenBefore, takenAfter);
++                Assert.Equal(freedBefore, freedAfter);
++                return;
++            }
++
++            int taken = takenAfter - takenBefore;
++            Assert.True(taken >= 3 * Cycles,
++                $"Expected at least {3 * Cycles} key_value_handles to be taken over ({Cycles} cycles x 3 reflection-hash tables per collectible memory manager), got {taken} — the cycles did not actually initialize reflection hashes, so this test would prove nothing.");
++
++            // Plateau, not growth. Slack of two managers' worth (6) absorbs a straggler set whose
++            // manager has not been freed yet; the pre-fix leak was 3 per cycle (24 here), so this
++            // stays well below it while remaining discriminating.
++            const int Slack = 6;
++            int outstandingBefore = takenBefore - freedBefore;
++            int outstandingAfter = takenAfter - freedAfter;
++            Assert.True(outstandingAfter - outstandingBefore <= Slack,
++                $"Outstanding reflection-hash holder handles grew from {outstandingBefore} to {outstandingAfter} across {Cycles} forced cycles that took over {taken} handles. mono_weak_hash_table_destroy must free key_value_handle, otherwise three handle-table slots leak per reflection-using memory manager per cycle.");
 +        }
 +
 +        // Load/unload/force cycles for the modes where the force must be Rejected (flag off, or
@@ -760,6 +887,87 @@ index 0000000..d8340df
 +            Assert.NotEmpty(asm.GetTypes());
 +            context.Unload();
 +            return type;
++        }
++
++        // Deliberately unrooted nursery garbage, shaped like what
++        // mono_mem_manager_init_reflection_hashes allocates (small object[]), used to bring the
++        // nursery close to a collection right before a first-reflection touch.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void Churn(int rounds)
++        {
++            for (int i = 0; i < rounds; i++)
++            {
++                object[] garbage = new object[8];
++                garbage[0] = new object();
++                garbage[7] = garbage[0];
++                GC.KeepAlive(garbage);
++            }
++        }
++
++        // One reflection-hash-initialization cycle under allocation pressure. A FRESH collectible
++        // ALC each time, so every cycle re-runs mono_mem_manager_init_reflection_hashes from
++        // scratch (the function early-returns once weak_refobject_hash is set for a manager).
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ReflectionHashInitUnderPressureCycle(int seed)
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            // Pressure IMMEDIATELY before the first reflection touch, so the four
++            // mono_array_new_checked calls inside mono_mem_manager_init_reflection_hashes are as
++            // likely as this suite can make them to straddle a nursery collection — the exact
++            // window the pinned-handle fix protects. The amount varies per cycle to move the
++            // collection point around inside that window.
++            Churn(96 + ((seed * 37) % 384));
++
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++
++            // First reflection touch on this collectible ALC: materialises LoaderAllocator.m_hashes
++            // plus the three MonoWeakHashTables.
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotNull(type);
++
++            // Reflection-cache integrity after the pressured construction. The runtime must hand
++            // back the SAME managed Type object for the same underlying MonoType, and every
++            // declared member must point back at it. Had a collection moved or reclaimed
++            // holders_arr or an earlier holder mid-construction, the published key/value arrays
++            // would be stale: these lookups would assert, crash, or resolve to a different object.
++            Churn(192);
++            Assert.Same(type, asm.GetType(TestClassName, throwOnError: true));
++            Assert.Same(asm, type.Assembly);
++            Assert.NotEmpty(asm.GetTypes());
++            Assert.Same(type, Activator.CreateInstance(type).GetType());
++
++            // Grow the weak tables past their load factor (the rehash path) while still under
++            // pressure, then re-check identity through a second, independent enumeration.
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            foreach (MemberInfo member in type.GetMembers(Declared))
++            {
++                Assert.Same(type, member.DeclaringType);
++            }
++
++            Churn(192);
++            foreach (MemberInfo member in type.GetMembers(Declared))
++            {
++                Assert.Same(type, member.DeclaringType);
++            }
++
++            // Cross-ALC generic over the collectible type argument: adds a shared generic memory
++            // manager, which the forced teardown must also reclaim (whole-set quiescence).
++            var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
++            list.Add(Activator.CreateInstance(type));
++            Assert.Equal(1, list.Count);
++
++            context.Unload();
++
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]

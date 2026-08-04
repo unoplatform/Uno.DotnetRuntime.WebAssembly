@@ -60,6 +60,7 @@ ForcedUnload_OnlyCompletesOnceQuiescent
 ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree
 ForceNativeUnload_AfterCompleted_ManagedLoadApisReject
 ForcedUnload_ScoutFinalizerPopulation_Plateaus
+ReflectionHashInit_UnderGcPressure_StaysCoherent_AndHolderHandlesDoNotLeak
 "
 if [ "$mode" = "mt" ]; then
   # The threads-enabled rejection test is [ConditionalFact(IsThreadingSupported)]: it self-skips
