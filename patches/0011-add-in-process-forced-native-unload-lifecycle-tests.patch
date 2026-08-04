@@ -47,29 +47,46 @@ so the tests assert the outcomes, not just "does not crash":
     (the context keeps servicing loads).
   * ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected
     ([ConditionalFact(IsThreadingSupported)], self-skips on the
-    single-threaded wasm leg): on a threads-enabled runtime the destructive
+    single-threaded wasm legs): on a threads-enabled runtime the destructive
     teardown is compiled out (DISABLE_THREADS hard gate), so the force must
     always report Rejected and disturb nothing -- proving the feature is
     unavailable on multithread packs until safe retirement is implemented.
+    CI runs a dedicated multithread leg (WasmEnableThreads=true, Chrome via
+    xharness test-browser) where this test is REQUIRED to execute and pass.
+  * ForcedUnload_ScoutFinalizerPopulation_Plateaus (scout churn): the scout
+    finalizer answers Destroy()==FALSE with GC.ReRegisterForFinalize, so a
+    forced teardown that freed the scout's manager without a terminal state
+    would leak one immortal finalizable scout per cycle. Asserts against the
+    new GetScoutRetirementStats diagnostics bridge that each forced cycle
+    strictly increases the terminal scout-destroy count and that the native
+    retired-set drains back to zero once finalizers run (counter-based,
+    bounded GC/WaitForPendingFinalizers retries, no timing); with the flag
+    off the registry must not move, and on a threads-enabled runtime the
+    stats must consistently report unavailable (-1).
 
-The tests run in BOTH env modes. With the flag unset, collectible ALCs are
-forced non-collectible natively, so every force is Rejected and nothing is
-reclaimed -- the tests then assert only the safe no-op surface. With the flag
-set they assert the full teardown protocol. On a genuinely unpatched runtime
+The tests run in BOTH env modes and on BOTH runtime flavours. The protocol
+assertions key on the flag AND !PlatformDetection.IsThreadingSupported: with
+the flag unset, collectible ALCs are forced non-collectible natively, so every
+force is Rejected and nothing is reclaimed -- the tests then assert only the
+safe no-op surface -- and on a threads-enabled runtime every force is Rejected
+regardless of the flag (DISABLE_THREADS hard gate), so the multithread leg
+runs with the flag ON and the tests assert exactly that rejection surface.
+With the flag set on the single-threaded build they assert the full teardown
+protocol. On a genuinely unpatched runtime
 (no ForceNativeUnload member) they no-op, EXCEPT when CI sets
 MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
 trim/rooting regression and fails loudly instead of silently self-skipping.
 
 ---
- src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 568 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 687 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
- 2 files changed, 569 insertions(+)
+ 2 files changed, 688 insertions(+)
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..1dff220
+index 0000000..d76f6c7
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,687 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -103,8 +120,12 @@ index 0000000..1dff220
 +    ///
 +    /// With the flag OFF, collectible ALCs are forced non-collectible natively, so every force is
 +    /// Rejected and nothing is ever reclaimed — the tests then only assert the safe no-op surface.
-+    /// With the flag ON they assert the full managed-Unload -> quiescence -> forced-teardown
-+    /// protocol, idempotence, sibling usability, and that the forced-down ALC objects die.
++    /// With the flag ON, on the single-threaded browser build, they assert the full managed-Unload
++    /// -> quiescence -> forced-teardown protocol, idempotence, sibling usability, that the
++    /// forced-down ALC objects die, and that the scout/finalizer population plateaus. On a
++    /// threads-enabled runtime every force is Rejected regardless of the flag (DISABLE_THREADS
++    /// hard gate), so there the tests assert only that rejection surface — the MT CI leg runs
++    /// with the flag ON to prove it.
 +    /// </summary>
 +    [Collection(nameof(DisableParallelization))]
 +    public class ForcedNativeUnloadTests
@@ -118,8 +139,15 @@ index 0000000..1dff220
 +        private const int NotQuiescent = 1;
 +        private const int Rejected = 2;
 +
++        // Stats kinds; MUST match ves_icall_..._InternalGetScoutRetirementStats.
++        private const int RetiredSetSize = 0;
++        private const int TerminalDestroyCount = 1;
++
 +        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
 +            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
++
++        private static readonly MethodInfo s_getScoutRetirementStats = typeof(AssemblyLoadContext)
++            .GetMethod("GetScoutRetirementStats", BindingFlags.NonPublic | BindingFlags.Static);
 +
 +        private static bool FlagEnabled
 +        {
@@ -129,6 +157,14 @@ index 0000000..1dff220
 +                return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 +            }
 +        }
++
++        // The full teardown protocol is only active when the host opted in AND the runtime is the
++        // single-threaded browser build: on a threads-enabled runtime the destructive teardown is
++        // compiled out (DISABLE_THREADS hard gate), mono_alc_init ignores the collectible opt-in
++        // and every force reports Rejected — even with the env flag set. The MT test leg runs with
++        // the flag ON specifically to prove that rejection, so the protocol assertions must key on
++        // both signals.
++        private static bool ProtocolActive => FlagEnabled && !PlatformDetection.IsThreadingSupported;
 +
 +        // Set by CI (in BOTH env modes, since both run on the opt-in patched pack) to demand that
 +        // the bridge member is actually present. When set, a missing member is a trim/rooting
@@ -141,14 +177,19 @@ index 0000000..1dff220
 +        // masking the regression.
 +        private static bool BridgeMissing()
 +        {
-+            if (s_forceNativeUnload != null)
++            if (s_forceNativeUnload != null && s_getScoutRetirementStats != null)
 +            {
 +                return false;
 +            }
 +
 +            Assert.False(RequireBridge,
-+                "AssemblyLoadContext.ForceNativeUnload is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
++                "AssemblyLoadContext.ForceNativeUnload and/or GetScoutRetirementStats is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
 +            return true;
++        }
++
++        private static int ScoutStats(int kind)
++        {
++            return (int)s_getScoutRetirementStats.Invoke(null, new object[] { kind });
 +        }
 +
 +        private static int Force(AssemblyLoadContext context)
@@ -214,7 +255,7 @@ index 0000000..1dff220
 +                refs[i] = LoadExerciseUnloadAndForce();
 +            }
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                // Every forced-down context must be reclaimable: the native teardown released the
 +                // runtime's strong handle, so nothing pins the managed ALC objects any more.
@@ -243,7 +284,7 @@ index 0000000..1dff220
 +
 +            WeakReference weakRef = AssertRejectedWithoutUnloadThenComplete();
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                // The earlier Rejected force did not consume the retry: after a proper Unload() and
 +                // GC the force completed, so the context object is now reclaimable.
@@ -261,7 +302,7 @@ index 0000000..1dff220
 +
 +            WeakReference weakRef = RunQuiescenceProtocol();
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                CollectAndAssertDead(new[] { weakRef });
 +            }
@@ -307,6 +348,99 @@ index 0000000..1dff220
 +            RunThreadsEnabledRejectionProtocol();
 +        }
 +
++        // Scout/finalizer churn plateau: the (disabled) LoaderAllocatorScout.Destroy icall returns
++        // FALSE unconditionally and the scout finalizer answers FALSE with GC.ReRegisterForFinalize,
++        // so without a terminal state every force-freed memory manager would leave one permanently
++        // resurrecting finalizable scout per cycle — an ever-growing set that every subsequent
++        // GC + WaitForPendingFinalizers reprocesses. The native terminal-state registry gives those
++        // scouts a terminal TRUE outcome (without dereferencing the freed manager). Prove the
++        // population plateaus: each forced cycle terminally retires at least one scout (the primary
++        // manager's LoaderAllocator is materialised eagerly, so every opted-in ALC has one) and the
++        // retired-set drains back to zero once finalizers run — deterministic counters, no timing.
++        [Fact]
++        public void ForcedUnload_ScoutFinalizerPopulation_Plateaus()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int baselineTerminal = ScoutStats(TerminalDestroyCount);
++            if (baselineTerminal < 0)
++            {
++                // Threads-enabled runtime: the forced teardown — and with it the registry — is
++                // compiled out (DISABLE_THREADS hard gate). The stats must consistently report
++                // unavailable (-1) and stay that way across forced cycles.
++                Assert.Equal(-1, ScoutStats(RetiredSetSize));
++                RunRejectedCycles(3);
++                Assert.Equal(-1, ScoutStats(RetiredSetSize));
++                Assert.Equal(-1, ScoutStats(TerminalDestroyCount));
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                // Flag off on the single-threaded build: every force is Rejected, nothing is ever
++                // retired, so the registry must not move at all.
++                int baselineRetired = ScoutStats(RetiredSetSize);
++                RunRejectedCycles(3);
++                Assert.Equal(baselineRetired, ScoutStats(RetiredSetSize));
++                Assert.Equal(baselineTerminal, ScoutStats(TerminalDestroyCount));
++                return;
++            }
++
++            const int Cycles = 4;
++            int previousTerminal = baselineTerminal;
++            for (int i = 0; i < Cycles; i++)
++            {
++                LoadExerciseUnloadAndForce();
++                DrainRetiredScouts();
++
++                int terminalNow = ScoutStats(TerminalDestroyCount);
++                Assert.True(terminalNow > previousTerminal,
++                    $"Cycle {i}: expected the terminal scout-destroy count to strictly increase (was {previousTerminal}, now {terminalNow}) — a forced cycle must terminally retire its scout(s) instead of leaving them resurrecting forever.");
++                previousTerminal = terminalNow;
++            }
++
++            // Plateau: every entry the forced teardowns published has been consumed by a scout
++            // finalizer (no unconsumed residue), and at least one scout terminally died per cycle.
++            Assert.Equal(0, ScoutStats(RetiredSetSize));
++            Assert.True(previousTerminal - baselineTerminal >= Cycles,
++                $"Expected at least {Cycles} terminal scout destructions (one per forced cycle), got {previousTerminal - baselineTerminal}.");
++        }
++
++        // Load/unload/force cycles for the modes where the force must be Rejected (flag off, or
++        // threads-enabled runtime); the per-cycle assertions live in LoadExerciseUnloadAndForce.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunRejectedCycles(int cycles)
++        {
++            for (int i = 0; i < cycles; i++)
++            {
++                LoadExerciseUnloadAndForce();
++            }
++        }
++
++        // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
++        // each pass collects (re-queuing any scouts that re-registered with FALSE last pass) and
++        // waits for finalizers, so a scout whose manager is in the registry terminally dies within
++        // a pass or two; the bound only guards against a hypothetical runaway.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void DrainRetiredScouts()
++        {
++            for (int attempt = 0; attempt < 10; attempt++)
++            {
++                if (ScoutStats(RetiredSetSize) == 0)
++                {
++                    return;
++                }
++
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++            }
++
++            Assert.Equal(0, ScoutStats(RetiredSetSize));
++        }
++
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static WeakReference LoadExerciseUnloadAndForce()
 +        {
@@ -314,7 +448,7 @@ index 0000000..1dff220
 +            var weakRef = new WeakReference(context);
 +            ExerciseAndUnload(context);
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                // Eventually completes once the exercised state is collected — the earlier
 +                // NotQuiescent attempts must not have consumed the retry.
@@ -324,7 +458,8 @@ index 0000000..1dff220
 +            }
 +            else
 +            {
-+                // Non-collectible when the opt-in is off: rejected and never freed, both times.
++                // Opt-in off (natively non-collectible) or threads-enabled runtime (hard gate):
++                // rejected and never freed, both times.
 +                Assert.Equal(Rejected, Force(context));
 +                Assert.Equal(Rejected, Force(context));
 +            }
@@ -370,7 +505,7 @@ index 0000000..1dff220
 +
 +            context.Unload();
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                // The rejected force did not latch the once-only flag, so a correct later force
 +                // can still complete.
@@ -378,7 +513,7 @@ index 0000000..1dff220
 +            }
 +            else
 +            {
-+                // Non-collectible when the opt-in is off: still rejected, never freed.
++                // Opt-in off or threads-enabled runtime: still rejected, never freed.
 +                Assert.Equal(Rejected, Force(context));
 +            }
 +
@@ -396,9 +531,9 @@ index 0000000..1dff220
 +            // GC cannot reclaim the LoaderAllocator while `rooted` references a type of this ALC.
 +            GcQuiesce();
 +
-+            if (!FlagEnabled)
++            if (!ProtocolActive)
 +            {
-+                // Non-collectible when the opt-in is off: rejected regardless of roots.
++                // Opt-in off or threads-enabled runtime: rejected regardless of roots.
 +                Assert.Equal(Rejected, Force(context));
 +                GC.KeepAlive(rooted);
 +                context = null;
@@ -434,7 +569,7 @@ index 0000000..1dff220
 +            CreateCrossPair(contextA, contextB);
 +
 +            contextA.Unload();
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
 +            }
@@ -450,7 +585,7 @@ index 0000000..1dff220
 +            Assert.NotEmpty(asmB.GetTypes());
 +
 +            contextB.Unload();
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                GC.KeepAlive(typeB);
 +                typeB = null;
@@ -482,7 +617,7 @@ index 0000000..1dff220
 +            contextA.Unload();
 +            GcQuiesce();
 +
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                // The rooted cross-context generic must block the native free: freeing the shared
 +                // {default, A, B} manager now would reclaim the live object's vtable.
@@ -499,14 +634,14 @@ index 0000000..1dff220
 +            }
 +            else
 +            {
-+                // Non-collectible when the opt-in is off: rejected regardless of roots.
++                // Opt-in off or threads-enabled runtime: rejected regardless of roots.
 +                Assert.Equal(Rejected, Force(contextA));
 +                GC.KeepAlive(crossPair);
 +                crossPair = null;
 +            }
 +
 +            contextB.Unload();
-+            if (FlagEnabled)
++            if (ProtocolActive)
 +            {
 +                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
 +            }
@@ -530,9 +665,10 @@ index 0000000..1dff220
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            ExerciseAndUnload(context);
 +
-+            if (!FlagEnabled)
++            if (!ProtocolActive)
 +            {
-+                // Flag off: the force is Rejected and must NOT tombstone — the context keeps
++                // Protocol inactive (flag off, or threads-enabled runtime): the force is Rejected and
++                // must NOT tombstone — the context keeps
 +                // servicing loads (the already-loaded assembly stays resolvable).
 +                Assert.Equal(Rejected, Force(context));
 +                Assert.NotNull(context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));

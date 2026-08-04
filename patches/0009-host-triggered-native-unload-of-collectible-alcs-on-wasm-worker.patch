@@ -74,8 +74,46 @@ build (DISABLE_THREADS) — see the threading bullet below.
     both the primary manager and each shared-generic manager in the
     owner-detach loop, before mono_mem_manager_free. memory_manager_delete
     does not touch the field, so this is not a double-free; the disabled
-    LoaderAllocatorScout_Destroy returns FALSE up front and never
-    dereferences the freed manager, so there is no scout use-after-free.
+    LoaderAllocatorScout_Destroy never dereferences the freed manager
+    (it only consults the terminal-state registry below by pointer
+    value), so there is no scout use-after-free.
+  * LoaderAllocatorScout terminal outcome (review): the scout finalizer
+    treats Destroy()==FALSE as "not yet" and re-registers itself for
+    finalization; the real Destroy is #if 0-disabled upstream and returns
+    FALSE unconditionally. The forced teardown freed the scout's manager
+    without publishing any terminal state the scout could observe, so
+    every forced cycle leaked one immortal finalizable scout (the primary
+    collectible manager eagerly materialises a LoaderAllocator, so every
+    opted-in ALC has at least one) that every subsequent
+    GC + WaitForPendingFinalizers reprocessed forever. mono_alc_cleanup
+    now records the pointer value of every force-freed manager that had a
+    materialised LoaderAllocator (weak handle non-NULL implies a scout
+    exists) in a native retired-set, and
+    ves_icall_System_Reflection_LoaderAllocatorScout_Destroy consults the
+    set BEFORE its unconditional FALSE: pure pointer-value comparison
+    (the freed manager is never dereferenced), consume the entry, return
+    TRUE -- that scout gets a terminal outcome and does not re-register.
+    Boundedness: an entry is only added when the manager's LoaderAllocator
+    witness is already dead (the quiescence gate proved it before anything
+    was freed), so its scout is already finalizable and consumes the entry
+    on the next finalization pass; the set is a GPtrArray so a recycled
+    address with a still-pending predecessor scout keeps exact counts.
+    ABA (new manager allocated at a recycled address): an entry is added
+    only at force-free time and consumed exactly once at the first Destroy
+    consult for that pointer value; consuming never frees or dereferences
+    anything, so at worst the successor scout (whose own LoaderAllocator
+    must also be dead before it can finalize) drains the predecessor's
+    entry -- permuting WHICH of two indistinguishable scouts terminally
+    dies, never touching a live manager -- and the pending population
+    still drains to zero because each force-free adds exactly one entry
+    and each entry retires exactly one scout. DISABLE_THREADS-gated like
+    the rest of the feature (registry mutated only by the forced teardown
+    and the finalizer, both single-threaded by the hard gate). A new
+    diagnostics icall InternalGetScoutRetirementStats (managed bridge
+    AssemblyLoadContext.GetScoutRetirementStats, DynamicDependency-rooted)
+    exposes the retired-set size and the monotonic terminal-destroy count
+    (-1 on a threads-enabled build) so lifecycle tests can assert the
+    scout/finalizer population plateaus across forced cycles.
   * New host-invoked icall InternalForceNativeUnload: once the host has
     proven managed quiescence it tears down the ALC natively. It is
     OUTCOME-BASED, returning int (0=Completed, 1=NotQuiescent,
@@ -141,16 +179,16 @@ on a DISABLE_THREADS browser build: individual ALCs stay
 non-collectible, InternalForceNativeUnload returns Rejected, and the
 memory manager free keeps its poisoning path for validation runs.
 ---
- src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs |   7 ++++--
- src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs |  88 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
- src/mono/mono/metadata/assembly-load-context.c                                        | 199 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++---------
- src/mono/mono/metadata/icall-def.h                                                    |   1 +
+ src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs |   7 +++++--
+ src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs | 100 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/mono/mono/metadata/assembly-load-context.c                                        | 317 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-----------
+ src/mono/mono/metadata/icall-def.h                                                    |   2 ++
  src/mono/mono/metadata/loader-internals.h                                             |   3 +++
- src/mono/mono/metadata/memory-manager.c                                               |  22 ++++++++++++++++++
- src/mono/mono/mini/interp/interp.c                                                    |  36 +++++++++++++++++++++++++++++
+ src/mono/mono/metadata/memory-manager.c                                               |  22 ++++++++++++++++++++++
+ src/mono/mono/mini/interp/interp.c                                                    |  36 ++++++++++++++++++++++++++++++++++++
  src/mono/mono/mini/interp/interp.h                                                    |   3 +++
- src/mono/mono/mini/mini-runtime.c                                                     |   5 ++++
- 9 files changed, 350 insertions(+), 14 deletions(-)
+ src/mono/mono/mini/mini-runtime.c                                                     |   5 +++++
+ 9 files changed, 481 insertions(+), 14 deletions(-)
 diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
 index 9f94037..4eac33a 100644
 --- a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
@@ -170,10 +208,10 @@ index 9f94037..4eac33a 100644
  
          // synchronization primitive to protect against usage of this instance while unloading
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index 57db653..9f9eede 100644
+index 57db653..da6e715 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -17,11 +17,25 @@ namespace System.Runtime.Loader
+@@ -17,11 +17,26 @@ namespace System.Runtime.Loader
          {
              get
              {
@@ -197,15 +235,27 @@ index 57db653..9f9eede 100644
  
          [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
 +        [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
++        [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
          private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
          {
              if (isCollectible)
-@@ -41,6 +55,78 @@ namespace System.Runtime.Loader
+@@ -41,6 +56,89 @@ namespace System.Runtime.Loader
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
          private static extern void PrepareForAssemblyLoadContextRelease(IntPtr nativeAssemblyLoadContext, IntPtr assemblyLoadContextStrong);
  
 +        [MethodImplAttribute(MethodImplOptions.InternalCall)]
 +        private static extern int InternalForceNativeUnload(IntPtr nativeAssemblyLoadContext);
++
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalGetScoutRetirementStats(int kind);
++
++        // Diagnostics for the forced-unload LoaderAllocatorScout terminal-state registry (see the
++        // native ves_icall_..._InternalGetScoutRetirementStats): kind 0 returns the current
++        // retired-set size (force-freed managers whose scout has not yet finalized), kind 1 the
++        // monotonic count of scouts that received a terminal Destroy outcome. Returns -1 when the
++        // feature is unavailable (threads-enabled runtime). Lifecycle tests use this to assert the
++        // scout/finalizer population plateaus across forced unload cycles.
++        internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
 +
 +        // Outcome of a host-triggered native ALC teardown. The values MUST stay in sync with the
 +        // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
@@ -280,7 +330,7 @@ index 57db653..9f9eede 100644
          [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
  #pragma warning disable IDE0060
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index dec9f96..42c756e 100644
+index dec9f96..d3f1ab2 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -3,6 +3,7 @@
@@ -291,7 +341,75 @@ index dec9f96..42c756e 100644
  #include "mono/metadata/domain-internals.h"
  #include "mono/metadata/exception-internals.h"
  #include "mono/metadata/icall-decl.h"
-@@ -39,8 +40,35 @@ mono_alc_init (MonoAssemblyLoadContext *alc, gboolean collectible)
+@@ -34,13 +35,103 @@ alcs_unlock (void)
+ 	mono_coop_mutex_unlock (&alc_list_lock);
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Terminal-state registry for LoaderAllocatorScout finalizers of force-retired memory
++ * managers.
++ *
++ * The (disabled) real implementation of LoaderAllocatorScout_Destroy returns FALSE
++ * unconditionally, and the scout finalizer responds to FALSE with
++ * GC.ReRegisterForFinalize — the upstream-correct "not yet" retry. But the forced
++ * native teardown (mono_alc_cleanup below) frees a manager without publishing any
++ * terminal state the scout could observe, so after a forced unload every scout whose
++ * manager is gone would resurrect itself forever: each cycle adds one permanently
++ * finalizable object that every subsequent GC/WaitForPendingFinalizers reprocesses.
++ *
++ * The registry records the POINTER VALUE of every force-freed manager that had a
++ * materialised LoaderAllocator (weak handle non-NULL implies a scout exists). The
++ * scout's Destroy icall consults it BEFORE the unconditional FALSE and, purely by
++ * pointer-value comparison — the freed manager is never dereferenced — consumes the
++ * entry and returns TRUE, giving that scout a terminal outcome (no re-registration).
++ *
++ * Boundedness: an entry is only added when the manager's LoaderAllocator witness is
++ * already dead (the quiescence gate proved it before anything was freed), so the
++ * scout is either already on the finalizer queue or becomes finalizable at the next
++ * collection — every entry is consumed by the next finalization pass, and the set
++ * size is bounded by the number of force-freed managers whose scout has not yet
++ * finalized. A GPtrArray (with possible duplicate pointer values, consumed one
++ * occurrence per Destroy) keeps the counting exact if an address is recycled while
++ * an earlier scout is still pending.
++ *
++ * ABA (manager freed, new manager allocated at the recycled address): an entry is
++ * added only at force-free time and removed at the first Destroy consult for that
++ * pointer value. A scout only ever calls Destroy after ITS LoaderAllocator is dead,
++ * and consuming an entry never frees or dereferences anything, so a mis-matched
++ * consult (the successor scout at a recycled address draining the predecessor's
++ * entry) at worst permutes WHICH of the two indistinguishable scouts receives the
++ * terminal outcome; the pending-scout count per address still drains to zero because
++ * every force-free adds exactly one entry and every entry retires exactly one scout.
++ *
++ * Single-threaded by construction: the registry is only mutated by the forced
++ * teardown and the scout finalizer, both hard-gated to the DISABLE_THREADS browser
++ * build, so no locking is needed.
++ */
++static GPtrArray *retired_scout_targets;
++/* Monotonic count of scouts given a terminal (TRUE) Destroy outcome; diagnostics only. */
++static gint32 retired_scout_terminal_count;
++
++static void
++retired_scout_targets_add (MonoMemoryManager *memory_manager)
++{
++	if (!retired_scout_targets)
++		retired_scout_targets = g_ptr_array_new ();
++	g_ptr_array_add (retired_scout_targets, memory_manager);
++}
++
++static gboolean
++retired_scout_targets_consume (gpointer memory_manager)
++{
++	if (!retired_scout_targets)
++		return FALSE;
++	/* Pointer-value comparison only; removes a single occurrence. */
++	return g_ptr_array_remove (retired_scout_targets, memory_manager);
++}
++#endif /* DISABLE_THREADS */
++
+ static void
+ mono_alc_init (MonoAssemblyLoadContext *alc, gboolean collectible)
  {
  	MonoLoadedImages *li = g_new0 (MonoLoadedImages, 1);
  
@@ -328,7 +446,7 @@ index dec9f96..42c756e 100644
  
  	mono_loaded_images_init (li, alc);
  	alc->loaded_images = li;
-@@ -187,17 +215,76 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
+@@ -187,17 +278,88 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
  	mono_gchandle_free_internal (alc->memory_manager->loader_allocator_handle);
  	alc->memory_manager->loader_allocator_handle = NULL;
  
@@ -340,6 +458,14 @@ index dec9f96..42c756e 100644
 +	 * gate on mono_alc_init for use-after-free validation runs.
 +	 */
 +	MonoMemoryManager *primary_mm = alc->memory_manager;
++#ifdef DISABLE_THREADS
++	/* A materialised LoaderAllocator (weak handle non-NULL) implies a scout whose finalizer
++	 * will later call Destroy with this manager's pointer value. Record the pointer in the
++	 * terminal-state registry BEFORE the handle is released below, so that scout receives a
++	 * terminal TRUE outcome instead of re-registering for finalization forever. */
++	if (primary_mm->loader_allocator_weak_handle)
++		retired_scout_targets_add (primary_mm);
++#endif
 +	/* Release the LoaderAllocator weak GCHandle before freeing: the quiescence gate reads it
 +	 * (mono_gchandle_get_target_internal) but nothing in the base ever frees it — only the
 +	 * strong handle is released (start_unload) — so a real free would leak one GCHandle slot
@@ -400,6 +526,10 @@ index dec9f96..42c756e 100644
 +			g_ptr_array_remove (owner->generic_memory_managers, mm);
 +			mono_alc_memory_managers_unlock (owner);
 +		}
++		/* Same terminal-state registration as the primary manager above: a shared manager
++		 * with a materialised LoaderAllocator also owns a scout that must terminally die. */
++		if (mm->loader_allocator_weak_handle)
++			retired_scout_targets_add (mm);
 +		/* Release the shared manager's LoaderAllocator weak GCHandle before freeing it,
 +		 * same rationale as the primary manager above (never freed elsewhere; no double-free). */
 +		mono_gchandle_free_internal (mm->loader_allocator_weak_handle);
@@ -414,7 +544,7 @@ index dec9f96..42c756e 100644
  
  	mono_gchandle_free_internal (alc->gchandle);
  	alc->gchandle = NULL;
-@@ -277,8 +364,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -277,8 +439,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_pointer;
  
  	// FIXME:
@@ -427,7 +557,7 @@ index dec9f96..42c756e 100644
  
  	g_assert (alc->collectible);
  	g_assert (!alc->unloading);
-@@ -298,6 +388,93 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -298,6 +463,120 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -518,21 +648,73 @@ index dec9f96..42c756e 100644
 +#endif
 +}
 +
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats (gint32 kind, MonoError *error)
++{
++	/*
++	 * Diagnostics for the LoaderAllocatorScout terminal-state registry (see
++	 * retired_scout_targets at the top of this file). Used by lifecycle tests to prove the
++	 * scout/finalizer population plateaus across forced unload cycles instead of growing:
++	 *   kind 0 — current retired-set size (entries added by forced teardown, not yet
++	 *            consumed by a scout finalizer; must drain back to 0 once finalizers run).
++	 *   kind 1 — monotonic count of scouts that received a terminal (TRUE) Destroy outcome.
++	 * Returns -1 when the feature is unavailable (threads-enabled build, where the forced
++	 * teardown is compiled out and the registry does not exist) or for an unknown kind.
++	 */
++#ifndef DISABLE_THREADS
++	return -1;
++#else
++	switch (kind) {
++	case 0:
++		return retired_scout_targets ? (int)retired_scout_targets->len : 0;
++	case 1:
++		return retired_scout_terminal_count;
++	default:
++		return -1;
++	}
++#endif
++}
++
  gpointer
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
+@@ -701,6 +980,22 @@ mono_alc_get_all (void)
+ MonoBoolean
+ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+ {
++#ifdef DISABLE_THREADS
++	/*
++	 * Terminal outcome for scouts whose memory manager was already freed by the forced
++	 * native teardown (see the retired_scout_targets registry at the top of this file).
++	 * The consult is a pure pointer-value comparison — the freed manager is NEVER
++	 * dereferenced — and consuming the entry retires exactly one scout: it returns TRUE,
++	 * so the finalizer does not GC.ReRegisterForFinalize and the scout population stays
++	 * bounded across forced load/unload cycles instead of growing by one immortal
++	 * finalizable object per cycle.
++	 */
++	if (retired_scout_targets_consume (native)) {
++		retired_scout_terminal_count++;
++		return TRUE;
++	}
++#endif
++
+ 	/* Not enabled yet */
+ 	return FALSE;
+ 
 diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
-index 444a41c..c1e2310 100644
+index 444a41c..4e1a934 100644
 --- a/src/mono/mono/metadata/icall-def.h
 +++ b/src/mono/mono/metadata/icall-def.h
-@@ -472,6 +472,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+@@ -472,7 +472,9 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
  
  ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
  HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
 +HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, int, 1, (gpointer))
  HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
++HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
  HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
  HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
+ HANDLES(ALC_3, "InternalLoadFromStream", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream, MonoReflectionAssembly, 5, (gpointer, gpointer, gint32, gpointer, gint32))
 diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
 index 2f42290..7b97776 100644
 --- a/src/mono/mono/metadata/loader-internals.h

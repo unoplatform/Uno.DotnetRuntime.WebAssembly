@@ -478,7 +478,7 @@ jobs:
         echo "checking bridge metadata in: $corelib"
         # Method names live as UTF-8 in the #Strings metadata heap, so a binary grep of the managed
         # method names is a reliable presence check without a metadata reader.
-        for sym in ForceNativeUnload InternalForceNativeUnload; do
+        for sym in ForceNativeUnload InternalForceNativeUnload GetScoutRetirementStats InternalGetScoutRetirementStats; do
           if ! grep -aq "$sym" "$corelib"; then
             echo "MISSING: '$sym' metadata not found in System.Private.CoreLib — native-unload bridge was trimmed or not applied"; exit 1
           fi
@@ -560,6 +560,167 @@ jobs:
           loader-results-flag-on.xml
           runtime/artifacts/log/**
 
+  # Multithread (WasmEnableThreads=true) validation leg for the ALC-unload patches. The feature is
+  # hard-gated at compile time to the single-threaded browser build (DISABLE_THREADS), and
+  # ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected — the test proving a threads-enabled
+  # runtime rejects the feature — is [ConditionalFact(IsThreadingSupported)], so it can only
+  # execute on a threads-enabled runtime: on the single-threaded legs above it always self-skips.
+  # This job builds runtime + libraries with /p:WasmEnableThreads=true and runs
+  # System.Runtime.Loader.Tests on headless Chrome (Scenario=WasmTestOnChrome via xharness
+  # test-browser — the engine dotnet/runtime's own _Threading library-test lane uses at this pin;
+  # plain V8 is only used upstream for single-threaded wasm). The sentinel runs in mode "mt",
+  # which REQUIRES the rejection test to be present AND passed (not skipped). The leg runs with
+  # MONO_WASM_ENABLE_ALC_UNLOAD=1 AND MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: the managed bridge
+  # must exist on the multithread pack too, while the runtime must reject every force (the
+  # lifecycle tests assert exactly that rejection surface there). package_job gates on this job
+  # like the single-threaded leg: packaging must not proceed unless the multithread contract is
+  # proven.
+  test_loader_wasm_mt:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    container: 'mcr.microsoft.com/dotnet/sdk:10.0-noble'
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        set -e
+        apt-get update
+        apt-get install -y sudo
+        sudo apt-get install -y python3-pip locales p7zip-full zip nodejs npm
+        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
+          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+        sudo locale-gen en_US.UTF-8
+
+    - name: Install Chrome shared libraries
+      run: |
+        set -e
+        # The pinned Chrome (provisioned by eng/testing/wasm-provisioning.targets in the test
+        # step below) is a bare chromium-browser-snapshots zip; the sdk container lacks its
+        # shared libraries, so install the headless-Chromium dependency set for Ubuntu noble.
+        sudo apt-get install -y --no-install-recommends \
+          libnss3 libnspr4 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
+          libdrm2 libgbm1 libxkbcommon0 libatspi2.0-0t64 libxcomposite1 libxdamage1 \
+          libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64 libexpat1 \
+          libx11-6 libx11-xcb1 libxcb1 libxext6 fonts-liberation
+
+    - name: Install LLVM
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
+
+    - name: Clone dotnet/runtime
+      run: git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Install cmake
+      run: |
+        set -e
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
+        sudo tar --strip-components=1 -xz -C /usr/local
+
+    - name: Build runtime + libraries (browser-wasm, multithread)
+      run: |
+        set -e
+        cd runtime
+        # /p:WasmEnableThreads=true is the canonical threads switch for the libs test tree at this
+        # pin (dotnet/runtime's _Threading library-test lane passes exactly this to both build and
+        # test); it builds the multithread runtime flavour (no DISABLE_THREADS) plus
+        # threads-enabled libraries — the same targeted build the single-threaded loader job does.
+        ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS /p:WasmEnableThreads=true
+
+    - name: Assert native-unload bridge is present in the built pack
+      run: |
+        set -e
+        cd runtime
+        # Same trim/rooting regression guard as the single-threaded job: the managed bridge is
+        # variant-independent and MUST exist on the multithread pack too (its icalls just report
+        # Rejected / unavailable there).
+        corelib=$(find artifacts/bin -name System.Private.CoreLib.dll -path '*rowser*' | head -1)
+        if [ -z "$corelib" ]; then
+          echo "System.Private.CoreLib.dll not found under artifacts/bin"; exit 1
+        fi
+        echo "checking bridge metadata in: $corelib"
+        for sym in ForceNativeUnload InternalForceNativeUnload GetScoutRetirementStats InternalGetScoutRetirementStats; do
+          if ! grep -aq "$sym" "$corelib"; then
+            echo "MISSING: '$sym' metadata not found in System.Private.CoreLib — native-unload bridge was trimmed or not applied"; exit 1
+          fi
+          echo "  ok: found '$sym'"
+        done
+
+    - name: Run System.Runtime.Loader tests (threads ON — rejection contract)
+      run: |
+        set -e
+        cd runtime
+        # Scenario=WasmTestOnChrome runs the suite under headless Chrome via xharness test-browser
+        # (the engine upstream uses for threaded wasm library tests). InstallChromeForTests=true
+        # provisions the PINNED chrome + chromedriver (eng/testing/BrowserVersions.props) right
+        # after Build — a single-project /t:Test invocation, so no provisioning race — and bakes
+        # --browser-path plus a chromedriver PREPEND_PATH into the generated run script.
+        #
+        # WasmXHarnessMonoArgs is a CLI *global* property here, which suppresses the automatic
+        # append of --setenv=IsBrowserThreadingSupported=true that tests.browser.targets performs
+        # for WasmEnableThreads=true builds — so it is passed explicitly: PlatformDetection
+        # .IsThreadingSupported must be TRUE for the rejection test to execute (it is
+        # [ConditionalFact(IsThreadingSupported)]). As on the single-threaded legs, the override
+        # also intentionally drops DOTNET_MODIFIABLE_ASSEMBLIES (hot-reload tests are out of this
+        # job's charter) and MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes a missing bridge member
+        # fail loudly. MONO_WASM_ENABLE_ALC_UNLOAD=1 proves the flag alone cannot enable the
+        # feature on a threads-enabled runtime: every force must still be Rejected.
+        #
+        # --no-sandbox / --disable-dev-shm-usage: the job runs as root in a container with a small
+        # /dev/shm; Chrome refuses to start as root with its sandbox and crashes on a tiny shm.
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:WasmEnableThreads=true /p:Scenario=WasmTestOnChrome /p:InstallChromeForTests=true \
+          "/p:WasmXHarnessArgs=--browser-arg=--no-sandbox --browser-arg=--disable-dev-shm-usage" \
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=IsBrowserThreadingSupported=true"
+        # Deterministic selection: pick the newest results file (multiple can exist across
+        # configurations/reruns) and fail early when none was produced.
+        results=$(find artifacts/bin/System.Runtime.Loader.Tests -name testResults.xml -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -z "$results" ]; then
+          echo "::error::No testResults.xml produced by System.Runtime.Loader.Tests" >&2
+          exit 1
+        fi
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-threads-on.xml"
+        # mode "mt": additionally REQUIRES ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected to
+        # be present AND passed (not skipped) — the contract this leg exists to prove.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "threads ON" mt
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: loader-wasm-mt-test-logs
+        path: |
+          loader-results-threads-on.xml
+          runtime/artifacts/log/**
+
   package_job:
     # AOT cross jobs must produce their nupkgs before this job runs, because
     # the main override pack now has direct PackageReference dependencies on
@@ -567,7 +728,7 @@ jobs:
     # restore inside `dotnet pack` would otherwise hit nuget.org and fail
     # with NU1101/NU1103 since these aren't published yet for the current
     # SemVer2.
-    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job, test_loader_wasm]
+    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job, test_loader_wasm, test_loader_wasm_mt]
     runs-on: ubuntu-latest
 
     steps:
