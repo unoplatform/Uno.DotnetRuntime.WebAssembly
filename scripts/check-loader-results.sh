@@ -44,7 +44,12 @@ RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible
 ForcedUnload_LeavesSiblingCollectibleContextUsable
 ForceNativeUnload_WithoutManagedUnload_IsRejected
 ForcedUnload_OnlyCompletesOnceQuiescent
+ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree
+ForceNativeUnload_AfterCompleted_ManagedLoadApisReject
 "
+# NOTE: ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected is intentionally NOT required here —
+# it is [ConditionalFact(IsThreadingSupported)] and self-skips on this single-threaded wasm leg;
+# it exists to prove the feature reports unavailable on a threads-enabled (multithread) pack.
 
 fail=0
 for method in $required_tests; do

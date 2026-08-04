@@ -15,7 +15,10 @@ so the tests assert the outcomes, not just "does not crash":
     collectible weak hashes) -> managed Unload -> force. With the flag on the
     force must eventually Complete once the exercised state is collected (the
     NotQuiescent retries must not be consumed) and repeats are a Completed
-    no-op; the ALC objects must then die under GC.
+    no-op; the ALC objects must then die under GC. Carries the tracked-residual
+    note for jiterpreter WASM function-table slots (not reclaimed, not
+    measurable from this suite -- see
+    https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166).
   * ForcedUnload_LeavesSiblingCollectibleContextUsable: two collectible
     siblings share a generic instantiation; forcing one down (owner-detach of
     the shared manager) must leave the sibling fully usable.
@@ -27,25 +30,46 @@ so the tests assert the outcomes, not just "does not crash":
     rooted -> NotQuiescent (the ALC is NOT freed, its WeakReference stays
     alive); drop the root, GC in a NoInlining frame, force again -> Completed
     and the ALC WeakReference dies.
+  * ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree (whole-set
+    quiescence): a live cross-context constructed generic (boxed
+    KeyValuePair<TypeA, TypeB>, vtable in the shared {default, A, B} manager)
+    is kept rooted across the force. The shared manager's LoaderAllocator
+    witness is alive even after the primary witness clears, so the force must
+    return NotQuiescent and free NOTHING (all-or-nothing); the object must
+    remain fully usable afterwards, and once unrooted the same force must
+    Complete.
+  * ForceNativeUnload_AfterCompleted_ManagedLoadApisReject (tombstone): after
+    a Completed force, an ordinary API call on the LoadFromAssemblyName ->
+    RuntimeAssembly.InternalLoad path (which has no VerifyIsAlive of its own)
+    must throw ObjectDisposedException in managed code instead of forwarding
+    the freed native pointer to an icall; the force stays an idempotent
+    Completed no-op. With the flag off, the Rejected force must NOT tombstone
+    (the context keeps servicing loads).
+  * ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected
+    ([ConditionalFact(IsThreadingSupported)], self-skips on the
+    single-threaded wasm leg): on a threads-enabled runtime the destructive
+    teardown is compiled out (DISABLE_THREADS hard gate), so the force must
+    always report Rejected and disturb nothing -- proving the feature is
+    unavailable on multithread packs until safe retirement is implemented.
 
 The tests run in BOTH env modes. With the flag unset, collectible ALCs are
 forced non-collectible natively, so every force is Rejected and nothing is
-reclaimed — the tests then assert only the safe no-op surface. With the flag
+reclaimed -- the tests then assert only the safe no-op surface. With the flag
 set they assert the full teardown protocol. On a genuinely unpatched runtime
 (no ForceNativeUnload member) they no-op, EXCEPT when CI sets
 MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
 trim/rooting regression and fails loudly instead of silently self-skipping.
 
 ---
- src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 402 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 568 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
-2 files changed, 403 insertions(+)
+ 2 files changed, 569 insertions(+)
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..93d9595
+index 0000000..1dff220
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,568 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -64,14 +88,18 @@ index 0000000..93d9595
 +    ///
 +    /// The native bridge is OUTCOME-BASED: AssemblyLoadContext.ForceNativeUnload returns
 +    /// Completed (0) / NotQuiescent (1) / Rejected (2). The gist exercised here:
-+    ///   * Rejected  — the force was refused up front (no prior managed Unload, or the ALC is
-+    ///     non-collectible, which is the case for EVERY ALC when the opt-in flag is off). The
-+    ///     context stays fully usable and the once-only latch is NOT consumed.
-+    ///   * NotQuiescent — a managed root into the collectible ALC is still alive, so the native
-+    ///     teardown declines to free (it would reclaim live memory). Nothing is freed; a retry
-+    ///     after the root is collected must still be able to complete.
-+    ///   * Completed — the LoaderAllocator has been collected; the ALC is freed and its runtime
-+    ///     strong handle released, so the managed ALC object finally becomes collectible.
++    ///   * Rejected  — the force was refused up front (feature unavailable on a threads-enabled
++    ///     runtime, no prior managed Unload, or the ALC is non-collectible, which is the case for
++    ///     EVERY ALC when the opt-in flag is off). The context stays fully usable and the
++    ///     once-only latch is NOT consumed.
++    ///   * NotQuiescent — a managed root into the collectible ALC is still alive (into its
++    ///     primary memory manager OR into any shared generic memory manager the teardown would
++    ///     also free), so the native teardown declines to free anything (all-or-nothing).
++    ///     Nothing is freed; a retry after the root is collected must still be able to complete.
++    ///   * Completed — every LoaderAllocator witness of the managers being freed has been
++    ///     collected; the ALC is freed, its runtime strong handle released (so the managed ALC
++    ///     object finally becomes collectible), and the stale native pointer is tombstoned so
++    ///     ordinary API calls reject in managed code (ObjectDisposedException).
 +    ///
 +    /// With the flag OFF, collectible ALCs are forced non-collectible natively, so every force is
 +    /// Rejected and nothing is ever reclaimed — the tests then only assert the safe no-op surface.
@@ -161,6 +189,16 @@ index 0000000..93d9595
 +            return outcome;
 +        }
 +
++        // Known residual, tracked and NOT measured here: on browser-wasm the jiterpreter's
++        // compiled trace functions stay installed in the WASM indirect function table after a
++        // forced unload, and table slots are never released or reused (the allocator's next_index
++        // is monotonic), so repeated cycles consume bounded table capacity; on exhaustion new
++        // traces stop being installed and execution stays in the interpreter (performance-only
++        // degradation). The jiterpreter occupancy counters (mono_jiterp_get_counter) are
++        // EMSCRIPTEN_KEEPALIVE exports consumed by the TypeScript runtime only — there is no
++        // managed-visible counter this suite could read without inventing new API surface — so
++        // this suite records the residual instead of measuring it. Tracked:
++        // https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 +        [Fact]
 +        public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
 +        {
@@ -227,6 +265,46 @@ index 0000000..93d9595
 +            {
 +                CollectAndAssertDead(new[] { weakRef });
 +            }
++        }
++
++        [Fact]
++        public void ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunRootedCrossGenericProtocol();
++        }
++
++        [Fact]
++        public void ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunTombstoneProtocol();
++        }
++
++        // On a threads-enabled runtime the destructive native teardown is compiled out entirely
++        // (DISABLE_THREADS hard gate): mono_alc_init ignores the collectible opt-in and
++        // InternalForceNativeUnload rejects before touching ANY manager state, because the
++        // cache-remove/owner-detach/free sequence races the lock-free mem-manager cache readers.
++        // Prove the feature reports unavailable there: the force never returns anything but
++        // Rejected, and nothing is disturbed. (Skipped on the single-threaded wasm leg, where the
++        // full protocol tests above run instead.)
++        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsThreadingSupported))]
++        public void ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunThreadsEnabledRejectionProtocol();
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
@@ -388,8 +466,119 @@ index 0000000..93d9595
 +            GC.KeepAlive(contextB);
 +        }
 +
++        // Whole-set quiescence: a live cross-context constructed generic keeps the SHARED generic
++        // memory manager's LoaderAllocator witness alive even after the forced context's primary
++        // witness has cleared. The native gate must check EVERY manager it would free
++        // (all-or-nothing): while the object is rooted the force must report NotQuiescent and free
++        // nothing (the object stays fully usable); once unrooted, the same force must complete.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void CreateCrossPair(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
++        private static void RunRootedCrossGenericProtocol()
++        {
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            object crossPair = CreateCrossPair(contextA, contextB);
++
++            contextA.Unload();
++            GcQuiesce();
++
++            if (FlagEnabled)
++            {
++                // The rooted cross-context generic must block the native free: freeing the shared
++                // {default, A, B} manager now would reclaim the live object's vtable.
++                Assert.Equal(NotQuiescent, Force(contextA));
++
++                // Nothing was freed — the refused force must leave the object fully usable.
++                Assert.NotNull(crossPair.ToString());
++                Assert.Equal(crossPair.GetHashCode(), crossPair.GetHashCode());
++
++                // Unroot; with the shared witness dead the same force must now complete.
++                GC.KeepAlive(crossPair);
++                crossPair = null;
++                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            }
++            else
++            {
++                // Non-collectible when the opt-in is off: rejected regardless of roots.
++                Assert.Equal(Rejected, Force(contextA));
++                GC.KeepAlive(crossPair);
++                crossPair = null;
++            }
++
++            contextB.Unload();
++            if (FlagEnabled)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextB));
++            }
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        // Object-wide tombstone: after a Completed force the stale native ALC pointer must never
++        // reach an icall again. Every managed consumer funnels through the NativeALC getter, so an
++        // ordinary API call (the LoadFromAssemblyName -> RuntimeAssembly.InternalLoad path has no
++        // VerifyIsAlive check of its own) must reject deterministically in managed code with
++        // ObjectDisposedException instead of forwarding freed native storage.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunTombstoneProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            ExerciseAndUnload(context);
++
++            if (!FlagEnabled)
++            {
++                // Flag off: the force is Rejected and must NOT tombstone — the context keeps
++                // servicing loads (the already-loaded assembly stays resolvable).
++                Assert.Equal(Rejected, Force(context));
++                Assert.NotNull(context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++                GC.KeepAlive(context);
++                return;
++            }
++
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++
++            // A successful force followed by an ordinary API call must reject in managed code.
++            Assert.Throws<ObjectDisposedException>(
++                () => context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++
++            // And the force itself stays an idempotent Completed no-op.
++            Assert.Equal(Completed, Force(context));
++            GC.KeepAlive(context);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunThreadsEnabledRejectionProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            Type type = LoadReturningType(context);
++
++            context.Unload();
++            GcQuiesce();
++
++            // Regardless of MONO_WASM_ENABLE_ALC_UNLOAD, a threads-enabled runtime must reject —
++            // the destructive reclamation is unavailable until safe retirement is implemented —
++            // and a rejected force must not consume state, so it stays Rejected on retry.
++            Assert.Equal(Rejected, Force(context));
++            Assert.Equal(Rejected, Force(context));
++
++            // Nothing was disturbed by the rejected forces: the loaded type is still usable.
++            Assert.NotNull(Activator.CreateInstance(type));
++            GC.KeepAlive(type);
++            GC.KeepAlive(context);
++        }
++
++        // Returns the boxed cross-context KeyValuePair<TypeA, TypeB> instance. Its vtable lives
++        // in the SHARED generic memory manager owned by {default, A, B}, so while the returned
++        // object is rooted, that shared manager's LoaderAllocator witness stays alive — even
++        // after contextA's primary witness has cleared. Callers that want the contexts to become
++        // quiescent must simply not root the result.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CreateCrossPair(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
 +        {
 +            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
 +            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
@@ -399,6 +588,7 @@ index 0000000..93d9595
 +            object crossPair = Activator.CreateInstance(
 +                typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB));
 +            Assert.NotNull(crossPair);
++            return crossPair;
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
