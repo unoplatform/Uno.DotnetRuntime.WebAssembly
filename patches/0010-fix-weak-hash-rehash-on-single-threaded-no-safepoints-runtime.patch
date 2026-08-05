@@ -65,13 +65,40 @@ Round 9 hardening (CI-evidenced dead-holder abort) and diagnostics:
     fires between the holder fetch and the internal array allocations,
     the window whose safety rests on the caller's pin spanning this
     call.
+
+Round 10 (review follow-up: distinct terminal result for dead tables):
+
+  Degrading a dead-table lookup to a plain miss was not enough: the
+  reflection-cache layer treats a miss as "construct and cache", and
+  every wrapper constructor that requires the collectible
+  LoaderAllocator (assembly, type) aborts on its liveness assert for a
+  condemned manager — the state a forced unload held at NotQuiescent by
+  a shared-manager witness leaves behind. "Callers construct uncached"
+  was therefore false exactly where it mattered.
+
+  * mono_weak_hash_table_lookup_full returns HIT / MISS / DEAD
+    (MonoWeakHashLookupResult) so a dead table is a distinct terminal
+    result the reflection-cache layer can honor by refusing to
+    construct. The plain mono_weak_hash_table_lookup keeps collapsing
+    DEAD to a miss for callers whose values are genuinely optional
+    (e.g. the type-init exception cache) and now delegates to the
+    tri-state lookup.
+  * weak_hash_dead_table_lookups / mono_weak_hash_table_dead_lookup_count:
+    monotonic diagnostics counter (scout-stats kind 6, unconditional
+    like the ledger and rehash counters) proving a workload really took
+    the dead-cache path — the lifecycle test asserts it moved when the
+    global assembly enumeration skipped a condemned assembly.
+  * DEAD-TABLE SEMANTICS updated: the lookup bullet documents the
+    tri-state contract and the insert bullet documents why hand-back-
+    uncached is only sound for the construct race (the object captured
+    the LoaderAllocator while it was alive), not as a general answer.
 ---
- src/mono/mono/metadata/weak-hash.c | 142 ++++++++++++++++++++++++++---
- src/mono/mono/metadata/weak-hash.h |   7 ++
- 2 files changed, 134 insertions(+), 15 deletions(-)
+ src/mono/mono/metadata/weak-hash.c | 206 ++++++++++++++++++++++++++---
+ src/mono/mono/metadata/weak-hash.h |  30 +++++
+ 2 files changed, 214 insertions(+), 22 deletions(-)
 
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
-index 522b4319a..11ca4af8e 100644
+index 522b4319a..0255eff2d 100644
 --- a/src/mono/mono/metadata/weak-hash.c
 +++ b/src/mono/mono/metadata/weak-hash.c
 @@ -13,6 +13,7 @@
@@ -82,7 +109,7 @@ index 522b4319a..11ca4af8e 100644
  
  #include <mono/utils/checked-build.h>
  #include <mono/utils/mono-threads-coop.h>
-@@ -63,12 +64,67 @@ mono_weak_hash_table_key_value_handle_stats (int kind)
+@@ -63,12 +64,91 @@ mono_weak_hash_table_key_value_handle_stats (int kind)
  /* We triple the table size at rehash time, similar with previous implementation */
  #define HASH_TABLE_RESIZE_RATIO 3
  
@@ -102,6 +129,21 @@ index 522b4319a..11ca4af8e 100644
 +}
 +
 +/*
++ * Monotonic count of lookups that found a DEAD table (see DEAD-TABLE SEMANTICS below).
++ * Diagnostics only, exposed as kind 6 of the AssemblyLoadContext scout/handle stats icall: a
++ * regression test uses it to prove the global assembly enumeration really took the terminal
++ * dead-cache path for a condemned assembly instead of passing vacuously. Every dead-table
++ * lookup counts (a coverage witness, not a 1:1 event count).
++ */
++static volatile gint32 weak_hash_dead_table_lookups;
++
++gint32
++mono_weak_hash_table_dead_lookup_count (void)
++{
++	return weak_hash_dead_table_lookups;
++}
++
++/*
 + * DEAD-TABLE SEMANTICS.
 + *
 + * key_value_handle is a WEAK handle to the object[2] holder that keeps the key/value arrays
@@ -115,14 +157,23 @@ index 522b4319a..11ca4af8e 100644
 + * holder != NULL here therefore turned a reachable production state into an abort.
 + *
 + * Instead, a NULL holder marks the table as DEAD and every entry point degrades gracefully:
-+ *   - lookup   -> miss (the entries were only reachable through the holder, so nothing can be
-+ *                 resurrected anyway);
++ *   - lookup   -> a DISTINCT terminal result, not a plain miss:
++ *                 mono_weak_hash_table_lookup_full reports MONO_WEAK_HASH_LOOKUP_DEAD (and
++ *                 counts it, see weak_hash_dead_table_lookups) so the reflection-cache layer
++ *                 can refuse to construct-and-cache. Treating dead as an ordinary miss is NOT
++ *                 safe there: "construct uncached" is impossible for every wrapper whose
++ *                 constructor requires the collectible LoaderAllocator (assembly and type
++ *                 wrappers g_assert on it), which is exactly what a dead holder implies is
++ *                 gone. The plain mono_weak_hash_table_lookup still collapses DEAD to a miss
++ *                 for callers whose values are genuinely optional (e.g. the type-init
++ *                 exception cache);
 + *   - insert   -> no-op (deliberately NOT re-materializing the holder: the manager is
 + *                 condemned, a fresh holder would resurrect a cache nobody owns, and
 + *                 mono_weak_hash_table_destroy must keep freeing exactly one handle exactly
-+ *                 once). Callers construct uncached objects — for a dying ALC the identity of
-+ *                 its reflection objects is already unobservable, since every previously
-+ *                 cached object died with the holder;
++ *                 once). The reflection-cache layer only reaches a dead-table insert through
++ *                 the construct race (the table died during the construction's allocations);
++ *                 the constructed object is handed back uncached, which is sound there because
++ *                 it captured the LoaderAllocator reference while it was still alive;
 + *   - rehash   -> skipped (both in rehash, before allocating replacement arrays, and in
 + *                 do_rehash, which re-reads the target because rehash's own allocations can
 + *                 trigger the collection that kills the holder).
@@ -152,7 +203,7 @@ index 522b4319a..11ca4af8e 100644
  	g_assert (holder);
  	return mono_array_get_fast (holder, MonoArray*, 0);
  }
-@@ -76,8 +132,8 @@ get_keys (MonoWeakHashTable *hash)
+@@ -76,8 +156,8 @@ get_keys (MonoWeakHashTable *hash)
  static MonoArray*
  get_values (MonoWeakHashTable *hash)
  {
@@ -163,7 +214,7 @@ index 522b4319a..11ca4af8e 100644
  	g_assert (holder);
  	return mono_array_get_fast (holder, MonoArray*, 1);
  }
-@@ -179,9 +235,23 @@ mono_weak_hash_table_new (GHashFunc hash_func, GEqualFunc key_equal_func, MonoGH
+@@ -179,9 +259,23 @@ mono_weak_hash_table_new (GHashFunc hash_func, GEqualFunc key_equal_func, MonoGH
  
  	g_assert (type <= MONO_HASH_KEY_VALUE_GC);
  
@@ -187,7 +238,7 @@ index 522b4319a..11ca4af8e 100644
  	if (hash->gc_type & MONO_HASH_KEY_GC) {
  		MonoArray *keys = mono_array_new_checked (mono_get_object_class (), hash->table_size, error);
  		mono_error_assert_ok (error);
-@@ -207,6 +277,8 @@ typedef struct {
+@@ -207,6 +301,8 @@ typedef struct {
  	MonoObject **values;
  	MonoArray *keys_arr;
  	MonoArray *values_arr;
@@ -196,7 +247,7 @@ index 522b4319a..11ca4af8e 100644
  } RehashData;
  
  static void*
-@@ -218,8 +290,16 @@ do_rehash (void *_data)
+@@ -218,8 +314,16 @@ do_rehash (void *_data)
  	MonoObject **old_keys = NULL;
  	MonoArray *old_values_arr = NULL;
  
@@ -214,7 +265,7 @@ index 522b4319a..11ca4af8e 100644
  
  	current_size = hash->table_size;
  	hash->table_size = data->new_size;
-@@ -264,8 +344,9 @@ rehash (MonoWeakHashTable *hash)
+@@ -264,8 +368,9 @@ rehash (MonoWeakHashTable *hash)
  	 */
  	data.new_size = g_spaced_primes_closest (GFLOAT_TO_UINT (hash->in_use / HASH_TABLE_MAX_LOAD_FACTOR * HASH_TABLE_RESIZE_RATIO));
  
@@ -226,7 +277,7 @@ index 522b4319a..11ca4af8e 100644
  
  	if (hash->gc_type & MONO_HASH_KEY_GC) {
  		MonoArray *keys = mono_array_new_checked (mono_get_object_class (), data.new_size, error);
-@@ -283,14 +364,33 @@ rehash (MonoWeakHashTable *hash)
+@@ -283,14 +388,33 @@ rehash (MonoWeakHashTable *hash)
  	}
  
  	if (!mono_threads_are_safepoints_enabled ()) {
@@ -262,25 +313,71 @@ index 522b4319a..11ca4af8e 100644
  	if (!(hash->gc_type & MONO_HASH_KEY_GC))
  		g_free (old_keys);
  	if (!(hash->gc_type & MONO_HASH_VALUE_GC))
-@@ -316,11 +416,15 @@ mono_weak_hash_table_lookup (MonoWeakHashTable *hash, gconstpointer key)
+@@ -309,24 +433,54 @@ mono_weak_hash_table_size (MonoWeakHashTable *hash)
+ }
+ 
+ /**
+- * mono_weak_hash_table_lookup:
++ * mono_weak_hash_table_lookup_full:
++ *
++ * Tri-state lookup (see MonoWeakHashLookupResult and DEAD-TABLE SEMANTICS above). *VALUE
++ * (required) receives the cached value on a HIT and NULL otherwise. A DEAD result means the
++ * holder died with the condemned manager's LoaderAllocator: the caller must not treat it as a
++ * miss it can repair by constructing and caching.
+  */
+-gpointer
+-mono_weak_hash_table_lookup (MonoWeakHashTable *hash, gconstpointer key)
++MonoWeakHashLookupResult
++mono_weak_hash_table_lookup_full (MonoWeakHashTable *hash, gconstpointer key, gpointer *value)
  {
  	g_assert (hash);
- 
--	int slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
 -
+-	int slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
++	g_assert (value);
+ 
  	// FIXME:
  	g_assert (hash->gc_type == MONO_HASH_VALUE_GC);
  
-+	/* Dead table (see DEAD-TABLE SEMANTICS): every lookup misses. */
-+	if (!get_holder (hash))
-+		return NULL;
++	*value = NULL;
++
++	/* Dead table (see DEAD-TABLE SEMANTICS): a distinct terminal result, counted for tests. */
++	if (!get_holder (hash)) {
++		UnlockedIncrement (&weak_hash_dead_table_lookups);
++		return MONO_WEAK_HASH_LOOKUP_DEAD;
++	}
 +
 +	int slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
 +
  	MonoArray* values = get_values (hash);
  
- 	if (hash->keys [slot])
-@@ -370,14 +474,22 @@ mono_weak_hash_table_insert_replace (MonoWeakHashTable *hash, gpointer key, gpoi
+-	if (hash->keys [slot])
+-		return mono_array_get_fast (values, MonoObject*, slot);
+-	else
+-		return NULL;
++	if (hash->keys [slot]) {
++		*value = mono_array_get_fast (values, MonoObject*, slot);
++		return MONO_WEAK_HASH_LOOKUP_HIT;
++	}
++	return MONO_WEAK_HASH_LOOKUP_MISS;
++}
++
++/**
++ * mono_weak_hash_table_lookup:
++ *
++ * DEAD collapses to a miss here (see DEAD-TABLE SEMANTICS): only callers whose values are
++ * genuinely optional may use this; callers that would construct-and-cache on a miss must use
++ * mono_weak_hash_table_lookup_full and honor the DEAD result.
++ */
++gpointer
++mono_weak_hash_table_lookup (MonoWeakHashTable *hash, gconstpointer key)
++{
++	gpointer value = NULL;
++	(void) mono_weak_hash_table_lookup_full (hash, key, &value);
++	return value;
+ }
+ 
+ /**
+@@ -370,14 +524,22 @@ mono_weak_hash_table_insert_replace (MonoWeakHashTable *hash, gpointer key, gpoi
  
  	g_assert (hash);
  
@@ -308,10 +405,35 @@ index 522b4319a..11ca4af8e 100644
  		if (replace) {
  			key_store (hash, slot, (MonoObject*)key);
 diff --git a/src/mono/mono/metadata/weak-hash.h b/src/mono/mono/metadata/weak-hash.h
-index a3d9d3c4a..ff12c85b4 100644
+index a3d9d3c4a..b351dd02d 100644
 --- a/src/mono/mono/metadata/weak-hash.h
 +++ b/src/mono/mono/metadata/weak-hash.h
-@@ -27,4 +27,11 @@ void     mono_weak_hash_table_insert          (MonoWeakHashTable *h, gpointer k,
+@@ -7,10 +7,24 @@
+ 
+ typedef struct _MonoWeakHashTable MonoWeakHashTable;
+ 
++/*
++ * Tri-state lookup result. DEAD means the table's object[2] holder was collected together with
++ * the condemned collectible manager's LoaderAllocator (see DEAD-TABLE SEMANTICS in weak-hash.c):
++ * distinct from MISS so the reflection-cache layer can refuse to construct-and-cache wrappers
++ * whose constructors require the dead LoaderAllocator, instead of treating the state as an
++ * ordinary cache miss.
++ */
++typedef enum {
++	MONO_WEAK_HASH_LOOKUP_MISS = 0,
++	MONO_WEAK_HASH_LOOKUP_HIT = 1,
++	MONO_WEAK_HASH_LOOKUP_DEAD = 2
++} MonoWeakHashLookupResult;
++
+ MonoWeakHashTable *
+ mono_weak_hash_table_new (GHashFunc hash_func, GEqualFunc key_equal_func, MonoGHashGCType type, MonoGCHandle key_value_handle);
+ guint    mono_weak_hash_table_size            (MonoWeakHashTable *hash);
+ gpointer mono_weak_hash_table_lookup          (MonoWeakHashTable *hash, gconstpointer key);
++MonoWeakHashLookupResult mono_weak_hash_table_lookup_full (MonoWeakHashTable *hash, gconstpointer key, gpointer *value);
+ gboolean mono_weak_hash_table_lookup_extended (MonoWeakHashTable *hash, gconstpointer key, gpointer *orig_key, gpointer *value);
+ void     mono_weak_hash_table_foreach         (MonoWeakHashTable *hash, GHFunc func, gpointer user_data);
+ gpointer mono_weak_hash_table_find            (MonoWeakHashTable *hash, GHRFunc predicate, gpointer user_data);
+@@ -27,4 +41,20 @@ void     mono_weak_hash_table_insert          (MonoWeakHashTable *h, gpointer k,
   */
  gint32   mono_weak_hash_table_key_value_handle_stats (int kind);
  
@@ -321,6 +443,15 @@ index a3d9d3c4a..ff12c85b4 100644
 + * the initial table size instead of asserting so by construction.
 + */
 +gint32   mono_weak_hash_table_rehash_count (void);
++
++/*
++ * Diagnostics only: monotonic count of lookups that found a DEAD table (holder collected; see
++ * MonoWeakHashLookupResult above). Lets a regression test prove that a workload really took the
++ * terminal dead-cache path — e.g. the global assembly enumeration skipping a condemned
++ * assembly — instead of passing vacuously. Counts every dead-table lookup, so it is a coverage
++ * witness, not a 1:1 event count.
++ */
++gint32   mono_weak_hash_table_dead_lookup_count (void);
 +
  #endif /* __MONO_WEAK_HASH_H__ */
 -- 

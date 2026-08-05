@@ -273,19 +273,73 @@ Round 9 (deterministic coverage amendment):
     (unconditional shared-runtime code, like kinds 2/3) so a lifecycle
     test can prove a reflection workload really crossed the
     initial-table-size load-factor boundary instead of assuming so.
+
+Round 10 (review follow-up: terminal dead-cache result, condemned
+assemblies filtered from the global enumeration):
+
+  Round 9 made a dead weak table degrade lookups to misses, but the
+  reflection-cache layer treats a miss as "construct and cache": the
+  CI-observed path InternalGetLoadedAssemblies ->
+  mono_assembly_get_object_handle -> check_or_construct_handle then
+  invoked assembly_object_construct for the condemned manager and
+  aborted on g_assert(loader_alloc) — "callers construct uncached" is
+  false for every constructor that requires the collectible
+  LoaderAllocator (assembly and type wrappers set m_keepalive from it).
+
+  * Tri-state weak-table lookup: mono_weak_hash_table_lookup_full
+    returns HIT / MISS / DEAD so a dead table is distinguishable from an
+    ordinary miss (plain mono_weak_hash_table_lookup keeps collapsing
+    DEAD to a miss for callers whose values are optional caches).
+  * check_object_handle / check_or_construct_handle plumb the DEAD
+    state through: the constructor is NOT invoked for a condemned
+    manager. Callers that can skip the item receive the state via the
+    new CHECK_OR_CONSTRUCT_HANDLE_DEAD out-param with error left OK;
+    every other caller gets a clean InvalidOperationException-shaped
+    MonoError (all existing call sites already propagate MonoError).
+    The g_assert(loader_alloc) in the constructors is deliberately NOT
+    weakened: for a live manager a NULL witness stays a fatal bug.
+    check_object_handle also drops upstream's dead first lookup block
+    (its result was unconditionally overwritten by the second lookup),
+    so exactly one lookup feeds the tri-state.
+  * cache_object_handle skips the ReflectedEntry allocation when the
+    table died between the caller's lookup and the insert (the insert
+    would no-op and leak the entry on a non-moving GC) and hands the
+    object back uncached.
+  * mono_mem_manager_init_reflection_hashes now returns FALSE for a
+    condemned manager (witness dead, hashes never built) instead of
+    publishing holders into a NULL LoaderAllocator; the cache layer
+    treats that exactly like a dead table. It must NOT create a fresh
+    LoaderAllocator: that would resurrect a condemned manager.
+  * mono_type_get_object_checked takes the same terminal path (clean
+    error) for a condemned manager, both when the hashes were never
+    built and when its weak_type_hash lookup reports DEAD.
+  * InternalGetLoadedAssemblies filters condemned assemblies via
+    mono_assembly_get_object_handle_or_condemned: they are still on the
+    loaded list while a shared-manager witness keeps the force at
+    NotQuiescent, but their wrapper can neither be found nor legally
+    re-constructed, so the enumeration skips them and returns an
+    exactly-sized array (no NULL slots). Observable as one GC earlier:
+    the wrapper was about to die anyway.
+  * Kind 6 of InternalGetScoutRetirementStats exposes
+    mono_weak_hash_table_dead_lookup_count (unconditional, like kinds
+    2/3/5) so the lifecycle test can prove the enumeration really took
+    the dead-cache path instead of passing vacuously.
 ---
  .../Runtime/Loader/AssemblyLoadContext.cs     |   7 +-
- .../Loader/AssemblyLoadContext.Mono.cs        | 108 +++++-
- .../mono/metadata/assembly-load-context.c     | 349 +++++++++++++++++-
+ .../Loader/AssemblyLoadContext.Mono.cs        | 108 ++++-
+ .../mono/metadata/assembly-load-context.c     | 389 +++++++++++++++++-
  src/mono/mono/metadata/icall-def.h            |   2 +
- src/mono/mono/metadata/loader-internals.h     |  27 ++
- src/mono/mono/metadata/memory-manager.c       | 136 ++++++-
- src/mono/mono/metadata/weak-hash.c            |  45 +++
+ src/mono/mono/metadata/loader-internals.h     |  35 +-
+ src/mono/mono/metadata/memory-manager.c       | 155 ++++++-
+ src/mono/mono/metadata/reflection-cache.h     |  86 +++-
+ src/mono/mono/metadata/reflection-internals.h |  14 +
+ src/mono/mono/metadata/reflection.c           |  48 ++-
+ src/mono/mono/metadata/weak-hash.c            |  45 ++
  src/mono/mono/metadata/weak-hash.h            |   7 +
  src/mono/mono/mini/interp/interp.c            |  36 ++
  src/mono/mono/mini/interp/interp.h            |   3 +
  src/mono/mono/mini/mini-runtime.c             |   5 +
- 11 files changed, 710 insertions(+), 15 deletions(-)
+ 14 files changed, 896 insertions(+), 44 deletions(-)
 
 diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
 index 9f9403738..4eac33a24 100644
@@ -436,7 +490,7 @@ index 57db6533e..cc30e0cdb 100644
          [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
  #pragma warning disable IDE0060
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index dec9f96b6..66b709ca6 100644
+index dec9f96b6..382247fa9 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -3,6 +3,7 @@
@@ -671,7 +725,7 @@ index dec9f96b6..66b709ca6 100644
  
  	g_assert (alc->collectible);
  	g_assert (!alc->unloading);
-@@ -298,6 +464,151 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -298,6 +464,159 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -798,11 +852,19 @@ index dec9f96b6..66b709ca6 100644
 +	 * observes is shared-runtime code. A lifecycle test uses it to prove a reflection workload
 +	 * genuinely crossed the initial-table-size load-factor boundary (initial size 11, rehash
 +	 * before the 9th unique insertion into one table) instead of assuming so.
++	 *
++	 * Kind 6 — monotonic count of weak-table lookups that found a DEAD table (holder collected
++	 * with the condemned manager's LoaderAllocator; see DEAD-TABLE SEMANTICS in weak-hash.c and
++	 * mono_weak_hash_table_dead_lookup_count). Unconditional like kinds 2/3/5. A lifecycle test
++	 * uses it to prove the global assembly enumeration really took the terminal dead-cache path
++	 * for a condemned assembly (skipping it) instead of passing vacuously.
 +	 */
 +	if (kind == 2 || kind == 3)
 +		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
 +	if (kind == 5)
 +		return mono_weak_hash_table_rehash_count ();
++	if (kind == 6)
++		return mono_weak_hash_table_dead_lookup_count ();
 +
 +#ifndef DISABLE_THREADS
 +	return -1;
@@ -823,7 +885,62 @@ index dec9f96b6..66b709ca6 100644
  gpointer
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
-@@ -701,6 +1012,22 @@ mono_alc_get_all (void)
+@@ -308,13 +627,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (M
+ }
+ 
+ static gboolean
+-add_assembly_to_array (MonoArrayHandle dest, int dest_idx, MonoAssembly* assm, MonoError *error)
++add_assembly_to_array (MonoArrayHandle dest, int dest_idx, MonoAssembly* assm, gboolean *condemned, MonoError *error)
+ {
+ 	HANDLE_FUNCTION_ENTER ();
+ 	error_init (error);
+-	MonoReflectionAssemblyHandle assm_obj = mono_assembly_get_object_handle (assm, error);
++	MonoReflectionAssemblyHandle assm_obj = mono_assembly_get_object_handle_or_condemned (assm, condemned, error);
+ 	goto_if_nok (error, leave);
+-	MONO_HANDLE_ARRAY_SETREF (dest, dest_idx, assm_obj);
++	if (!*condemned)
++		MONO_HANDLE_ARRAY_SETREF (dest, dest_idx, assm_obj);
+ leave:
+ 	HANDLE_FUNCTION_RETURN_VAL (is_ok (error));
+ }
+@@ -323,12 +643,35 @@ MonoArrayHandle
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies (MonoError *error)
+ {
+ 	GPtrArray *assemblies = mono_alc_get_all_loaded_assemblies ();
++	guint filled = 0;
+ 
+ 	MonoArrayHandle res = mono_array_new_handle (mono_class_get_assembly_class (), assemblies->len, error);
+ 	goto_if_nok (error, leave);
+ 	for (guint i = 0; i < assemblies->len; ++i) {
+-		if (!add_assembly_to_array (res, i, (MonoAssembly *)g_ptr_array_index (assemblies, i), error))
++		/*
++		 * Filter CONDEMNED assemblies: after a collectible ALC's managed unload has completed
++		 * (LoaderAllocator witness dead) but before the forced native teardown has freed it —
++		 * e.g. while a shared generic manager witness still reports NotQuiescent — the
++		 * assembly is still on the loaded list, yet its reflection wrapper can neither be
++		 * found (the weak caches died with the witness) nor be re-constructed
++		 * (assembly_object_construct requires the dead LoaderAllocator, and re-creating any
++		 * of it would resurrect a condemned manager). Skipping here mirrors what the array
++		 * would have looked like one GC earlier, when the wrapper was still cached but about
++		 * to die: the assembly is on its way out and must simply stop being observable.
++		 */
++		gboolean condemned = FALSE;
++		if (!add_assembly_to_array (res, filled, (MonoAssembly *)g_ptr_array_index (assemblies, i), &condemned, error))
+ 			goto leave;
++		if (!condemned)
++			filled++;
++	}
++
++	if (filled < assemblies->len) {
++		/* Condemned assemblies were skipped: hand back an exactly-sized array, no NULL tail. */
++		MonoArrayHandle compact = mono_array_new_handle (mono_class_get_assembly_class (), filled, error);
++		goto_if_nok (error, leave);
++		mono_array_handle_memcpy_refs (compact, 0, res, 0, filled);
++		MONO_HANDLE_ASSIGN (res, compact);
+ 	}
+ 
+ leave:
+@@ -701,6 +1044,22 @@ mono_alc_get_all (void)
  MonoBoolean
  ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  {
@@ -861,7 +978,7 @@ index 444a41c2b..4e1a93423 100644
  HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
  HANDLES(ALC_3, "InternalLoadFromStream", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream, MonoReflectionAssembly, 5, (gpointer, gpointer, gint32, gpointer, gint32))
 diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
-index 2f422904e..cbd6aa231 100644
+index 2f422904e..4275a39d2 100644
 --- a/src/mono/mono/metadata/loader-internals.h
 +++ b/src/mono/mono/metadata/loader-internals.h
 @@ -297,6 +297,9 @@ mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collec
@@ -874,7 +991,20 @@ index 2f422904e..cbd6aa231 100644
  void
  mono_mem_manager_free_objects (MonoMemoryManager *memory_manager);
  
-@@ -368,6 +371,30 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager);
+@@ -362,12 +365,42 @@ g_slist_prepend_mem_manager (MonoMemoryManager *memory_manager, GSList *list, gp
+ MonoGCHandle
+ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager);
+ 
+-void
++/*
++ * Returns TRUE when the manager's reflection caches are usable; FALSE for a condemned
++ * collectible manager (LoaderAllocator witness dead, tables never built — see the definition
++ * in memory-manager.c). FALSE must be treated like a dead weak table: skip the cache and never
++ * construct wrappers that require the LoaderAllocator.
++ */
++gboolean
+ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager);
+ 
  void
  mono_mem_manager_start_unload (MonoMemoryManager *mem_manager);
  
@@ -906,7 +1036,7 @@ index 2f422904e..cbd6aa231 100644
  
  #endif
 diff --git a/src/mono/mono/metadata/memory-manager.c b/src/mono/mono/metadata/memory-manager.c
-index e7a234661..235884011 100644
+index e7a234661..b06ce79a9 100644
 --- a/src/mono/mono/metadata/memory-manager.c
 +++ b/src/mono/mono/metadata/memory-manager.c
 @@ -1,5 +1,6 @@
@@ -951,7 +1081,7 @@ index e7a234661..235884011 100644
  static MonoMemoryManager*
  get_mem_manager_for_alcs (MonoAssemblyLoadContext **alcs, int nalcs)
  {
-@@ -662,6 +684,63 @@ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager)
+@@ -662,23 +684,91 @@ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager)
  	return res;
  }
  
@@ -1015,7 +1145,38 @@ index e7a234661..235884011 100644
  /*
   * Initialize reflection hashes in MEM_MANAGER.
   * This is done on demand, see get_loader_alloc ().
-@@ -687,15 +766,57 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
++ *
++ * Returns TRUE when the manager's reflection caches are usable (non-collectible manager, or
++ * the tables exist / were just built). Returns FALSE for a CONDEMNED collectible manager: its
++ * LoaderAllocator witness has already been collected (the weak handle target is NULL), so the
++ * holder arrays cannot be published into LoaderAllocator.m_hashes — and creating a fresh
++ * LoaderAllocator here would resurrect a manager whose managed unload already completed.
++ * Callers must treat FALSE like a dead weak table (see DEAD-TABLE SEMANTICS in weak-hash.c):
++ * skip the cache and never construct wrappers that require the LoaderAllocator.
+  */
+-void
++gboolean
+ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+ {
+ 	ERROR_DECL (error);
+ 
+ 	if (!mem_manager->collectible)
+-		return;
++		return TRUE;
+ 	if (mem_manager->weak_refobject_hash)
+-		return;
++		return TRUE;
+ 
+ 	MonoGCHandle loader_alloc_handle = mono_mem_manager_get_loader_alloc (mem_manager);
+ 	MonoManagedLoaderAllocator *loader_alloc = (MonoManagedLoaderAllocator*)mono_gchandle_get_target_internal (loader_alloc_handle);
+ 
++	if (!loader_alloc)
++		return FALSE;
++
+ 	const int nhashes = 3;
+ 
+ 	/* Create a set of object[2] arrays to hold arrays of keys/values, store them into LoaderAllocator.m_hashes */
+@@ -687,15 +777,57 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
  	MonoArray *holders_arr = mono_array_new_checked (mono_get_object_class (), nhashes, error);
  	mono_error_assert_ok (error);
  
@@ -1074,7 +1235,7 @@ index e7a234661..235884011 100644
  	}
  
  	mono_mem_manager_lock (mem_manager);
-@@ -710,10 +831,22 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+@@ -710,10 +842,24 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
  		/* Set this last because of the double checked locking above */
  		mem_manager->weak_refobject_hash = hash;
  	} else {
@@ -1094,15 +1255,266 @@ index e7a234661..235884011 100644
 +	for (int i = 0; i < nhashes; ++i)
 +		mono_gchandle_free_internal (holder_pins [i]);
 +	mono_gchandle_free_internal (holders_arr_pin);
++
++	return TRUE;
  }
  
  void
-@@ -722,4 +855,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
+@@ -722,4 +868,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
  	/* Free the strong handle so the LoaderAllocator object can be freed */
  	MonoGCHandle loader_handle = mem_manager->loader_allocator_handle;
  	mono_gchandle_free_internal (loader_handle);
 +	mem_manager->loader_allocator_handle = NULL;
  }
+diff --git a/src/mono/mono/metadata/reflection-cache.h b/src/mono/mono/metadata/reflection-cache.h
+index de92ac2dd..af68552b6 100644
+--- a/src/mono/mono/metadata/reflection-cache.h
++++ b/src/mono/mono/metadata/reflection-cache.h
+@@ -85,7 +85,15 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 	pe.item = item;
+ 	pe.refclass = klass;
+ 
+-	mono_mem_manager_init_reflection_hashes (mem_manager);
++	if (!mono_mem_manager_init_reflection_hashes (mem_manager)) {
++		/*
++		 * Condemned collectible manager (see mono_mem_manager_init_reflection_hashes): there
++		 * is no table to cache into and one must not be materialized, so hand the caller its
++		 * own object back uncached. Identity is unobservable for a condemned manager — every
++		 * previously cached wrapper died with the LoaderAllocator.
++		 */
++		return o;
++	}
+ 
+ 	mono_mem_manager_lock (mem_manager);
+ 	if (!mem_manager->collectible) {
+@@ -102,8 +110,17 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 			MONO_HANDLE_ASSIGN (obj, o);
+ 		}
+ 	} else {
+-		obj = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (mem_manager->weak_refobject_hash, &pe));
+-		if (MONO_HANDLE_IS_NULL (obj)) {
++		gpointer cached = NULL;
++		MonoWeakHashLookupResult lookup = mono_weak_hash_table_lookup_full (mem_manager->weak_refobject_hash, &pe, &cached);
++		obj = MONO_HANDLE_NEW (MonoObject, (MonoObject *)cached);
++		if (lookup == MONO_WEAK_HASH_LOOKUP_DEAD) {
++			/*
++			 * The table died between the caller's lookup and this insert (the construction
++			 * allocates, and an allocation-triggered collection can kill the holder). Do not
++			 * allocate a ReflectedEntry the no-op insert would leak; return the object uncached.
++			 */
++			MONO_HANDLE_ASSIGN (obj, o);
++		} else if (MONO_HANDLE_IS_NULL (obj)) {
+ 			ReflectedEntry *e = alloc_reflected_entry (mem_manager);
+ 			e->item = item;
+ 			e->refclass = klass;
+@@ -122,8 +139,17 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ #define CACHE_OBJECT(t,mem_manager,flags,p,o,k) ((t) (cache_object ((mem_manager), (flags), (k), (p), (o))))
+ #define CACHE_OBJECT_HANDLE(t,mem_manager,flags,p,o,k) (MONO_HANDLE_CAST (t, cache_object_handle ((mem_manager), (flags), (k), (p), (o))))
+ 
++/*
++ * Looks ITEM up in MEM_MANAGER's reflection cache. *CACHE_DEAD (required) reports the terminal
++ * DEAD state of a condemned collectible manager — its LoaderAllocator witness died, so its weak
++ * tables (or the manager's ability to ever build them) died with it. DEAD is deliberately
++ * distinct from an ordinary miss: on a miss the caller constructs and caches, but a condemned
++ * manager's wrappers must NOT be constructed — the assembly/type constructors require the dead
++ * LoaderAllocator (they g_assert on it) and re-materializing any of the bookkeeping would
++ * resurrect a manager whose teardown is already pending. See DEAD-TABLE SEMANTICS in weak-hash.c.
++ */
+ static inline MonoObjectHandle
+-check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item)
++check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gboolean *cache_dead)
+ {
+ 	MonoObjectHandle obj_handle;
+ 	gpointer orig_e, orig_value;
+@@ -131,19 +157,20 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 	e.item = item;
+ 	e.refclass = klass;
+ 
+-	// FIXME: May need a memory manager for item+klass ?
++	*cache_dead = FALSE;
+ 
+-	mono_mem_manager_init_reflection_hashes (mem_manager);
++	// FIXME: May need a memory manager for item+klass ?
+ 
+-	mono_mem_manager_lock (mem_manager);
+-	if (!mem_manager->collectible) {
+-		MonoConcGHashTable *hash = mem_manager->refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_conc_g_hash_table_lookup (hash, &e));
+-	} else {
+-		MonoWeakHashTable *hash = mem_manager->weak_refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (hash, &e));
++	if (!mono_mem_manager_init_reflection_hashes (mem_manager)) {
++		/*
++		 * Condemned manager whose reflection hashes were never built: the same terminal state
++		 * as a dead table, just without a table to look into.
++		 */
++		*cache_dead = TRUE;
++		return MONO_HANDLE_NEW (MonoObject, NULL);
+ 	}
+ 
++	mono_mem_manager_lock (mem_manager);
+ 	if (!mem_manager->collectible) {
+ 		MonoConcGHashTable *hash = mem_manager->refobject_hash;
+ 		if (mono_conc_g_hash_table_lookup_extended (hash, &e, &orig_e, &orig_value))
+@@ -159,7 +186,10 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 		}
+ 	} else {
+ 		MonoWeakHashTable *hash = mem_manager->weak_refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (hash, &e));
++		gpointer cached = NULL;
++		if (mono_weak_hash_table_lookup_full (hash, &e, &cached) == MONO_WEAK_HASH_LOOKUP_DEAD)
++			*cache_dead = TRUE;
++		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)cached);
+ 	}
+ 	mono_mem_manager_unlock (mem_manager);
+ 
+@@ -168,13 +198,29 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 
+ typedef MonoObjectHandle (*ReflectionCacheConstructFunc_handle) (MonoClass*, gpointer, gpointer, MonoError *);
+ 
++/*
++ * CACHE_DEAD semantics: a NULL result is TERMINAL when the manager is condemned (see
++ * check_object_handle) — the constructor is NOT invoked, nothing is cached, nothing can be
++ * resurrected. Callers that can meaningfully handle the condemned state (skip the item) pass a
++ * non-NULL CACHE_DEAD and receive it with error left OK; for everyone else (CACHE_DEAD == NULL)
++ * the condemned state becomes a clean InvalidOperationException-shaped MonoError, never an
++ * abort.
++ */
+ static inline MonoObjectHandle
+-check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gpointer user_data, MonoError *error, ReflectionCacheConstructFunc_handle construct)
++check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gpointer user_data, gboolean *cache_dead, MonoError *error, ReflectionCacheConstructFunc_handle construct)
+ {
+ 	error_init (error);
+-	MonoObjectHandle obj = check_object_handle (mem_manager, flags, klass, item);
++	gboolean dead = FALSE;
++	MonoObjectHandle obj = check_object_handle (mem_manager, flags, klass, item, &dead);
++	if (cache_dead)
++		*cache_dead = dead;
+ 	if (!MONO_HANDLE_IS_NULL (obj))
+ 		return obj;
++	if (dead) {
++		if (!cache_dead)
++			mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++		return NULL_HANDLE;
++	}
+ 	MONO_HANDLE_ASSIGN (obj, construct (klass, item, user_data, error));
+ 	return_val_if_nok (error, NULL_HANDLE);
+ 	if (MONO_HANDLE_IS_NULL (obj))
+@@ -185,6 +231,12 @@ check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass
+ 
+ #define CHECK_OR_CONSTRUCT_HANDLE(type,mem_manager,flags,item,klass,construct,user_data) \
+ 	(MONO_HANDLE_CAST (type, check_or_construct_handle ( \
+-		(mem_manager), (flags), (klass), (item), (user_data), error, (ReflectionCacheConstructFunc_handle) (construct))))
++		(mem_manager), (flags), (klass), (item), (user_data), NULL, error, (ReflectionCacheConstructFunc_handle) (construct))))
++
++/* Same as CHECK_OR_CONSTRUCT_HANDLE, but surfaces the terminal condemned-manager state to the
++ * caller through CACHE_DEAD instead of turning it into a MonoError. */
++#define CHECK_OR_CONSTRUCT_HANDLE_DEAD(type,mem_manager,flags,item,klass,construct,user_data,cache_dead) \
++	(MONO_HANDLE_CAST (type, check_or_construct_handle ( \
++		(mem_manager), (flags), (klass), (item), (user_data), (cache_dead), error, (ReflectionCacheConstructFunc_handle) (construct))))
+ 
+ #endif /*__MONO_METADATA_REFLECTION_CACHE_H__*/
+diff --git a/src/mono/mono/metadata/reflection-internals.h b/src/mono/mono/metadata/reflection-internals.h
+index 160850ae2..06b098e1f 100644
+--- a/src/mono/mono/metadata/reflection-internals.h
++++ b/src/mono/mono/metadata/reflection-internals.h
+@@ -92,6 +92,20 @@ mono_find_dynamic_image_owner (void *ptr);
+ MONO_COMPONENT_API MonoReflectionAssemblyHandle
+ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error);
+ 
++/*
++ * Like mono_assembly_get_object_handle, but instead of failing with an error when the
++ * assembly's collectible memory manager is CONDEMNED (its LoaderAllocator witness died — the
++ * managed unload ran to the point where every managed reference is gone — but the manager has
++ * not been torn down yet), reports that terminal state through *condemned and returns a NULL
++ * handle with error left OK. A condemned manager's reflection wrapper CANNOT be constructed:
++ * the constructor requires the dead LoaderAllocator (see assembly_object_construct), and
++ * re-creating one would resurrect a condemned manager. Callers that can meaningfully skip such
++ * assemblies (the global enumeration in InternalGetLoadedAssemblies) use this; everyone else
++ * keeps the plain function, which converts the condemned state into a clean MonoError.
++ */
++MonoReflectionAssemblyHandle
++mono_assembly_get_object_handle_or_condemned (MonoAssembly *assembly, gboolean *condemned, MonoError *error);
++
+ MONO_COMPONENT_API MonoReflectionType*
+ mono_type_get_object_checked (MonoType *type, MonoError *error);
+ 
+diff --git a/src/mono/mono/metadata/reflection.c b/src/mono/mono/metadata/reflection.c
+index ea3d4bb28..fd6b534b9 100644
+--- a/src/mono/mono/metadata/reflection.c
++++ b/src/mono/mono/metadata/reflection.c
+@@ -238,6 +238,13 @@ assembly_object_construct (MonoClass *unused_klass, MonoAssembly *assembly, gpoi
+  * @assembly: an assembly
+  *
+  * Return an System.Reflection.Assembly object representing the MonoAssembly @assembly.
++ *
++ * When the assembly's collectible memory manager is condemned (see
++ * mono_assembly_get_object_handle_or_condemned below), no wrapper can exist any more:
++ * assembly_object_construct requires the dead LoaderAllocator (the g_assert above stays — for
++ * a live manager a NULL target is a bug) and caching would resurrect condemned bookkeeping.
++ * The reflection-cache layer turns that terminal state into a clean MonoError here instead of
++ * invoking the constructor, so callers get an ordinary failure, never an abort.
+  */
+ MonoReflectionAssemblyHandle
+ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error)
+@@ -246,6 +253,21 @@ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error)
+ 	return CHECK_OR_CONSTRUCT_HANDLE (MonoReflectionAssembly, m_image_get_mem_manager (assembly->image), MONO_REFL_CACHE_NO_HOT_RELOAD_INVALIDATE, assembly, NULL, assembly_object_construct, NULL);
+ }
+ 
++/*
++ * mono_assembly_get_object_handle_or_condemned:
++ *
++ * Same as mono_assembly_get_object_handle, but reports the condemned-manager terminal state
++ * through *CONDEMNED (returning a NULL handle with error left OK) instead of raising an error,
++ * so enumeration-style callers can skip such assemblies. See reflection-internals.h.
++ */
++MonoReflectionAssemblyHandle
++mono_assembly_get_object_handle_or_condemned (MonoAssembly *assembly, gboolean *condemned, MonoError *error)
++{
++	error_init (error);
++	g_assert (condemned);
++	return CHECK_OR_CONSTRUCT_HANDLE_DEAD (MonoReflectionAssembly, m_image_get_mem_manager (assembly->image), MONO_REFL_CACHE_NO_HOT_RELOAD_INVALIDATE, assembly, NULL, assembly_object_construct, NULL, condemned);
++}
++
+ /**
+  * mono_module_get_object:
+  */
+@@ -530,13 +552,31 @@ mono_type_get_object_checked (MonoType *type, MonoError *error)
+ 			return (MonoReflectionType *)vtable->type;
+ 	}
+ 
+-	mono_mem_manager_init_reflection_hashes (memory_manager);
++	if (!mono_mem_manager_init_reflection_hashes (memory_manager)) {
++		/*
++		 * Condemned collectible manager (LoaderAllocator witness dead, reflection hashes never
++		 * built): the wrapper cannot be constructed — the alloc helper below requires the dead
++		 * LoaderAllocator — and nothing may be resurrected. Same terminal contract as the
++		 * reflection-cache layer (see check_or_construct_handle): a clean error, never an abort.
++		 */
++		mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++		return NULL;
++	}
+ 	mono_loader_lock (); /*FIXME mono_class_init_internal and mono_class_vtable acquire it*/
+ 	mono_mem_manager_lock (memory_manager);
+-	if (memory_manager->collectible)
+-		res = (MonoReflectionType *)mono_weak_hash_table_lookup (memory_manager->weak_type_hash, type);
+-	else
++	if (memory_manager->collectible) {
++		gpointer cached_value = NULL;
++		if (mono_weak_hash_table_lookup_full (memory_manager->weak_type_hash, type, &cached_value) == MONO_WEAK_HASH_LOOKUP_DEAD) {
++			/* Dead weak table: the same condemned-manager terminal state, one step later. */
++			mono_mem_manager_unlock (memory_manager);
++			mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++			res = NULL;
++			goto leave;
++		}
++		res = (MonoReflectionType *)cached_value;
++	} else {
+ 		res = (MonoReflectionType *)mono_g_hash_table_lookup (memory_manager->type_hash, type);
++	}
+ 	mono_mem_manager_unlock (memory_manager);
+ 	if (res)
+ 		goto leave;
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
 index 9aed30b1b..522b4319a 100644
 --- a/src/mono/mono/metadata/weak-hash.c

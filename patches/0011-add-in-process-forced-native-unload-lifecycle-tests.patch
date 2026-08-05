@@ -153,19 +153,41 @@ Round 9 (review 4857579048 + coverage amendment):
     actually ran via the native rehash counter (stats kind 5), and
     re-checks identity through the rehashed table. Added to the CI
     sentinel's required-tests list.
+
+Round 10 (review follow-up):
+
+  * GlobalAssemblyEnumeration_SkipsCondemnedAssembly_WithoutAbortOrResurrection:
+    deterministic regression for the terminal dead-cache result. Builds
+    the condemned-but-not-freed window directly — collectible ALC with
+    materialized+populated reflection hashes, a rooted cross-context
+    generic holding the shared {default, A, B} manager witness, managed
+    Unload, GC until the primary witness proxies (cached assembly/type
+    wrappers) are weak-ref dead, force pinned at NotQuiescent — then
+    drives AppDomain.CurrentDomain.GetAssemblies() through
+    InternalGetLoadedAssemblies and asserts: no abort, the condemned
+    assembly is absent while the sibling's copy stays present, the
+    dead-table lookup counter (stats kind 6) moved (non-vacuous), the
+    weak proxies stayed dead (no resurrection), the force still reports
+    NotQuiescent (nothing freed), and after releasing the last witness
+    the same context still Completes with a clean enumeration. The
+    cross pair is returned directly into a local (not via a tuple) so
+    no compiler temporary keeps the shared witness alive under the
+    interpreter's conservative frame scanning. On the dark legs (flag
+    off, or threads-enabled runtime) it asserts the Rejected surface,
+    that the assembly stays enumerable, and that kind 6 does not move.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 1062 +++++++++++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 1236 +++++++++++++++++
  .../TestClass.cs                              |   37 +
  .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
- 3 files changed, 1100 insertions(+)
+ 3 files changed, 1274 insertions(+)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 000000000..a0dea9617
+index 000000000..efcfd17b4
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1062 @@
+@@ -0,0 +1,1236 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -235,6 +257,10 @@ index 000000000..a0dea9617
 +        // MonoWeakHashTable rehashes actually performed (mono_weak_hash_table_rehash_count).
 +        // Unconditional shared-runtime code, like kinds 2/3.
 +        private const int WeakTableRehashCount = 5;
++        // Weak-table lookups that found a DEAD table (holder collected with the condemned
++        // manager's LoaderAllocator; mono_weak_hash_table_dead_lookup_count). Unconditional
++        // shared-runtime code, like kinds 2/3/5.
++        private const int WeakTableDeadLookupCount = 6;
 +
 +        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
 +            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -689,6 +715,176 @@ index 000000000..a0dea9617
 +                // is ever built and the counter must not move.
 +                Assert.Equal(rehashBefore, rehashAfter);
 +            }
++        }
++
++        /// <summary>
++        /// Terminal dead-cache regression for the global assembly enumeration (round 10).
++        ///
++        /// The state under test is condemned-but-not-freed: a collectible ALC whose managed
++        /// Unload has completed to the point where its primary LoaderAllocator witness (and with
++        /// it the object[2] holders of its reflection weak tables) has been collected, while a
++        /// SHARED generic memory manager witness — kept alive by a rooted cross-context generic
++        /// instance — holds the forced native teardown at NotQuiescent. The ALC's assemblies are
++        /// still on the runtime's loaded list in that window, so the global enumeration
++        /// (AppDomain.CurrentDomain.GetAssemblies -> AssemblyLoadContext.GetLoadedAssemblies ->
++        /// InternalGetLoadedAssemblies) reaches them. Before the fix, the dead weak table
++        /// degraded the cache lookup to a miss, check_or_construct_handle invoked
++        /// assembly_object_construct, and the runtime aborted on g_assert(loader_alloc).
++        ///
++        /// With the fix the dead table is a DISTINCT terminal result: the constructor is never
++        /// invoked, the condemned assembly is filtered out of the returned array, and nothing is
++        /// resurrected — the LoaderAllocator is not re-created and the wrapper weak refs stay
++        /// dead. Kind 6 (dead-table lookups) proves the enumeration really took the dead-cache
++        /// path rather than passing vacuously (e.g. because the assembly was already off the
++        /// loaded list).
++        /// </summary>
++        [Fact]
++        public void GlobalAssemblyEnumeration_SkipsCondemnedAssembly_WithoutAbortOrResurrection()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int deadBefore = ScoutStats(WeakTableDeadLookupCount);
++            Assert.True(deadBefore >= 0,
++                $"The dead-table lookup counter must be available on every build; kind {WeakTableDeadLookupCount} returned {deadBefore}.");
++
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            // The cross pair is returned DIRECTLY into a local (same pattern as
++            // RunRootedCrossGenericProtocol): a tuple return would leave a compiler-generated
++            // ValueTuple temporary holding a second reference to it, which the interpreter's
++            // conservative frame scanning would keep alive past the null-out below and pin the
++            // final force at NotQuiescent forever. The weak witness proxies travel via an array
++            // the helper fills in — WeakReference objects are safe to root anywhere.
++            var witnessRefs = new WeakReference[2];
++            object crossPair = CondemnPrimaryKeepingSharedWitness(contextA, contextB, witnessRefs);
++            WeakReference weakAssembly = witnessRefs[0];
++            WeakReference weakType = witnessRefs[1];
++
++            if (!ProtocolActive)
++            {
++                // Dark surface (flag off on the single-threaded build, or a threads-enabled
++                // runtime): the force is Rejected, nothing is ever condemned, the enumeration
++                // keeps reporting A's assembly, and the dead-table counter (unconditional, like
++                // kinds 2/3/5) must not move.
++                Assert.Equal(Rejected, Force(contextA));
++                Assert.Contains(AppDomain.CurrentDomain.GetAssemblies(),
++                    a => ReferenceEquals(AssemblyLoadContext.GetLoadContext(a), contextA));
++                Assert.Equal(deadBefore, ScoutStats(WeakTableDeadLookupCount));
++
++                contextB.Unload();
++                Assert.Equal(Rejected, Force(contextB));
++                GC.KeepAlive(crossPair);
++                GC.KeepAlive(contextA);
++                GC.KeepAlive(contextB);
++                return;
++            }
++
++            // The primary witness — proxied by the cached wrapper objects, whose weak-table
++            // entries die with the holder — must be collectible now that every A-side strong
++            // reference is confined to the returned-from helper frame. crossPair (the ONLY
++            // intentionally live witness) keeps the shared {default, A, B} manager alive.
++            for (int attempt = 0; attempt < 10 && (weakAssembly.IsAlive || weakType.IsAlive); attempt++)
++            {
++                GcQuiesce();
++            }
++            Assert.False(weakAssembly.IsAlive,
++                "A's cached RuntimeAssembly wrapper must die with the primary LoaderAllocator once the helper frame is gone — otherwise this test is not exercising the condemned state.");
++            Assert.False(weakType.IsAlive,
++                "A's cached Type wrapper must die with the primary LoaderAllocator once the helper frame is gone — otherwise this test is not exercising the condemned state.");
++
++            // The rooted cross-context generic keeps the shared witness alive: the all-or-nothing
++            // gate must decline, leaving the condemned-but-not-freed window in place.
++            Assert.Equal(NotQuiescent, Force(contextA));
++
++            // THE REGRESSION PATH: global enumeration inside that window. Must not abort, must
++            // skip the condemned assembly, must keep the sibling's copy.
++            AssertEnumerationSkipsCondemned(contextA, contextB);
++
++            int deadAfter = ScoutStats(WeakTableDeadLookupCount);
++            Assert.True(deadAfter > deadBefore,
++                $"The enumeration must have looked into A's DEAD weak table at least once (kind {WeakTableDeadLookupCount}: {deadBefore} -> {deadAfter}) — if the counter did not move, the condemned path was never exercised and this test is vacuous.");
++
++            // No resurrection: the wrappers stayed dead (no LoaderAllocator or cache was
++            // re-created to satisfy the enumeration) and the manager is still merely condemned —
++            // a further force still reports NotQuiescent while the shared witness lives, so
++            // nothing was freed by the enumeration either.
++            Assert.False(weakAssembly.IsAlive,
++                "The enumeration must not resurrect the condemned manager's Assembly wrapper.");
++            Assert.False(weakType.IsAlive,
++                "The enumeration must not resurrect the condemned manager's Type wrapper.");
++            Assert.Equal(NotQuiescent, Force(contextA));
++
++            // Release the last witness: the same context must now complete (the skip-filter did
++            // not consume or corrupt the teardown), and the enumeration stays clean after the
++            // assembly really leaves the loaded list.
++            GC.KeepAlive(crossPair);
++            crossPair = null;
++            Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            Assert.Equal(Completed, Force(contextA));
++            AssertEnumerationSkipsCondemned(contextA, contextB);
++
++            contextB.Unload();
++            Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        // Builds the condemned-but-not-freed state: loads the test assembly into A, materializes
++        // A's reflection hashes AND caches its RuntimeAssembly/Type wrappers (so the later
++        // enumeration finds a DEAD table, not an uninitialized one), asserts the positive
++        // control (the global enumeration reports A while everything is alive), creates the
++        // cross-context generic whose vtable lives in the shared {default, A, B} manager, and
++        // unloads A. Every A-side strong reference except the returned crossPair is confined to
++        // this frame (see ExerciseAndUnload for why the interpreter's conservative frame
++        // scanning makes that mandatory); the weak references — written into the caller-owned
++        // witnessRefs array ([0] = assembly wrapper, [1] = type wrapper) — let the caller
++        // observe that the primary witness genuinely died and was not resurrected.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CondemnPrimaryKeepingSharedWitness(
++            AssemblyLoadContext contextA, AssemblyLoadContext contextB, WeakReference[] witnessRefs)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++
++            // Materialize the primary manager's weak tables and populate them: the regression
++            // must find tables that EXISTED and died, exactly like the CI-observed state.
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            foreach (MemberInfo member in typeA.GetMembers(Declared))
++            {
++                Assert.Same(typeA, member.DeclaringType);
++            }
++
++            // Positive control while everything is alive: the global enumeration reports A's
++            // assembly (this also caches the RuntimeAssembly wrapper in the weak refobject hash).
++            Assert.Contains(AppDomain.CurrentDomain.GetAssemblies(),
++                a => ReferenceEquals(AssemblyLoadContext.GetLoadContext(a), contextA));
++
++            object crossPair = CreateCrossPair(contextA, contextB);
++
++            witnessRefs[0] = new WeakReference(asmA);
++            witnessRefs[1] = new WeakReference(typeA);
++
++            contextA.Unload();
++            return crossPair;
++        }
++
++        // The enumeration itself and its assertions live in their own frame so the wrapper
++        // objects it creates (for the sibling's assemblies) die with it and cannot keep any
++        // witness alive across the caller's later forces.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void AssertEnumerationSkipsCondemned(AssemblyLoadContext condemned, AssemblyLoadContext live)
++        {
++            Assembly[] all = AppDomain.CurrentDomain.GetAssemblies();
++            Assert.DoesNotContain(all,
++                a => ReferenceEquals(AssemblyLoadContext.GetLoadContext(a), condemned));
++            Assert.Contains(all,
++                a => ReferenceEquals(AssemblyLoadContext.GetLoadContext(a), live));
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
