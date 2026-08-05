@@ -194,19 +194,41 @@ Round 10 (review follow-up):
   Contains/DoesNotContain probes (no display classes or enumerator
   temporaries in witness-sensitive frames), and the test became async
   Task for the event-loop turns.
+
+  CI follow-up 2 (ST flag-on leg, same precondition): the drain fix was
+  not enough because the root was structural — the shared witness was a
+  ROOTED INSTANCE of KeyValuePair<TypeA, TypeB>, and a live instance
+  must keep TypeA's runtime structures (and with them A's primary
+  witness set) reachable: its field-type closure spans A, which is the
+  same soundness constraint the all-or-nothing gate encodes and exactly
+  what RunRootedCrossGenericProtocol demonstrates (primary witnesses
+  are only ever observed to die AFTER the instance is unrooted). With
+  an instance rooted, the primary-dead/shared-alive window is
+  unreachable by construction. The witness is now the METADATA-level
+  one: the composed RuntimeType wrapper for the cross-context generic
+  (CreateCrossTypeWitness — MakeGenericType only, no
+  Activator.CreateInstance). Composing the type creates the shared
+  {default, A, B} manager, materializes its LoaderAllocator and
+  reflection hashes, and caches the wrapper whose ONLY keepalive edge
+  is that shared LoaderAllocator (the reflection alloc helper sets
+  m_keepalive from the composed class's own memory manager), so
+  rooting it holds the shared witness while A's primary set stays
+  collectible — the exact condemned window the enumeration regression
+  needs, and the metadata-level shape that survives the primary in the
+  CI-observed abort.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 1271 +++++++++++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 1308 +++++++++++++++++
  .../TestClass.cs                              |   37 +
  .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
- 3 files changed, 1309 insertions(+)
+ 3 files changed, 1346 insertions(+)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 000000000..b742b90cc
+index 000000000..6eae223ba
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1308 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -742,9 +764,19 @@ index 000000000..b742b90cc
 +        /// The state under test is condemned-but-not-freed: a collectible ALC whose managed
 +        /// Unload has completed to the point where its primary LoaderAllocator witness (and with
 +        /// it the object[2] holders of its reflection weak tables) has been collected, while a
-+        /// SHARED generic memory manager witness — kept alive by a rooted cross-context generic
-+        /// instance — holds the forced native teardown at NotQuiescent. The ALC's assemblies are
-+        /// still on the runtime's loaded list in that window, so the global enumeration
++        /// SHARED generic memory manager witness — kept alive by a rooted cross-context
++        /// constructed-generic TYPE wrapper — holds the forced native teardown at NotQuiescent.
++        /// The witness is deliberately the composed RuntimeType object, NOT an instance: a live
++        /// INSTANCE of KeyValuePair&lt;TypeA, TypeB&gt; must keep TypeA's runtime structures — and
++        /// with them A's primary witness set — reachable (its field-type closure spans A; the
++        /// all-or-nothing gate exists precisely because freeing an owner under a live instance
++        /// would be unsound, see RunRootedCrossGenericProtocol), so with an instance rooted the
++        /// primary witness can never die and this window is unreachable. The composed TYPE
++        /// wrapper's only keepalive edge is its OWN manager's LoaderAllocator (the shared
++        /// {default, A, B} one — see the reflection alloc helper: m_keepalive is set from
++        /// m_class_get_mem_manager of the composed class), so it holds the shared witness alone
++        /// and the primary set can be collected. The ALC's assemblies are still on the runtime's
++        /// loaded list in that window, so the global enumeration
 +        /// (AppDomain.CurrentDomain.GetAssemblies -> AssemblyLoadContext.GetLoadedAssemblies ->
 +        /// InternalGetLoadedAssemblies) reaches them. Before the fix, the dead weak table
 +        /// degraded the cache lookup to a miss, check_or_construct_handle invoked
@@ -772,14 +804,14 @@ index 000000000..b742b90cc
 +            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +
-+            // The cross pair is returned DIRECTLY into a local (same pattern as
-+            // RunRootedCrossGenericProtocol): a tuple return would leave a compiler-generated
++            // The shared witness (the composed cross-context TYPE wrapper, see the summary) is
++            // returned DIRECTLY into a local: a tuple return would leave a compiler-generated
 +            // ValueTuple temporary holding a second reference to it, which the interpreter's
 +            // conservative frame scanning would keep alive past the null-out below and pin the
 +            // final force at NotQuiescent forever. The weak witness proxies travel via an array
 +            // the helper fills in — WeakReference objects are safe to root anywhere.
 +            var witnessRefs = new WeakReference[2];
-+            object crossPair = CondemnPrimaryKeepingSharedWitness(contextA, contextB, witnessRefs);
++            object sharedWitness = CondemnPrimaryKeepingSharedWitness(contextA, contextB, witnessRefs);
 +            WeakReference weakAssembly = witnessRefs[0];
 +            WeakReference weakType = witnessRefs[1];
 +
@@ -796,7 +828,7 @@ index 000000000..b742b90cc
 +
 +                contextB.Unload();
 +                Assert.Equal(Rejected, Force(contextB));
-+                GC.KeepAlive(crossPair);
++                GC.KeepAlive(sharedWitness);
 +                GC.KeepAlive(contextA);
 +                GC.KeepAlive(contextB);
 +                return;
@@ -804,8 +836,9 @@ index 000000000..b742b90cc
 +
 +            // The primary witness — proxied by the cached wrapper objects, whose weak-table
 +            // entries die with the holder — must be collectible now that every A-side strong
-+            // reference is confined to the returned-from helper frame. crossPair (the ONLY
-+            // intentionally live witness) keeps the shared {default, A, B} manager alive.
++            // reference is confined to the returned-from helper frame. sharedWitness (the ONLY
++            // intentionally live witness, a composed-type wrapper whose keepalive edge reaches
++            // only the shared LoaderAllocator) keeps the shared {default, A, B} manager alive.
 +            //
 +            // Draining needs more than bare GC.Collect loops here (CI-evidenced): the setup
 +            // helper's call tree was deep (global enumeration, per-assembly GetLoadContext,
@@ -815,7 +848,7 @@ index 000000000..b742b90cc
 +            // mechanism ForceUntilCompleted already relies on in every passing test: each
 +            // Force() goes through MethodInfo.Invoke, whose deep interpreter frames scrub the
 +            // stale region between collections. Mirror that here — each attempt collects,
-+            // forces (which must keep reporting NotQuiescent while crossPair lives: the
++            // forces (which must keep reporting NotQuiescent while sharedWitness lives: the
 +            // all-or-nothing gate must decline as long as the shared witness is alive), and
 +            // then turns the JS event loop (as DrainRetiredScoutsAsync does) so the scheduled
 +            // background GC/finalizer pump can run on the single-threaded runtime.
@@ -855,8 +888,8 @@ index 000000000..b742b90cc
 +            // Release the last witness: the same context must now complete (the skip-filter did
 +            // not consume or corrupt the teardown), and the enumeration stays clean after the
 +            // assembly really leaves the loaded list.
-+            GC.KeepAlive(crossPair);
-+            crossPair = null;
++            GC.KeepAlive(sharedWitness);
++            sharedWitness = null;
 +            Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
 +            Assert.Equal(Completed, Force(contextA));
 +            AssertEnumerationSkipsCondemned(contextA, contextB);
@@ -872,12 +905,13 @@ index 000000000..b742b90cc
 +        // A's reflection hashes AND caches its RuntimeAssembly/Type wrappers (so the later
 +        // enumeration finds a DEAD table, not an uninitialized one), asserts the positive
 +        // control (the global enumeration reports A while everything is alive), creates the
-+        // cross-context generic whose vtable lives in the shared {default, A, B} manager, and
-+        // unloads A. Every A-side strong reference except the returned crossPair is confined to
-+        // this frame (see ExerciseAndUnload for why the interpreter's conservative frame
-+        // scanning makes that mandatory); the weak references — written into the caller-owned
-+        // witnessRefs array ([0] = assembly wrapper, [1] = type wrapper) — let the caller
-+        // observe that the primary witness genuinely died and was not resurrected.
++        // cross-context constructed-generic TYPE witness that lives in the shared
++        // {default, A, B} manager, and unloads A. Every A-side strong reference except the
++        // returned shared witness is confined to this frame (see ExerciseAndUnload for why the
++        // interpreter's conservative frame scanning makes that mandatory); the weak references —
++        // written into the caller-owned witnessRefs array ([0] = assembly wrapper, [1] = type
++        // wrapper) — let the caller observe that the primary witness genuinely died and was not
++        // resurrected.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static object CondemnPrimaryKeepingSharedWitness(
 +            AssemblyLoadContext contextA, AssemblyLoadContext contextB, WeakReference[] witnessRefs)
@@ -901,13 +935,38 @@ index 000000000..b742b90cc
 +            Assert.True(EnumerationReportsContext(contextA),
 +                "Positive control failed: the global enumeration must report the collectible ALC's assembly while everything is alive.");
 +
-+            object crossPair = CreateCrossPair(contextA, contextB);
++            object sharedWitness = CreateCrossTypeWitness(contextA, contextB);
 +
 +            witnessRefs[0] = new WeakReference(asmA);
 +            witnessRefs[1] = new WeakReference(typeA);
 +
 +            contextA.Unload();
-+            return crossPair;
++            return sharedWitness;
++        }
++
++        // The METADATA-level shared-manager witness: the RuntimeType wrapper for the
++        // cross-context constructed generic KeyValuePair<TypeA, TypeB>. Composing the type
++        // creates the shared {default, A, B} generic memory manager, materializes its
++        // LoaderAllocator and reflection hashes, and caches this wrapper in them; the wrapper's
++        // ONLY keepalive edge is that shared LoaderAllocator (the reflection alloc helper sets
++        // m_keepalive from the composed class's own memory manager), so rooting it holds the
++        // shared witness WITHOUT keeping any of A's primary witness set alive. Deliberately no
++        // Activator.CreateInstance here: a live INSTANCE must keep TypeA's runtime structures
++        // (and so A's primary witnesses) reachable — that instance-rooted scenario is
++        // RunRootedCrossGenericProtocol's, and it makes the primary-dead/shared-alive window
++        // this witness exists for unreachable. All other loads/wrappers are confined to this
++        // frame.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CreateCrossTypeWitness(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            Type crossType = typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB);
++            Assert.NotNull(crossType);
++            return crossType;
 +        }
 +
 +        // The enumeration itself lives in its own frame so the wrapper objects it creates (for
