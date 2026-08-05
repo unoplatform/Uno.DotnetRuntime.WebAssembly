@@ -515,6 +515,9 @@ jobs:
         # wasm/V8 (tracked separately; this job gates the Loader/ALC surface only).
         # MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes the lifecycle tests FAIL (not self-skip) if the
         # ForceNativeUnload member is missing, so a trim/rooting regression cannot read as green.
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 arms the deterministic native GC hook that collects
+        # inside the reflection-hash construction window (kind 4 of the stats icall); with the
+        # flag OFF no ALC is collectible, so the tests assert the armed hook never fires.
         # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
         # earlier leg or rerun left behind, so the file this step validates can only have
         # been produced by the invocation below.
@@ -525,7 +528,7 @@ jobs:
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
         # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
         # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
         # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
@@ -550,6 +553,11 @@ jobs:
       run: |
         set -e
         cd runtime
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 arms the deterministic native GC hook: every
+        # reflection-hash init on this leg performs REAL nursery collections inside the
+        # pinned-holder construction window, and the pressure test asserts the fire counter
+        # (kind 4) advanced at least once per init — reverting the holder pins fails this leg
+        # deterministically instead of depending on stochastic churn.
         # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
         # earlier leg or rerun left behind, so the file this step validates can only have
         # been produced by the invocation below.
@@ -560,7 +568,7 @@ jobs:
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
         # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
         # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
         # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
@@ -723,6 +731,9 @@ jobs:
         # job's charter) and MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes a missing bridge member
         # fail loudly. MONO_WASM_ENABLE_ALC_UNLOAD=1 proves the flag alone cannot enable the
         # feature on a threads-enabled runtime: every force must still be Rejected.
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 is set for the same reason: the deterministic GC
+        # hook is compiled out with the DISABLE_THREADS gate, so the tests assert its counter
+        # (stats kind 4) reports unavailable (-1) here even though the env var is set.
         #
         # --no-sandbox / --disable-dev-shm-usage: the job runs as root in a container with a small
         # /dev/shm; Chrome refuses to start as root with its sandbox and crashes on a tiny shm.
@@ -737,7 +748,7 @@ jobs:
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:WasmEnableThreads=true /p:Scenario=WasmTestOnChrome /p:InstallChromeForTests=true \
           "/p:WasmXHarnessArgs=--browser-arg=--no-sandbox --browser-arg=--disable-dev-shm-usage" \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=IsBrowserThreadingSupported=true"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 --setenv=IsBrowserThreadingSupported=true"
         # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
         # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
         # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit

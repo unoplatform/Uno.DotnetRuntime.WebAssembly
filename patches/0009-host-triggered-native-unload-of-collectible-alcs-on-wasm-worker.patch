@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Mon, 06 Jul 2026 00:00:00 +0000
+Date: Mon, 6 Jul 2026 00:00:00 +0000
 Subject: [PATCH] feat: host-triggered native unload of collectible
  AssemblyLoadContexts on a WASM worker
 
@@ -248,21 +248,47 @@ The behaviour is fully dark unless MONO_WASM_ENABLE_ALC_UNLOAD is set
 on a DISABLE_THREADS browser build: individual ALCs stay
 non-collectible, InternalForceNativeUnload returns Rejected, and the
 memory manager free keeps its poisoning path for validation runs.
+
+Round 9 (deterministic coverage amendment):
+
+  * Deterministic test GC hook for the reflection-hash construction
+    window: managed nursery churn cannot force a collection between two
+    chosen allocations (a few tens of KiB against a 4 MiB nursery), so a
+    revert of the holder pins could stay green whenever no collection
+    happened to land inside the short window.
+    mono_mem_manager_alc_unload_test_gc_hook -- compiled only under
+    DISABLE_THREADS like the rest of the machinery, inert unless
+    MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set (one cached getenv,
+    mirroring the MONO_WASM_ENABLE_ALC_UNLOAD opt-in) -- performs a real
+    nursery collection (mono_gc_collect(0), the same entry point as
+    GC.Collect(0)) and counts the fire. Call sites cover the exact
+    window the pins protect: after the holders_arr allocation and
+    between the holder allocations (memory-manager.c), plus inside
+    mono_weak_hash_table_new between the holder fetch and the table's
+    own array allocations (the pins deliberately span that call too).
+    Exposed as kind 4 of InternalGetScoutRetirementStats; a
+    threads-enabled build reports -1 even with the env var set, so the
+    hook cannot be smuggled past the DISABLE_THREADS hard gate.
+  * Kind 5 of the same icall exposes mono_weak_hash_table_rehash_count
+    (unconditional shared-runtime code, like kinds 2/3) so a lifecycle
+    test can prove a reflection workload really crossed the
+    initial-table-size load-factor boundary instead of assuming so.
 ---
- src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs |   7 +++++--
- src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs | 108 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
- src/mono/mono/metadata/assembly-load-context.c                                        | 333 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-----------
- src/mono/mono/metadata/icall-def.h                                                    |   2 ++
- src/mono/mono/metadata/loader-internals.h                                             |   3 +++
- src/mono/mono/metadata/memory-manager.c                                               |  67 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
- src/mono/mono/metadata/weak-hash.c                                                    |  45 +++++++++++++++++++++++++++++++++++++++++++++
- src/mono/mono/metadata/weak-hash.h                                                    |   7 +++++++
- src/mono/mono/mini/interp/interp.c                                                    |  36 ++++++++++++++++++++++++++++++++++++
- src/mono/mono/mini/interp/interp.h                                                    |   3 +++
- src/mono/mono/mini/mini-runtime.c                                                     |   5 +++++
- 11 files changed, 601 insertions(+), 15 deletions(-)
+ .../Runtime/Loader/AssemblyLoadContext.cs     |   7 +-
+ .../Loader/AssemblyLoadContext.Mono.cs        | 108 +++++-
+ .../mono/metadata/assembly-load-context.c     | 349 +++++++++++++++++-
+ src/mono/mono/metadata/icall-def.h            |   2 +
+ src/mono/mono/metadata/loader-internals.h     |  27 ++
+ src/mono/mono/metadata/memory-manager.c       | 136 ++++++-
+ src/mono/mono/metadata/weak-hash.c            |  45 +++
+ src/mono/mono/metadata/weak-hash.h            |   7 +
+ src/mono/mono/mini/interp/interp.c            |  36 ++
+ src/mono/mono/mini/interp/interp.h            |   3 +
+ src/mono/mono/mini/mini-runtime.c             |   5 +
+ 11 files changed, 710 insertions(+), 15 deletions(-)
+
 diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
-index 9f94037..4eac33a 100644
+index 9f9403738..4eac33a24 100644
 --- a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
 +++ b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
 @@ -44,8 +44,11 @@ private enum InternalState
@@ -280,7 +306,7 @@ index 9f94037..4eac33a 100644
  
          // synchronization primitive to protect against usage of this instance while unloading
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index 57db653..cc30e0c 100644
+index 57db6533e..cc30e0cdb 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 @@ -17,11 +17,26 @@ internal IntPtr NativeALC
@@ -410,7 +436,7 @@ index 57db653..cc30e0c 100644
          [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
  #pragma warning disable IDE0060
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index dec9f96..efc6b34 100644
+index dec9f96b6..66b709ca6 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -3,6 +3,7 @@
@@ -645,7 +671,7 @@ index dec9f96..efc6b34 100644
  
  	g_assert (alc->collectible);
  	g_assert (!alc->unloading);
-@@ -298,6 +464,135 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -298,6 +464,151 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -760,9 +786,23 @@ index dec9f96..efc6b34 100644
 +	 * unconditional shared-runtime code, so its diagnostics must be readable on a
 +	 * threads-enabled build too — there the ledger simply never moves, because no ALC is ever
 +	 * collectible and only collectible managers build reflection hashes.
++	 *
++	 * Kind 4 — monotonic count of deterministic test-GC-hook fires inside the reflection-hash
++	 * construction window (see mono_mem_manager_alc_unload_test_gc_hook). Compiled only on the
++	 * single-threaded build like kinds 0/1, so a threads-enabled runtime reports -1 even when
++	 * MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set — the hook cannot be smuggled past the
++	 * DISABLE_THREADS hard gate.
++	 *
++	 * Kind 5 — monotonic count of MonoWeakHashTable rehashes actually performed (see
++	 * mono_weak_hash_table_rehash_count). Unconditional like kinds 2/3: the rehash fix it
++	 * observes is shared-runtime code. A lifecycle test uses it to prove a reflection workload
++	 * genuinely crossed the initial-table-size load-factor boundary (initial size 11, rehash
++	 * before the 9th unique insertion into one table) instead of assuming so.
 +	 */
 +	if (kind == 2 || kind == 3)
 +		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
++	if (kind == 5)
++		return mono_weak_hash_table_rehash_count ();
 +
 +#ifndef DISABLE_THREADS
 +	return -1;
@@ -772,6 +812,8 @@ index dec9f96..efc6b34 100644
 +		return retired_scout_targets ? (int)retired_scout_targets->len : 0;
 +	case 1:
 +		return retired_scout_terminal_count;
++	case 4:
++		return mono_mem_manager_alc_unload_test_gc_hook_count ();
 +	default:
 +		return -1;
 +	}
@@ -781,7 +823,7 @@ index dec9f96..efc6b34 100644
  gpointer
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
-@@ -701,6 +996,22 @@ mono_alc_get_all (void)
+@@ -701,6 +1012,22 @@ mono_alc_get_all (void)
  MonoBoolean
  ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  {
@@ -805,7 +847,7 @@ index dec9f96..efc6b34 100644
  	return FALSE;
  
 diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
-index 444a41c..4e1a934 100644
+index 444a41c2b..4e1a93423 100644
 --- a/src/mono/mono/metadata/icall-def.h
 +++ b/src/mono/mono/metadata/icall-def.h
 @@ -472,7 +472,9 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
@@ -819,7 +861,7 @@ index 444a41c..4e1a934 100644
  HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
  HANDLES(ALC_3, "InternalLoadFromStream", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream, MonoReflectionAssembly, 5, (gpointer, gpointer, gint32, gpointer, gint32))
 diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
-index 2f42290..7b97776 100644
+index 2f422904e..cbd6aa231 100644
 --- a/src/mono/mono/metadata/loader-internals.h
 +++ b/src/mono/mono/metadata/loader-internals.h
 @@ -297,6 +297,9 @@ mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collec
@@ -832,11 +874,49 @@ index 2f42290..7b97776 100644
  void
  mono_mem_manager_free_objects (MonoMemoryManager *memory_manager);
  
+@@ -368,6 +371,30 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager);
+ void
+ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager);
+ 
++/*
++ * Test-only deterministic GC hook for the reflection-hash construction window (see
++ * mono_mem_manager_init_reflection_hashes). Gated twice: compiled only on the single-threaded
++ * build (DISABLE_THREADS, like the rest of the forced-unload machinery) and inert at runtime
++ * unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set — when unset the only cost is one cached
++ * getenv per process and a branch per call site. When armed, every call performs a nursery
++ * collection and increments an observable counter (scout-stats kind 4), so a regression test
++ * can prove a collection really happened INSIDE the window the pinned holder handles protect
++ * instead of relying on stochastic allocation pressure.
++ */
++#ifdef DISABLE_THREADS
++void
++mono_mem_manager_alc_unload_test_gc_hook (void);
++
++gint32
++mono_mem_manager_alc_unload_test_gc_hook_count (void);
++#else
++static inline void
++mono_mem_manager_alc_unload_test_gc_hook (void)
++{
++	/* Threads-enabled build: the forced-unload machinery (and this hook) is compiled out. */
++}
++#endif
++
+ G_END_DECLS
+ 
+ #endif
 diff --git a/src/mono/mono/metadata/memory-manager.c b/src/mono/mono/metadata/memory-manager.c
-index e7a2346..73c5c3e 100644
+index e7a234661..235884011 100644
 --- a/src/mono/mono/metadata/memory-manager.c
 +++ b/src/mono/mono/metadata/memory-manager.c
-@@ -263,6 +263,14 @@ memory_manager_delete (MonoMemoryManager *memory_manager, gboolean debug_unload)
+@@ -1,5 +1,6 @@
+ #include <mono/metadata/loader-internals.h>
+ #include <mono/metadata/gc-internals.h>
++#include <mono/metadata/mono-gc.h>
+ #include <mono/metadata/reflection-cache.h>
+ #include <mono/metadata/mono-hash-internals.h>
+ #include <mono/metadata/debug-internals.h>
+@@ -263,6 +264,14 @@ memory_manager_delete (MonoMemoryManager *memory_manager, gboolean debug_unload)
  		memory_manager->_mp = NULL;
  		mono_code_manager_destroy (memory_manager->code_mp);
  		memory_manager->code_mp = NULL;
@@ -851,7 +931,7 @@ index e7a2346..73c5c3e 100644
  	}
  }
  
-@@ -481,6 +489,19 @@ mem_manager_cache_add (MonoMemoryManager *mem_manager)
+@@ -481,6 +490,19 @@ mem_manager_cache_add (MonoMemoryManager *mem_manager)
  	mem_manager_cache [index] = mem_manager;
  }
  
@@ -871,7 +951,71 @@ index e7a2346..73c5c3e 100644
  static MonoMemoryManager*
  get_mem_manager_for_alcs (MonoAssemblyLoadContext **alcs, int nalcs)
  {
-@@ -687,13 +708,44 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+@@ -662,6 +684,63 @@ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager)
+ 	return res;
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Deterministic test hook for the reflection-hash construction window below.
++ *
++ * The stochastic nursery churn a lifecycle test can apply from managed code is vacuous with
++ * respect to the pinned-holder fix: the workload allocates a few tens of KiB against a 4 MiB
++ * nursery and cannot place a collection between two chosen allocations, so reverting the pins
++ * could stay green whenever no collection happens to land inside the short window. When
++ * MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set (CI test legs only), each hook call forces a
++ * nursery collection at the exact points a hostile collection could strike — between the
++ * holder-array allocations and, via the call in mono_weak_hash_table_new, between a table's
++ * internal array allocations — and counts the fire so the test can assert the collections
++ * actually happened. With the pins present this must be behaviorally invisible; with the pins
++ * reverted the collected/moved holders make the reflection-cache coherence assertions (or the
++ * holder liveness asserts) fail deterministically.
++ *
++ * Same double gate as the rest of the forced-unload machinery: DISABLE_THREADS at compile
++ * time, an explicit env opt-in at runtime (cached once, mirroring MONO_WASM_ENABLE_ALC_UNLOAD
++ * in mono_alc_init). Single-threaded by construction, so plain increments suffice.
++ */
++static gint32 alc_unload_test_gc_hook_fired;
++
++static gboolean
++alc_unload_test_gc_hook_enabled (void)
++{
++	static int enabled = -1;
++	if (enabled == -1) {
++		/* Explicit opt-in only: unset, empty, "0" and "false" all remain off. */
++		char *val = g_getenv ("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK");
++		enabled = (val && (!g_ascii_strcasecmp (val, "1") || !g_ascii_strcasecmp (val, "true"))) ? 1 : 0;
++		g_free (val);
++	}
++	return enabled == 1;
++}
++
++void
++mono_mem_manager_alc_unload_test_gc_hook (void)
++{
++	if (G_LIKELY (!alc_unload_test_gc_hook_enabled ()))
++		return;
++	alc_unload_test_gc_hook_fired++;
++	/*
++	 * Nursery collection, same entry point as GC.Collect(0) (ves_icall_System_GC_InternalCollect),
++	 * called from GC-unsafe code exactly like an allocation-triggered minor collection would be.
++	 * The construction window's objects are freshly allocated, so a minor collection is what
++	 * moves or reclaims them when they are insufficiently rooted.
++	 */
++	mono_gc_collect (0);
++}
++
++gint32
++mono_mem_manager_alc_unload_test_gc_hook_count (void)
++{
++	return alc_unload_test_gc_hook_fired;
++}
++#endif /* DISABLE_THREADS */
++
+ /*
+  * Initialize reflection hashes in MEM_MANAGER.
+  * This is done on demand, see get_loader_alloc ().
+@@ -687,15 +766,57 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
  	MonoArray *holders_arr = mono_array_new_checked (mono_get_object_class (), nhashes, error);
  	mono_error_assert_ok (error);
  
@@ -905,6 +1049,15 @@ index e7a2346..73c5c3e 100644
 +	 * argument harder to check, and this is arguably upstreamable as-is.
 +	 */
 +	MonoGCHandle holders_arr_pin = mono_gchandle_new_internal ((MonoObject*)holders_arr, TRUE);
++
++	/*
++	 * Test hook (inert unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set): force a collection at
++	 * each point of the construction window where only the pins above keep the already
++	 * allocated arrays alive and in place — after holders_arr, then between the holder
++	 * allocations. The third window (between a table's own internal array allocations, which
++	 * the pins also span) is hooked inside mono_weak_hash_table_new itself.
++	 */
++	mono_mem_manager_alc_unload_test_gc_hook ();
  
  	MonoArray *holders [16];
 +	MonoGCHandle holder_pins [16];
@@ -916,8 +1069,12 @@ index e7a2346..73c5c3e 100644
 +		holder_pins [i] = mono_gchandle_new_internal ((MonoObject*)holders [i], TRUE);
  		mono_array_setref_fast (holders_arr, i, holders [i]);
  		holder_handles [i] = mono_gchandle_new_weakref_internal ((MonoObject*)holders [i], FALSE);
++		/* Between holder allocations (and after the last one, before the tables are built). */
++		mono_mem_manager_alc_unload_test_gc_hook ();
  	}
-@@ -710,10 +762,22 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+ 
+ 	mono_mem_manager_lock (mem_manager);
+@@ -710,10 +831,22 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
  		/* Set this last because of the double checked locking above */
  		mem_manager->weak_refobject_hash = hash;
  	} else {
@@ -940,14 +1097,14 @@ index e7a2346..73c5c3e 100644
  }
  
  void
-@@ -722,4 +786,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
+@@ -722,4 +855,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
  	/* Free the strong handle so the LoaderAllocator object can be freed */
  	MonoGCHandle loader_handle = mem_manager->loader_allocator_handle;
  	mono_gchandle_free_internal (loader_handle);
 +	mem_manager->loader_allocator_handle = NULL;
  }
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
-index 9aed30b..522b431 100644
+index 9aed30b1b..522b4319a 100644
 --- a/src/mono/mono/metadata/weak-hash.c
 +++ b/src/mono/mono/metadata/weak-hash.c
 @@ -32,6 +32,31 @@ struct _MonoWeakHashTable {
@@ -1018,7 +1175,7 @@ index 9aed30b..522b431 100644
  		g_free (hash->keys);
  	if (!(hash->gc_type & MONO_HASH_VALUE_GC))
 diff --git a/src/mono/mono/metadata/weak-hash.h b/src/mono/mono/metadata/weak-hash.h
-index ba5fdcc..a3d9d3c 100644
+index ba5fdcc2b..a3d9d3c4a 100644
 --- a/src/mono/mono/metadata/weak-hash.h
 +++ b/src/mono/mono/metadata/weak-hash.h
 @@ -20,4 +20,11 @@ void     mono_weak_hash_table_destroy         (MonoWeakHashTable *hash);
@@ -1034,7 +1191,7 @@ index ba5fdcc..a3d9d3c 100644
 +
  #endif /* __MONO_WEAK_HASH_H__ */
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index b4f9175..a47d812 100644
+index b4f917526..a47d81246 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -3725,6 +3725,42 @@ interp_free_method (MonoMethod *method)
@@ -1081,7 +1238,7 @@ index b4f9175..a47d812 100644
  static long opcode_counts[MINT_LASTOP];
  
 diff --git a/src/mono/mono/mini/interp/interp.h b/src/mono/mono/mini/interp/interp.h
-index a09111c..88895bb 100644
+index a09111c49..88895bb21 100644
 --- a/src/mono/mono/mini/interp/interp.h
 +++ b/src/mono/mono/mini/interp/interp.h
 @@ -57,6 +57,9 @@ typedef struct _InterpMethodArguments InterpMethodArguments;
@@ -1095,7 +1252,7 @@ index a09111c..88895bb 100644
  
  gpointer
 diff --git a/src/mono/mono/mini/mini-runtime.c b/src/mono/mono/mini/mini-runtime.c
-index 7cf6384..760ca0b 100644
+index 7cf63847f..760ca0bf9 100644
 --- a/src/mono/mono/mini/mini-runtime.c
 +++ b/src/mono/mono/mini/mini-runtime.c
 @@ -4458,6 +4458,11 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
@@ -1112,3 +1269,4 @@ index 7cf6384..760ca0b 100644
  	mono_llvm_free_mem_manager (info);
 -- 
 2.43.0
+

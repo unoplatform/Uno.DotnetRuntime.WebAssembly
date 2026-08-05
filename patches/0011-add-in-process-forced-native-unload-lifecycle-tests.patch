@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Thu, 31 Jul 2026 00:00:00 +0000
-Subject: [PATCH] test: in-process lifecycle tests for host-triggered native ALC unload
+Date: Fri, 31 Jul 2026 00:00:00 +0000
+Subject: [PATCH] test: in-process lifecycle tests for host-triggered native
+ ALC unload
 
 Adds ForcedNativeUnloadTests to System.Runtime.Loader.Tests, exercising the
 opt-in native unload protocol in-process (no RemoteExecutor, so they run on
@@ -114,16 +115,57 @@ protocol. On a genuinely unpatched runtime
 MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
 trim/rooting regression and fails loudly instead of silently self-skipping.
 
+Round 9 (review 4857579048 + coverage amendment):
+
+  * MT drain fix: DrainRetiredScoutsAsync is now called only when the
+    forced-teardown protocol is active -- on a threads-enabled runtime
+    kinds 0/1 report -1 by design, so the unconditional per-cycle drain
+    in the reflection-hash test spun on -1 for 20 passes and then
+    asserted -1 == 0 (the deterministic test_loader_wasm_mt failure).
+    Kinds 2/3 (the handle ledger) stay read unconditionally on MT.
+  * ST frame-roots fix: the reflection workload of each pressure cycle
+    (asm/type/member enumerations/cross-ALC List over the collectible
+    type) is confined to a NoInlining helper that returns no collectible
+    root and unloads before returning, mirroring ExerciseAndUnload --
+    the interpreter records every IL local of a live frame as a
+    reference slot and scans them conservatively (including
+    compiler-generated enumerator/temporary slots), so the old
+    same-frame locals kept the primary and shared-generic
+    LoaderAllocator witnesses alive and pinned the force at
+    NotQuiescent (the deterministic ST flag-ON failure).
+  * Deterministic window coverage: with MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK
+    armed (CI wasm legs), the pressure test asserts the native hook
+    fired at least once per reflection-hash init (stats kind 4) -- a
+    real nursery collection inside the pinned-holder construction window
+    per cycle -- while the coherence assertions still held, so reverting
+    the pins fails deterministically instead of staying vacuously green.
+    On a threads-enabled runtime it asserts kind 4 stays -1 (hook
+    compiled out with the DISABLE_THREADS gate); with the flag off, that
+    an armed hook never fires (the init early-returns).
+  * Rehash-boundary coverage:
+    ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary drives
+    reflection over RehashProbeClass (new type in the test assembly:
+    12 methods + 1 constructor + 4 fields = 17 refobject-cache entries,
+    deliberately no nested types, which go to the separate type cache)
+    so ONE weak_refobject_hash receives at least 9 unique insertions --
+    the initial size-11 table rehashes before the 9th (load factor 0.7).
+    The test asserts the member arithmetic at runtime, proves the rehash
+    actually ran via the native rehash counter (stats kind 5), and
+    re-checks identity through the rehashed table. Added to the CI
+    sentinel's required-tests list.
 ---
- src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs         | 874 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj |   1 +
- 2 files changed, 875 insertions(+)
+ .../tests/ForcedNativeUnloadTests.cs          | 1062 +++++++++++++++++
+ .../TestClass.cs                              |   37 +
+ .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
+ 3 files changed, 1100 insertions(+)
+ create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 0000000..61655dd
+index 000000000..a0dea9617
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,1062 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -170,6 +212,7 @@ index 0000000..61655dd
 +    {
 +        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
 +        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
++        private const string RehashProbeClassName = "System.Runtime.Loader.Tests.RehashProbeClass";
 +
 +        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult and the native
 +        // ves_icall_..._InternalForceNativeUnload return codes.
@@ -185,6 +228,13 @@ index 0000000..61655dd
 +        // mono_weak_hash_table_destroy, their owner.
 +        private const int HolderHandlesTaken = 2;
 +        private const int HolderHandlesFreed = 3;
++        // Deterministic test-GC-hook fires inside the reflection-hash construction window
++        // (mono_mem_manager_alc_unload_test_gc_hook). Behind the DISABLE_THREADS gate like kinds
++        // 0/1: a threads-enabled runtime reports -1 even when the hook env var is set.
++        private const int GcHookFiredCount = 4;
++        // MonoWeakHashTable rehashes actually performed (mono_weak_hash_table_rehash_count).
++        // Unconditional shared-runtime code, like kinds 2/3.
++        private const int WeakTableRehashCount = 5;
 +
 +        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
 +            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -214,6 +264,14 @@ index 0000000..61655dd
 +        // regression, not a legitimately unpatched runtime.
 +        private static bool RequireBridge =>
 +            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE") == "1";
++
++        // Set by the CI wasm legs: arms the native deterministic GC hook that forces a nursery
++        // collection at each point inside the reflection-hash construction window that the
++        // pinned holder handles protect (see mono_mem_manager_alc_unload_test_gc_hook). On the
++        // single-threaded build the fire counter (kind 4) must then advance per init; on a
++        // threads-enabled runtime the hook is compiled out and kind 4 stays -1 regardless.
++        private static bool GcHookRequested =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK") == "1";
 +
 +        // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
 +        // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
@@ -464,12 +522,18 @@ index 0000000..61655dd
 +        /// weak. This test drives that window many times over FRESH collectible ALCs with nursery
 +        /// pressure applied immediately before and between the touches, and asserts the
 +        /// reflection-cache stays coherent (identity of Type objects and of every declared
-+        /// member's DeclaringType) rather than merely "did not crash". It is BEST-EFFORT
-+        /// stochastic coverage, NOT a deterministic interleaving: it cannot pin a collection to a
-+        /// chosen instruction. The pin gives us no supported knob at this runtime pin either —
-+        /// sgen's collect-before-allocs is a MONO_GC_DEBUG option that collects on essentially
-+        /// every allocation, which would make the whole test assembly (including runtime startup)
-+        /// unusable, so no dedicated GC-stress CI step is claimed here.
++        /// member's DeclaringType) rather than merely "did not crash". The managed churn alone is
++        /// BEST-EFFORT (a few tens of KiB against a 4 MiB nursery cannot force a collection into
++        /// a chosen window), which is why the CI legs additionally arm
++        /// MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK: a narrowly gated native hook that performs a REAL
++        /// nursery collection at each point inside the construction window the pinned holder
++        /// handles protect (after the holders_arr allocation, between the holder allocations, and
++        /// between each table's internal array allocations) and counts the fires (kind 4). With
++        /// the hook armed this test asserts the collections actually happened inside the window,
++        /// so reverting the pins deterministically fails the coherence assertions instead of
++        /// staying green whenever no collection happened to land there. sgen's
++        /// collect-before-allocs remains unusable here (it collects on essentially every
++        /// allocation, killing runtime startup), hence the dedicated hook.
 +        ///
 +        /// Handle ownership (what this DOES measure exactly): mono_weak_hash_table_new hands the
 +        /// key_value_handle to the table and mono_weak_hash_table_destroy is now its sole owner.
@@ -493,6 +557,7 @@ index 0000000..61655dd
 +
 +            int takenBefore = ScoutStats(HolderHandlesTaken);
 +            int freedBefore = ScoutStats(HolderHandlesFreed);
++            int hookBefore = ScoutStats(GcHookFiredCount);
 +
 +            // Kinds 2/3 are NOT behind the DISABLE_THREADS gate (the ownership fix they observe is
 +            // unconditional shared-runtime code), so they must be readable on every leg.
@@ -508,7 +573,16 @@ index 0000000..61655dd
 +            {
 +                ReflectionHashInitUnderPressureCycle(i);
 +                GcQuiesce();
-+                await DrainRetiredScoutsAsync();
++
++                if (ProtocolActive)
++                {
++                    // Only drain when the retired-scout registry is actually active: on a
++                    // threads-enabled runtime kinds 0/1 report -1 by design (the registry is
++                    // compiled out with the DISABLE_THREADS hard gate), so draining would spin on
++                    // -1 and then assert -1 == 0. Kinds 2/3 (the handle ledger) stay read
++                    // unconditionally below — the ownership fix they observe is shared code.
++                    await DrainRetiredScoutsAsync();
++                }
 +            }
 +
 +            GcQuiesce();
@@ -518,6 +592,37 @@ index 0000000..61655dd
 +
 +            Assert.True(freedAfter <= takenAfter,
 +                $"More key_value_handles freed ({freedAfter}) than taken ({takenAfter}): mono_weak_hash_table_destroy must free each handed-over handle exactly once.");
++
++            int hookAfter = ScoutStats(GcHookFiredCount);
++            if (PlatformDetection.IsThreadingSupported)
++            {
++                // The hook is compiled out with the rest of the forced-teardown machinery
++                // (DISABLE_THREADS hard gate): even with MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK set,
++                // the counter must consistently report unavailable.
++                Assert.Equal(-1, hookAfter);
++            }
++            else if (GcHookRequested)
++            {
++                if (ProtocolActive)
++                {
++                    // Deterministic (non-vacuous) window coverage: each cycle ran
++                    // mono_mem_manager_init_reflection_hashes for a FRESH collectible ALC with the
++                    // hook armed, so a REAL nursery collection fired inside the pinned-holder
++                    // construction window at least once per init (currently seven sites per init:
++                    // holders_arr, three holders, three table-internal windows). The coherence
++                    // assertions above therefore ran against actually-collected nursery state —
++                    // reverting the holder pins makes these cycles fail instead of staying green.
++                    Assert.True(hookAfter - hookBefore >= Cycles,
++                        $"Expected the armed test GC hook to fire at least once per reflection-hash init ({Cycles} inits), but it fired {hookAfter - hookBefore} times ({hookBefore} -> {hookAfter}) — the deterministic in-window collection coverage did not actually run.");
++                }
++                else
++                {
++                    // Flag off on the single-threaded build: no ALC is collectible, the
++                    // reflection-hash init early-returns before the window, so the armed hook
++                    // must never fire.
++                    Assert.Equal(hookBefore, hookAfter);
++                }
++            }
 +
 +            if (!ProtocolActive)
 +            {
@@ -541,6 +646,109 @@ index 0000000..61655dd
 +            int outstandingAfter = takenAfter - freedAfter;
 +            Assert.True(outstandingAfter - outstandingBefore <= Slack,
 +                $"Outstanding reflection-hash holder handles grew from {outstandingBefore} to {outstandingAfter} across {Cycles} forced cycles that took over {taken} handles. mono_weak_hash_table_destroy must free key_value_handle, otherwise three handle-table slots leak per reflection-using memory manager per cycle.");
++        }
++
++        /// <summary>
++        /// Deterministic rehash-boundary coverage for the no-safepoints weak-table rehash fix
++        /// (patch 0010, previously a g_assert_not_reached that aborted the runtime).
++        ///
++        /// The arithmetic: a MonoWeakHashTable starts at size 11 (g_spaced_primes_closest(1)) and
++        /// mono_weak_hash_table_insert_replace rehashes when the pre-insert in_use exceeds
++        /// 11 * 0.7 = 7.7 — i.e. before the 9th unique insertion into ONE table. Reflecting over
++        /// every declared member of RehashProbeClass inserts 17 entries (12 methods + 1
++        /// constructor + 4 fields; deliberately no nested types, which go to the separate
++        /// type cache) into the collectible manager's single weak_refobject_hash, so the
++        /// boundary is necessarily crossed. The native rehash counter (stats kind 5) proves the
++        /// rehash actually ran at runtime instead of leaving the claim to construction, and the
++        /// identity re-checks prove the rehashed table still resolves every entry.
++        /// </summary>
++        [Fact]
++        public void ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int rehashBefore = ScoutStats(WeakTableRehashCount);
++            Assert.True(rehashBefore >= 0,
++                $"The weak-table rehash counter must be available on every build; kind {WeakTableRehashCount} returned {rehashBefore}.");
++
++            RunRefobjectRehashCycle();
++            GcQuiesce();
++
++            int rehashAfter = ScoutStats(WeakTableRehashCount);
++            if (ProtocolActive)
++            {
++                Assert.True(rehashAfter > rehashBefore,
++                    $"Reflecting over all declared members of {RehashProbeClassName} must cross the initial weak_refobject_hash load-factor boundary (size 11, rehash before the 9th unique insertion) and perform a real rehash, but the native rehash counter did not move ({rehashBefore} -> {rehashAfter}) — the rehash regression coverage is vacuous.");
++            }
++            else
++            {
++                // Flag off, or threads-enabled runtime: no ALC is collectible, so no weak table
++                // is ever built and the counter must not move.
++                Assert.Equal(rehashBefore, rehashAfter);
++            }
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunRefobjectRehashCycle()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            // All collectible roots are confined to the helper frame (see
++            // ReflectionHashInitUnderPressureCycle for why that matters on the interpreter).
++            ExerciseRehashProbe(context);
++
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
++        }
++
++        // Drives >= 9 unique insertions into ONE weak_refobject_hash and re-checks identity
++        // through the rehashed table. Returns no collectible root; unloads before returning.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseRehashProbe(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type probe = asm.GetType(RehashProbeClassName, throwOnError: true);
++
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            MemberInfo[] first = probe.GetMembers(Declared);
++
++            // Assert (not assume) the arithmetic behind the boundary claim: only MethodBase and
++            // FieldInfo entries populate weak_refobject_hash — nested types would go to the type
++            // cache — and crossing the initial size-11 table's 0.7 load factor needs at least 9.
++            int refobjectEntries = 0;
++            foreach (MemberInfo member in first)
++            {
++                if (member is MethodBase || member is FieldInfo)
++                {
++                    refobjectEntries++;
++                }
++
++                Assert.Same(probe, member.DeclaringType);
++            }
++
++            Assert.True(refobjectEntries >= 9,
++                $"{RehashProbeClassName} must contribute at least 9 unique weak_refobject_hash entries to force a rehash of the initial size-11 table (load factor 0.7), but only {refobjectEntries} of its {first.Length} declared members are methods/constructors/fields.");
++
++            // Post-rehash integrity: a second enumeration resolves through the rehashed table and
++            // must hand back the SAME cached reflection objects, in the same metadata order.
++            MemberInfo[] second = probe.GetMembers(Declared);
++            Assert.Equal(first.Length, second.Length);
++            for (int i = 0; i < first.Length; i++)
++            {
++                Assert.Same(first[i], second[i]);
++            }
++
++            context.Unload();
 +        }
 +
 +        // Load/unload/force cycles for the modes where the force must be Rejected (flag off, or
@@ -907,16 +1115,45 @@ index 0000000..61655dd
 +        // One reflection-hash-initialization cycle under allocation pressure. A FRESH collectible
 +        // ALC each time, so every cycle re-runs mono_mem_manager_init_reflection_hashes from
 +        // scratch (the function early-returns once weak_refobject_hash is set for a manager).
++        //
++        // The reflection workload — and EVERY collectible object it creates — is confined to the
++        // NoInlining helper below, mirroring ExerciseAndUnload: the Mono interpreter records every
++        // IL local of a live frame as a reference slot and scans them conservatively (including
++        // compiler-generated enumerator/temporary slots, so nulling source locals is not enough).
++        // Holding asm/type/list in THIS frame across the force would keep the primary and
++        // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
++        // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
++        // it until a Completed force regardless (see LoadExerciseUnloadAndForce).
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void ReflectionHashInitUnderPressureCycle(int seed)
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +
++            ExerciseReflectionHashInitUnderPressure(context, seed);
++
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
++        }
++
++        // The reflection-hash workload for one pressure cycle. Returns no collectible root and
++        // calls context.Unload() before returning, so once this frame dies the context can become
++        // quiescent for the force performed by the caller.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseReflectionHashInitUnderPressure(AssemblyLoadContext context, int seed)
++        {
 +            // Pressure IMMEDIATELY before the first reflection touch, so the four
 +            // mono_array_new_checked calls inside mono_mem_manager_init_reflection_hashes are as
 +            // likely as this suite can make them to straddle a nursery collection — the exact
 +            // window the pinned-handle fix protects. The amount varies per cycle to move the
-+            // collection point around inside that window.
++            // collection point around inside that window. (With MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK
++            // armed, the native hook additionally forces a REAL collection at each point inside
++            // that window, making this coverage deterministic rather than stochastic.)
 +            Churn(96 + ((seed * 37) % 384));
 +
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
@@ -937,8 +1174,10 @@ index 0000000..61655dd
 +            Assert.NotEmpty(asm.GetTypes());
 +            Assert.Same(type, Activator.CreateInstance(type).GetType());
 +
-+            // Grow the weak tables past their load factor (the rehash path) while still under
-+            // pressure, then re-check identity through a second, independent enumeration.
++            // Populate the weak tables while still under pressure, then re-check identity through
++            // a second, independent enumeration. (TestClass alone does NOT cross the rehash
++            // boundary — the dedicated rehash-boundary test below drives that path with
++            // RehashProbeClass and proves it via the native rehash counter.)
 +            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
 +                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
 +            foreach (MemberInfo member in type.GetMembers(Declared))
@@ -959,15 +1198,6 @@ index 0000000..61655dd
 +            Assert.Equal(1, list.Count);
 +
 +            context.Unload();
-+
-+            if (ProtocolActive)
-+            {
-+                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
-+            }
-+            else
-+            {
-+                Assert.Equal(Rejected, Force(context));
-+            }
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
@@ -998,8 +1228,54 @@ index 0000000..61655dd
 +        }
 +    }
 +}
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+index 4a54cb27b..5cad40171 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+@@ -43,4 +43,41 @@ public class GenericTestClass<T>
+         // Allow to store a static reference (either an instance of the ALC or an instance outside of it)
+         public static T StaticObjectRef;
+     }
++
++    // Rehash-boundary probe for the collectible reflection caches. Reflecting over ALL declared
++    // members of this type inserts each MethodInfo/ConstructorInfo/FieldInfo into the owning
++    // memory manager's SINGLE weak_refobject_hash (nested types would go to the separate type
++    // cache instead, hence there are none). A MonoWeakHashTable starts at size 11 with a 0.7
++    // load factor, so a rehash triggers before the 9th unique insertion into one table: the
++    // 17 entries below (12 methods + 1 constructor + 4 fields) cross that boundary with room to
++    // spare. Keep the member count comfortably above 8 — the forced-native-unload lifecycle
++    // tests assert the arithmetic and the actual rehash at runtime.
++    public class RehashProbeClass
++    {
++        public int Field0;
++        public int Field1;
++        public string Field2;
++        public object Field3;
++
++        public RehashProbeClass()
++        {
++            Field0 = 0;
++            Field1 = 1;
++            Field2 = string.Empty;
++            Field3 = new object();
++        }
++
++        public void Method0() { }
++        public void Method1() { }
++        public void Method2() { }
++        public void Method3() { }
++        public void Method4() { }
++        public void Method5() { }
++        public int Method6() => Field0;
++        public int Method7() => Field1;
++        public string Method8() => Field2;
++        public object Method9() => Field3;
++        public static void Method10() { }
++        public static void Method11() { }
++    }
+ }
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-index fba550c..bbdad35 100644
+index fba550cf1..bbdad35cc 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 @@ -31,6 +31,7 @@
@@ -1012,3 +1288,4 @@ index fba550c..bbdad35 100644
    </ItemGroup>
 -- 
 2.43.0
+

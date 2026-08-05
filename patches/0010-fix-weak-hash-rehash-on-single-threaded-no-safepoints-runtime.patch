@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Mon, 06 Jul 2026 00:00:00 +0000
+Date: Mon, 6 Jul 2026 00:00:00 +0000
 Subject: [PATCH] fix: rehash MonoWeakHashTable on a no-safepoints runtime
 
 The MonoWeakHashTable rehash path aborted (g_assert_not_reached) for the
@@ -24,15 +24,209 @@ asynchronous GC from observing a partial rehash. A direct fast path can
 be added later behind an actual single-thread proof if profiling ever
 justifies it.
 
+Round 9 hardening (CI-evidenced dead-holder abort) and diagnostics:
+
+  * DEAD-TABLE SEMANTICS: key_value_handle is weak; the object[2] holder
+    is kept alive only through LoaderAllocator.m_hashes. When the
+    collectible LoaderAllocator managed object dies while the memory
+    manager still awaits teardown -- exactly the state a forced native
+    unload that keeps reporting NotQuiescent leaves behind -- a later
+    assembly enumeration (InternalGetLoadedAssemblies ->
+    mono_assembly_get_object_handle -> check_or_construct_handle) still
+    reaches the table and hit g_assert (holder) in get_values: an abort
+    in a reachable production state (observed in CI while the test
+    process was exiting after a NotQuiescent force). Every holder
+    dereference in this file is now audited: a NULL holder marks the
+    table DEAD and each entry point degrades gracefully -- lookups miss
+    (the entries were only reachable through the holder, so nothing can
+    be resurrected), inserts no-op (deliberately NOT re-materializing
+    the holder: the manager is condemned, a fresh holder would resurrect
+    a cache nobody owns, and mono_weak_hash_table_destroy must keep
+    freeing exactly one handle exactly once; callers simply construct
+    uncached objects, whose identity is unobservable for a dying ALC
+    because every previously cached object died with the holder), and
+    rehash is skipped both before allocating replacement arrays and
+    again inside do_rehash (rehash's own allocations can trigger the
+    very collection that kills the holder; the unused replacement
+    arrays are then discarded, never swapped in). Of the entry points
+    declared in weak-hash.h only new/lookup/insert/destroy (plus the
+    rehash path insert drives) are implemented at this pin, and destroy
+    never dereferences the holder, so these guards cover every
+    dereference. A NULL handle FIELD still asserts -- that is
+    use-after-destroy, genuine corruption -- and a creation-time NULL
+    holder also still asserts: the creator must keep the holder alive
+    and pinned across construction.
+  * Rehash counter: increments only when the replacement arrays are
+    actually swapped in, exposed as kind 4-adjacent diagnostics (stats
+    kind 5) so a regression test can prove the load-factor boundary of
+    the initial size-11 table was genuinely crossed at runtime.
+  * Test GC hook call inside mono_weak_hash_table_new (hook defined in
+    patch 0009, inert unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set):
+    fires between the holder fetch and the internal array allocations,
+    the window whose safety rests on the caller's pin spanning this
+    call.
 ---
- src/mono/mono/metadata/weak-hash.c | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
+ src/mono/mono/metadata/weak-hash.c | 142 ++++++++++++++++++++++++++---
+ src/mono/mono/metadata/weak-hash.h |   7 ++
+ 2 files changed, 134 insertions(+), 15 deletions(-)
 
 diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
-index 522b431..ef10af8 100644
+index 522b4319a..11ca4af8e 100644
 --- a/src/mono/mono/metadata/weak-hash.c
 +++ b/src/mono/mono/metadata/weak-hash.c
-@@ -283,8 +283,14 @@ rehash (MonoWeakHashTable *hash)
+@@ -13,6 +13,7 @@
+ 
+ #include "weak-hash.h"
+ #include "metadata/gc-internals.h"
++#include "metadata/loader-internals.h"
+ 
+ #include <mono/utils/checked-build.h>
+ #include <mono/utils/mono-threads-coop.h>
+@@ -63,12 +64,67 @@ mono_weak_hash_table_key_value_handle_stats (int kind)
+ /* We triple the table size at rehash time, similar with previous implementation */
+ #define HASH_TABLE_RESIZE_RATIO 3
+ 
++/*
++ * Monotonic count of rehashes actually performed (i.e. the load-factor boundary was crossed
++ * and the replacement arrays were swapped in). Diagnostics only, exposed alongside the
++ * key_value_handle ledger via the AssemblyLoadContext scout/handle stats icall (kind 5): a
++ * regression test for the no-safepoints rehash branch uses it to prove its reflection
++ * workload genuinely triggered a rehash instead of asserting so by construction.
++ */
++static volatile gint32 weak_hash_rehash_count;
++
++gint32
++mono_weak_hash_table_rehash_count (void)
++{
++	return weak_hash_rehash_count;
++}
++
++/*
++ * DEAD-TABLE SEMANTICS.
++ *
++ * key_value_handle is a WEAK handle to the object[2] holder that keeps the key/value arrays
++ * alive; the holder itself is only kept alive through LoaderAllocator.m_hashes. When the
++ * collectible LoaderAllocator managed object dies while the memory manager is still awaiting
++ * teardown — exactly the state a forced native unload that keeps reporting NotQuiescent
++ * leaves behind (manager not freed, witnesses dead) — the holder is collected and the weak
++ * handle target becomes NULL, yet runtime-wide code can still reach the table: e.g. a later
++ * assembly enumeration (InternalGetLoadedAssemblies -> mono_assembly_get_object_handle ->
++ * check_or_construct_handle) looks up and inserts into the dying manager's caches. Asserting
++ * holder != NULL here therefore turned a reachable production state into an abort.
++ *
++ * Instead, a NULL holder marks the table as DEAD and every entry point degrades gracefully:
++ *   - lookup   -> miss (the entries were only reachable through the holder, so nothing can be
++ *                 resurrected anyway);
++ *   - insert   -> no-op (deliberately NOT re-materializing the holder: the manager is
++ *                 condemned, a fresh holder would resurrect a cache nobody owns, and
++ *                 mono_weak_hash_table_destroy must keep freeing exactly one handle exactly
++ *                 once). Callers construct uncached objects — for a dying ALC the identity of
++ *                 its reflection objects is already unobservable, since every previously
++ *                 cached object died with the holder;
++ *   - rehash   -> skipped (both in rehash, before allocating replacement arrays, and in
++ *                 do_rehash, which re-reads the target because rehash's own allocations can
++ *                 trigger the collection that kills the holder).
++ * Of the entry points declared in weak-hash.h, only new/lookup/insert/destroy (and the
++ * rehash path insert drives) are implemented at this pin; destroy never dereferences the
++ * holder (it only frees the handle), so these guards cover every holder dereference.
++ *
++ * A NULL handle FIELD, by contrast, still means use-after-destroy — genuine corruption —
++ * and stays fatal.
++ */
++static MonoArray*
++get_holder (MonoWeakHashTable *hash)
++{
++	/* NULL only after mono_weak_hash_table_destroy: use-after-free of the table itself. */
++	g_assert (hash->key_value_handle);
++	return (MonoArray*)mono_gchandle_get_target_internal (hash->key_value_handle);
++}
++
+ static MonoArray*
+ get_keys (MonoWeakHashTable *hash)
+ {
+ 	// FIXME: Do it in the caller
+-	MonoArray *holder = (MonoArray*)mono_gchandle_get_target_internal (hash->key_value_handle);
+-	/* This is expected to be alive */
++	MonoArray *holder = get_holder (hash);
++	/* Callers must have taken the dead-table path already (see DEAD-TABLE SEMANTICS). */
+ 	g_assert (holder);
+ 	return mono_array_get_fast (holder, MonoArray*, 0);
+ }
+@@ -76,8 +132,8 @@ get_keys (MonoWeakHashTable *hash)
+ static MonoArray*
+ get_values (MonoWeakHashTable *hash)
+ {
+-	MonoArray *holder = (MonoArray*)mono_gchandle_get_target_internal (hash->key_value_handle);
+-	/* This is expected to be alive */
++	MonoArray *holder = get_holder (hash);
++	/* Callers must have taken the dead-table path already (see DEAD-TABLE SEMANTICS). */
+ 	g_assert (holder);
+ 	return mono_array_get_fast (holder, MonoArray*, 1);
+ }
+@@ -179,9 +235,23 @@ mono_weak_hash_table_new (GHashFunc hash_func, GEqualFunc key_equal_func, MonoGH
+ 
+ 	g_assert (type <= MONO_HASH_KEY_VALUE_GC);
+ 
++	/*
++	 * Creation-time NULL is a caller bug, not a dead table: the creator must keep the holder
++	 * alive (and pinned — the raw pointer below is reused across the allocating calls) for
++	 * the whole construction window, as mono_mem_manager_init_reflection_hashes does.
++	 */
+ 	holder = (MonoArray*)mono_gchandle_get_target_internal (key_value_handle);
+ 	g_assert (holder);
+ 
++	/*
++	 * Test hook (inert unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set): force a collection
++	 * inside the table's own construction window — the raw holder pointer above is about to
++	 * be reused across the array allocations below, which is only safe because the caller's
++	 * pin spans this call. With that pin reverted, this collection moves or reclaims the
++	 * holder and the stale publication is caught by the lifecycle tests deterministically.
++	 */
++	mono_mem_manager_alc_unload_test_gc_hook ();
++
+ 	if (hash->gc_type & MONO_HASH_KEY_GC) {
+ 		MonoArray *keys = mono_array_new_checked (mono_get_object_class (), hash->table_size, error);
+ 		mono_error_assert_ok (error);
+@@ -207,6 +277,8 @@ typedef struct {
+ 	MonoObject **values;
+ 	MonoArray *keys_arr;
+ 	MonoArray *values_arr;
++	/* Set by do_rehash when the replacement arrays were actually swapped in. */
++	gboolean rehashed;
+ } RehashData;
+ 
+ static void*
+@@ -218,8 +290,16 @@ do_rehash (void *_data)
+ 	MonoObject **old_keys = NULL;
+ 	MonoArray *old_values_arr = NULL;
+ 
++	/*
++	 * Re-read the target here even though rehash already checked it: the replacement-array
++	 * allocations in rehash can trigger the very collection that kills the holder. Dead
++	 * table: leave everything untouched, the caller discards the replacement arrays and the
++	 * pending insert no-ops (see DEAD-TABLE SEMANTICS).
++	 */
+ 	MonoArray *holder = (MonoArray*)mono_gchandle_get_target_internal (hash->key_value_handle);
+-	g_assert (holder);
++	if (!holder)
++		return NULL;
++	data->rehashed = TRUE;
+ 
+ 	current_size = hash->table_size;
+ 	hash->table_size = data->new_size;
+@@ -264,8 +344,9 @@ rehash (MonoWeakHashTable *hash)
+ 	 */
+ 	data.new_size = g_spaced_primes_closest (GFLOAT_TO_UINT (hash->in_use / HASH_TABLE_MAX_LOAD_FACTOR * HASH_TABLE_RESIZE_RATIO));
+ 
+-	MonoArray *holder = (MonoArray*)mono_gchandle_get_target_internal (hash->key_value_handle);
+-	g_assert (holder);
++	/* Dead table (see DEAD-TABLE SEMANTICS): skip before allocating replacement arrays. */
++	if (!get_holder (hash))
++		return;
+ 
+ 	if (hash->gc_type & MONO_HASH_KEY_GC) {
+ 		MonoArray *keys = mono_array_new_checked (mono_get_object_class (), data.new_size, error);
+@@ -283,14 +364,33 @@ rehash (MonoWeakHashTable *hash)
  	}
  
  	if (!mono_threads_are_safepoints_enabled ()) {
@@ -49,5 +243,86 @@ index 522b431..ef10af8 100644
  		mono_gc_invoke_with_gc_lock (do_rehash, &data);
  	} else {
  		/* We cannot be preempted */
+ 		do_rehash (&data);
+ 	}
+ 
++	if (!data.rehashed) {
++		/*
++		 * The holder died while the replacement arrays were being allocated (see
++		 * do_rehash): the table kept its old storage, so discard the unused replacement
++		 * NATIVE arrays (the managed ones are unreferenced garbage) and free nothing else.
++		 */
++		g_free (data.keys);
++		g_free (data.values);
++		return;
++	}
++
++	UnlockedIncrement (&weak_hash_rehash_count);
++
+ 	if (!(hash->gc_type & MONO_HASH_KEY_GC))
+ 		g_free (old_keys);
+ 	if (!(hash->gc_type & MONO_HASH_VALUE_GC))
+@@ -316,11 +416,15 @@ mono_weak_hash_table_lookup (MonoWeakHashTable *hash, gconstpointer key)
+ {
+ 	g_assert (hash);
+ 
+-	int slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
+-
+ 	// FIXME:
+ 	g_assert (hash->gc_type == MONO_HASH_VALUE_GC);
+ 
++	/* Dead table (see DEAD-TABLE SEMANTICS): every lookup misses. */
++	if (!get_holder (hash))
++		return NULL;
++
++	int slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
++
+ 	MonoArray* values = get_values (hash);
+ 
+ 	if (hash->keys [slot])
+@@ -370,14 +474,22 @@ mono_weak_hash_table_insert_replace (MonoWeakHashTable *hash, gpointer key, gpoi
+ 
+ 	g_assert (hash);
+ 
+-	if (hash->in_use > (hash->table_size * HASH_TABLE_MAX_LOAD_FACTOR))
++	// FIXME:
++	g_assert (hash->gc_type == MONO_HASH_VALUE_GC);
++
++	/* Dead table (see DEAD-TABLE SEMANTICS): inserts no-op, the caller keeps its object uncached. */
++	if (!get_holder (hash))
++		return;
++
++	if (hash->in_use > (hash->table_size * HASH_TABLE_MAX_LOAD_FACTOR)) {
+ 		rehash (hash);
++		/* rehash's own allocations can be the collection that kills the holder. */
++		if (!get_holder (hash))
++			return;
++	}
+ 
+ 	slot = mono_weak_hash_table_find_slot (hash, (MonoObject*)key);
+ 
+-	// FIXME:
+-	g_assert (hash->gc_type == MONO_HASH_VALUE_GC);
+-
+ 	if (hash->keys [slot]) {
+ 		if (replace) {
+ 			key_store (hash, slot, (MonoObject*)key);
+diff --git a/src/mono/mono/metadata/weak-hash.h b/src/mono/mono/metadata/weak-hash.h
+index a3d9d3c4a..ff12c85b4 100644
+--- a/src/mono/mono/metadata/weak-hash.h
++++ b/src/mono/mono/metadata/weak-hash.h
+@@ -27,4 +27,11 @@ void     mono_weak_hash_table_insert          (MonoWeakHashTable *h, gpointer k,
+  */
+ gint32   mono_weak_hash_table_key_value_handle_stats (int kind);
+ 
++/*
++ * Diagnostics only: monotonic count of rehashes actually performed (replacement arrays
++ * swapped in). Lets a regression test prove a workload crossed the load-factor boundary of
++ * the initial table size instead of asserting so by construction.
++ */
++gint32   mono_weak_hash_table_rehash_count (void);
++
+ #endif /* __MONO_WEAK_HASH_H__ */
 -- 
 2.43.0
+
