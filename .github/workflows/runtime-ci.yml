@@ -963,3 +963,35 @@ jobs:
         shell: pwsh
         run: |
           dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}" --skip-duplicate
+
+  # Aggregate CI gate. Branch protection requires exactly this one check instead of
+  # per-job names: matrix jobs report suffixed check names ("build_linux_job (Release,
+  # multithread)") and job renames silently orphan name-based required contexts, leaving
+  # PRs stuck on "Expected — waiting for status". This job needs every validation job and
+  # fails unless all of them succeeded, so the single context "ci_ok" is rename- and
+  # matrix-proof.
+  ci_ok:
+    name: ci_ok
+    if: ${{ always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')) }}
+    runs-on: ubuntu-latest
+    needs:
+      - build_aot_windows_job
+      - build_aot_linux_job
+      - build_aot_macos_job
+      - build_linux_job
+      - test_loader_wasm
+      - test_loader_wasm_mt
+      - package_job
+    steps:
+      - name: Verify all required jobs succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -e
+          echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS_JSON" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
+            echo "ci_ok: all required jobs succeeded"
+          else
+            echo "::error::One or more required jobs did not succeed."
+            exit 1
+          fi
