@@ -381,6 +381,402 @@ jobs:
         name: wasm-sdk-${{ matrix.MONO_WASM_THREADS }}
         path: ci-artifacts
 
+  # Blocking validation gate for the ALC-unload patches (0009 host-triggered native unload,
+  # 0010 weak-hash rehash). Builds the libraries + their test host for browser-wasm against the
+  # patched runtime and runs System.Runtime.Loader.Tests under V8 in two modes:
+  #   * default (flag off) — the general (non-collectible) AssemblyLoadContext surface must be
+  #     unregressed: the "does not break anything" guard. (The upstream collectible-unload tests are
+  #     [ActiveIssue dotnet/runtime#34072, TestRuntimes.Mono] and RemoteExecutor-based, so they
+  #     self-skip on wasm; the collectible reclaim path is exercised in-process by the downstream
+  #     consumer's runtime tests.)
+  #   * MONO_WASM_ENABLE_ALC_UNLOAD=1 — the same surface must stay green with the flag enabled.
+  # package_job (and transitively sign/publish, which need package_job) gate on this: packaging
+  # must not proceed unless the ALC lifecycle validation passed. This adds the libs+test
+  # wall-clock to the publish critical path by design.
+  test_loader_wasm:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    container: 'mcr.microsoft.com/dotnet/sdk:10.0-noble'
+    # Blocking gate since 2 consecutive green runs (was continue-on-error while stabilizing).
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        set -e
+        apt-get update
+        apt-get install -y sudo
+        sudo apt-get install -y python3-pip locales p7zip-full zip nodejs npm
+        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
+          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+        sudo locale-gen en_US.UTF-8
+
+    - name: Install LLVM
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
+
+    - name: Clone dotnet/runtime
+      run: git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Install cmake
+      run: |
+        set -e
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
+        sudo tar --strip-components=1 -xz -C /usr/local
+
+    - name: Build runtime + libraries (browser-wasm)
+      run: |
+        set -e
+        cd runtime
+        # V8 is auto-provisioned by the per-suite test build below
+        # (eng/testing/wasm-provisioning.targets). We deliberately do NOT run the whole
+        # `build.sh libs.tests` tree: that builds 700+ test projects which race to provision the
+        # same shared V8 zip in parallel ("file is being used by another process"). Building only
+        # the single Loader test suite via `/t:Test` provisions V8 exactly once, no race.
+        ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS
+
+    - name: Assert native-unload bridge is present in the built pack
+      run: |
+        set -e
+        cd runtime
+        # Trim/rooting regression guard: the opt-in managed bridge (patch 0009) MUST survive into
+        # the produced System.Private.CoreLib. If it were trimmed away or the patch failed to take,
+        # the in-process lifecycle tests would self-skip (missing member) and a rooting regression
+        # would read as green. Fail here, and again in-test via MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE.
+        corelib=$(find artifacts/bin -name System.Private.CoreLib.dll -path '*rowser*' | head -1)
+        if [ -z "$corelib" ]; then
+          echo "System.Private.CoreLib.dll not found under artifacts/bin"; exit 1
+        fi
+        echo "checking bridge metadata in: $corelib"
+        # Method names live as UTF-8 in the #Strings metadata heap, so a binary grep of the managed
+        # method names is a reliable presence check without a metadata reader.
+        for sym in ForceNativeUnload InternalForceNativeUnload GetScoutRetirementStats InternalGetScoutRetirementStats; do
+          if ! grep -aq "$sym" "$corelib"; then
+            echo "MISSING: '$sym' metadata not found in System.Private.CoreLib — native-unload bridge was trimmed or not applied"; exit 1
+          fi
+          echo "  ok: found '$sym'"
+        done
+
+    - name: Provision pinned V8 (wasm-provisioning.targets)
+      run: |
+        set -e
+        cd runtime
+        # Provision the PINNED V8 (stamp-guarded — deterministic, no cross-project race) in a
+        # dedicated step, because the generated run script resolves the `v8` binary from PATH:
+        # the provisioned directory must be exported to PATH before the test steps run.
+        ./dotnet.sh build src/libraries/System.Runtime.Loader/tests /t:DownloadAndInstallV8 \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true
+        v8dir=$(ls -d "$PWD"/artifacts/bin/v8-*/ | head -1)
+        v8dir="${v8dir%/}"
+        echo "provisioned: $v8dir"; ls -l "$v8dir"
+        # xharness resolves an executable literally named `v8`; provisioning may leave only d8.
+        if [ ! -x "$v8dir/v8" ]; then
+          printf '#!/bin/sh\nexec "%s/d8" "$@"\n' "$v8dir" > "$v8dir/v8"
+          chmod +x "$v8dir/v8"
+        fi
+        echo "$v8dir" >> "$GITHUB_PATH"
+
+    - name: Run System.Runtime.Loader tests (flag OFF — default ALC regression)
+      run: |
+        set -e
+        cd runtime
+        # Uniform WasmXHarnessMonoArgs override in BOTH modes: it intentionally drops the suite's
+        # default DOTNET_MODIFIABLE_ASSEMBLIES so the ApplyUpdate (hot-reload) tests self-skip —
+        # they are out of this job's ALC charter and patch 0004's nested-class test fails on
+        # wasm/V8 (tracked separately; this job gates the Loader/ALC surface only).
+        # MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes the lifecycle tests FAIL (not self-skip) if the
+        # ForceNativeUnload member is missing, so a trim/rooting regression cannot read as green.
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 arms the deterministic native GC hook that collects
+        # inside the reflection-hash construction window (kind 4 of the stats icall); with the
+        # flag OFF no ALC is collectible, so the tests assert the armed hook never fires.
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true \
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
+          exit 1
+        fi
+        results=$matches
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
+        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
+        # file mode — a newly-added .sh may land without the executable bit on checkout.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag OFF"
+
+    - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
+      run: |
+        set -e
+        cd runtime
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 arms the deterministic native GC hook: every
+        # reflection-hash init on this leg performs REAL nursery collections inside the
+        # pinned-holder construction window, and the pressure test asserts the fire counter
+        # (kind 4) advanced at least once per init — reverting the holder pins fails this leg
+        # deterministically instead of depending on stochastic churn.
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:InstallV8ForTests=true \
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
+          exit 1
+        fi
+        results=$matches
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
+        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
+        # file mode — a newly-added .sh may land without the executable bit on checkout.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag ON"
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: loader-wasm-test-logs
+        path: |
+          loader-results-flag-off.xml
+          loader-results-flag-on.xml
+          runtime/artifacts/log/**
+
+  # Multithread (WasmEnableThreads=true) validation leg for the ALC-unload patches. The feature is
+  # hard-gated at compile time to the single-threaded browser build (DISABLE_THREADS), and
+  # ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected — the test proving a threads-enabled
+  # runtime rejects the feature — is [ConditionalFact(IsThreadingSupported)], so it can only
+  # execute on a threads-enabled runtime: on the single-threaded legs above it always self-skips.
+  # This job builds runtime + libraries with /p:WasmEnableThreads=true and runs
+  # System.Runtime.Loader.Tests on headless Chrome (Scenario=WasmTestOnChrome via xharness
+  # test-browser — the engine dotnet/runtime's own _Threading library-test lane uses at this pin;
+  # plain V8 is only used upstream for single-threaded wasm). The sentinel runs in mode "mt",
+  # which REQUIRES the rejection test to be present AND passed (not skipped). The leg runs with
+  # MONO_WASM_ENABLE_ALC_UNLOAD=1 AND MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: the managed bridge
+  # must exist on the multithread pack too, while the runtime must reject every force (the
+  # lifecycle tests assert exactly that rejection surface there). package_job gates on this job
+  # like the single-threaded leg: packaging must not proceed unless the multithread contract is
+  # proven.
+  test_loader_wasm_mt:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    container: 'mcr.microsoft.com/dotnet/sdk:10.0-noble'
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+        fetch-depth: 0
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.100
+
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNETSDK_VERSION }}
+
+    - name: Install dependencies
+      run: |
+        set -e
+        apt-get update
+        apt-get install -y sudo
+        sudo apt-get install -y python3-pip locales p7zip-full zip nodejs npm
+        sudo apt-get install -y unzip zip libc6 ninja-build
+        sudo apt-get install -y lsb-release wget software-properties-common gnupg
+        sudo apt-get install -y unzip zip libc6 ninja-build \
+          libtool build-essential curl git \
+          libunwind8 libunwind8-dev gettext libicu-dev liblttng-ust-dev \
+          libssl-dev libnuma-dev libkrb5-dev zlib1g-dev locales
+        sudo locale-gen en_US.UTF-8
+
+    - name: Install Chrome shared libraries
+      run: |
+        set -e
+        # The pinned Chrome (provisioned by eng/testing/wasm-provisioning.targets in the test
+        # step below) is a bare chromium-browser-snapshots zip; the sdk container lacks its
+        # shared libraries, so install the headless-Chromium dependency set for Ubuntu noble.
+        sudo apt-get install -y --no-install-recommends \
+          libnss3 libnspr4 libdbus-1-3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 \
+          libdrm2 libgbm1 libxkbcommon0 libatspi2.0-0t64 libxcomposite1 libxdamage1 \
+          libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64 libexpat1 \
+          libx11-6 libx11-xcb1 libxcb1 libxext6 fonts-liberation
+
+    - name: Install LLVM
+      run: |
+        set -e
+        wget https://apt.llvm.org/llvm.sh
+        chmod u+x llvm.sh
+        sudo ./llvm.sh 18
+
+    - name: Trust My Directory
+      run: git config --global --add safe.directory /__w/Uno.DotnetRuntime.WebAssembly/Uno.DotnetRuntime.WebAssembly
+
+    - name: Clone dotnet/runtime
+      run: git clone --recursive https://github.com/dotnet/runtime
+
+    - run: ./scripts/apply-patches.ps1
+      name: Apply uno-specific patches
+      shell: pwsh
+
+    - name: Install cmake
+      run: |
+        set -e
+        wget -qO- https://github.com/Kitware/CMake/releases/download/v3.27.2/cmake-3.27.2-linux-x86_64.tar.gz | \
+        sudo tar --strip-components=1 -xz -C /usr/local
+
+    - name: Build runtime + libraries (browser-wasm, multithread)
+      run: |
+        set -e
+        cd runtime
+        # /p:WasmEnableThreads=true is the canonical threads switch for the libs test tree at this
+        # pin (dotnet/runtime's _Threading library-test lane passes exactly this to both build and
+        # test); it builds the multithread runtime flavour (no DISABLE_THREADS) plus
+        # threads-enabled libraries — the same targeted build the single-threaded loader job does.
+        ./build.sh -arch wasm -os browser -c Release $ADDITIONAL_BUILD_ARGS /p:WasmEnableThreads=true
+
+    - name: Assert native-unload bridge is present in the built pack
+      run: |
+        set -e
+        cd runtime
+        # Same trim/rooting regression guard as the single-threaded job: the managed bridge is
+        # variant-independent and MUST exist on the multithread pack too (its icalls just report
+        # Rejected / unavailable there).
+        corelib=$(find artifacts/bin -name System.Private.CoreLib.dll -path '*rowser*' | head -1)
+        if [ -z "$corelib" ]; then
+          echo "System.Private.CoreLib.dll not found under artifacts/bin"; exit 1
+        fi
+        echo "checking bridge metadata in: $corelib"
+        for sym in ForceNativeUnload InternalForceNativeUnload GetScoutRetirementStats InternalGetScoutRetirementStats; do
+          if ! grep -aq "$sym" "$corelib"; then
+            echo "MISSING: '$sym' metadata not found in System.Private.CoreLib — native-unload bridge was trimmed or not applied"; exit 1
+          fi
+          echo "  ok: found '$sym'"
+        done
+
+    - name: Run System.Runtime.Loader tests (threads ON — rejection contract)
+      run: |
+        set -e
+        cd runtime
+        # Scenario=WasmTestOnChrome runs the suite under headless Chrome via xharness test-browser
+        # (the engine upstream uses for threaded wasm library tests). InstallChromeForTests=true
+        # provisions the PINNED chrome + chromedriver (eng/testing/BrowserVersions.props) right
+        # after Build — a single-project /t:Test invocation, so no provisioning race — and bakes
+        # --browser-path plus a chromedriver PREPEND_PATH into the generated run script.
+        #
+        # WasmXHarnessMonoArgs is a CLI *global* property here, which suppresses the automatic
+        # append of --setenv=IsBrowserThreadingSupported=true that tests.browser.targets performs
+        # for WasmEnableThreads=true builds — so it is passed explicitly: PlatformDetection
+        # .IsThreadingSupported must be TRUE for the rejection test to execute (it is
+        # [ConditionalFact(IsThreadingSupported)]). As on the single-threaded legs, the override
+        # also intentionally drops DOTNET_MODIFIABLE_ASSEMBLIES (hot-reload tests are out of this
+        # job's charter) and MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 makes a missing bridge member
+        # fail loudly. MONO_WASM_ENABLE_ALC_UNLOAD=1 proves the flag alone cannot enable the
+        # feature on a threads-enabled runtime: every force must still be Rejected.
+        # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 is set for the same reason: the deterministic GC
+        # hook is compiled out with the DISABLE_THREADS gate, so the tests assert its counter
+        # (stats kind 4) reports unavailable (-1) here even though the env var is set.
+        #
+        # --no-sandbox / --disable-dev-shm-usage: the job runs as root in a container with a small
+        # /dev/shm; Chrome refuses to start as root with its sandbox and crashes on a tiny shm.
+        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
+        # earlier leg or rerun left behind, so the file this step validates can only have
+        # been produced by the invocation below.
+        suite=artifacts/bin/System.Runtime.Loader.Tests
+        if [ -d "$suite" ]; then
+          find "$suite" -name testResults.xml -delete
+        fi
+        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
+          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
+          /p:WasmEnableThreads=true /p:Scenario=WasmTestOnChrome /p:InstallChromeForTests=true \
+          "/p:WasmXHarnessArgs=--browser-arg=--no-sandbox --browser-arg=--disable-dev-shm-usage" \
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 --setenv=IsBrowserThreadingSupported=true"
+        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
+        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
+        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
+        # 0 without emitting results, and another leg in this same job leaves its own
+        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
+        # while the guard still passed. Zero matches means this invocation produced nothing;
+        # more than one means the selection is ambiguous. Both are hard failures.
+        matches=$(find "$suite" -name testResults.xml)
+        count=$(printf '%s\n' "$matches" | grep -c . || true)
+        if [ "$count" -ne 1 ]; then
+          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
+          printf '%s\n' "$matches" >&2
+          exit 1
+        fi
+        results=$matches
+        cp "$results" "$GITHUB_WORKSPACE/loader-results-threads-on.xml"
+        # mode "mt": additionally REQUIRES ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected to
+        # be present AND passed (not skipped) — the contract this leg exists to prove.
+        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "threads ON" mt
+
+    - uses: actions/upload-artifact@v4
+      if: ${{ always() }}
+      with:
+        name: loader-wasm-mt-test-logs
+        path: |
+          loader-results-threads-on.xml
+          runtime/artifacts/log/**
+
   package_job:
     # AOT cross jobs must produce their nupkgs before this job runs, because
     # the main override pack now has direct PackageReference dependencies on
@@ -388,7 +784,7 @@ jobs:
     # restore inside `dotnet pack` would otherwise hit nuget.org and fail
     # with NU1101/NU1103 since these aren't published yet for the current
     # SemVer2.
-    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job]
+    needs: [build_linux_job, build_aot_linux_job, build_aot_windows_job, build_aot_macos_job, test_loader_wasm, test_loader_wasm_mt]
     runs-on: ubuntu-latest
 
     steps:
@@ -567,3 +963,35 @@ jobs:
         shell: pwsh
         run: |
           dotnet nuget push artifacts\*.nupkg -s https://api.nuget.org/v3/index.json -k "${{ secrets.NUGET_ORG_API_KEY }}" --skip-duplicate
+
+  # Aggregate CI gate. Branch protection requires exactly this one check instead of
+  # per-job names: matrix jobs report suffixed check names ("build_linux_job (Release,
+  # multithread)") and job renames silently orphan name-based required contexts, leaving
+  # PRs stuck on "Expected — waiting for status". This job needs every validation job and
+  # fails unless all of them succeeded, so the single context "ci_ok" is rename- and
+  # matrix-proof.
+  ci_ok:
+    name: ci_ok
+    if: ${{ always() && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')) }}
+    runs-on: ubuntu-latest
+    needs:
+      - build_aot_windows_job
+      - build_aot_linux_job
+      - build_aot_macos_job
+      - build_linux_job
+      - test_loader_wasm
+      - test_loader_wasm_mt
+      - package_job
+    steps:
+      - name: Verify all required jobs succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -e
+          echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS_JSON" | jq -e 'to_entries | all(.value.result == "success")' > /dev/null; then
+            echo "ci_ok: all required jobs succeeded"
+          else
+            echo "::error::One or more required jobs did not succeed."
+            exit 1
+          fi

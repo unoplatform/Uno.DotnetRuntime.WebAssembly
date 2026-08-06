@@ -1,0 +1,1684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Mon, 6 Jul 2026 00:00:00 +0000
+Subject: [PATCH] feat: host-triggered native unload of collectible
+ AssemblyLoadContexts on a WASM worker
+
+A downstream WASM worker hosting Roslyn repeatedly loads previewed apps
+into collectible AssemblyLoadContexts and unloads them. On WASM
+WebAssembly.Memory.grow() is irreversible, so every load/unload cycle
+that fails to reclaim the ALC's native memory permanently inflates
+HEAPU8. The existing native teardown chain is unreachable because
+mono_alc_init unconditionally forces collectible=FALSE, and
+mono_alc_cleanup poisons (debug_unload=TRUE) instead of freeing.
+
+This change makes the native teardown reachable and effective when the
+host opts in via the MONO_WASM_ENABLE_ALC_UNLOAD environment variable.
+Default behaviour is unchanged for every other consumer, and the entire
+feature is hard-gated at compile time to the single-threaded browser
+build (DISABLE_THREADS) — see the threading bullet below.
+
+  * mono_alc_init: gate the collectible=FALSE override behind the env
+    flag (explicit opt-in: only "1"/"true" enable; unset/empty/"0"/
+    "false" remain off). collectible=TRUE is required for correctness
+    (cross-ALC generics otherwise route into the never-freed default
+    memory manager), not merely to enable the free chain. On a
+    threads-enabled build (#ifndef DISABLE_THREADS) the opt-in is
+    ignored entirely and collectible stays forced FALSE, so
+    PrepareForAssemblyLoadContextRelease keeps its !collectible
+    early-return and never mutates any manager state there.
+  * PrepareForAssemblyLoadContextRelease: free the leaked strong
+    GCHandle on the !collectible early return so mixed-collectible
+    hosts do not leak it.
+  * mono_alc_cleanup: flip the primary memory manager free to
+    debug_unload=FALSE so its mempool and code-manager pages are
+    actually reclaimed, and delete the shared generic memory managers
+    that include the dying ALC, following the (disabled)
+    LoaderAllocatorScout_Destroy protocol: purge the lock-free
+    mem-manager cache entry, detach the manager from every surviving
+    owner's generic_memory_managers list, then free it -- so no sibling
+    ALC is left holding a dangling manager and no recycled ALC address
+    can produce a false cache hit (new mono_mem_manager_cache_remove
+    helper in memory-manager.c).
+  * Threading hard gate (review): the destructive cache-remove +
+    owner-detach + free sequence races the lock-free
+    mem_manager_cache_get() (which loads and dereferences a manager
+    pointer with no lock held), and no runtime predicate
+    (mono_threads_are_safepoints_enabled() describes suspension policy,
+    not thread count) can prove single-threadedness. The feature is
+    therefore hard-gated at COMPILE TIME to the single-threaded browser
+    build: under #ifndef DISABLE_THREADS the InternalForceNativeUnload
+    icall returns Rejected up front WITHOUT touching any manager state,
+    mono_alc_init refuses the collectible opt-in (so no
+    mono_mem_manager_start_unload preparation ever runs on shared
+    managers either -- no stale ownership is ever created), and
+    mono_alc_cleanup's shared-generic reclamation is compiled out
+    (unreachable there anyway: its only caller is the gated icall).
+    Within the DISABLE_THREADS build the loader lock still brackets the
+    whole sequence (matching the scout protocol), correctly ordered
+    above the per-owner memory_managers_lock. A lifecycle test proves a
+    threads-enabled pack reports the feature unavailable (Rejected).
+  * memory_manager_delete (review): free the lock_free_mp mempool on the
+    real-free (debug_unload==FALSE) branch. mono_mem_manager_new always
+    allocates it via lock_free_mempool_new but nothing ever called
+    lock_free_mempool_free, so its valloc'd pages leaked -- defeating the
+    bounded-memory goal on WASM.
+  * mono_mem_manager_start_unload: null loader_allocator_handle after
+    freeing it, closing a double-free against mono_alc_cleanup.
+  * mono_alc_cleanup weak-handle release (review): the quiescence gate
+    reads mm->loader_allocator_weak_handle (mono_gchandle_get_target_internal)
+    but nothing in the base ever frees that weak GCHandle -- start_unload
+    only drops the strong handle and memory_manager_delete never touches
+    either -- so every reclaimed manager leaked a weak GCHandle slot. The
+    real-free path now frees it (loader_allocator_weak_handle = NULL) for
+    both the primary manager and each shared-generic manager in the
+    owner-detach loop, before mono_mem_manager_free. memory_manager_delete
+    does not touch the field, so this is not a double-free; the disabled
+    LoaderAllocatorScout_Destroy never dereferences the freed manager
+    (it only consults the terminal-state registry below by pointer
+    value), so there is no scout use-after-free.
+  * LoaderAllocatorScout terminal outcome (review): the scout finalizer
+    treats Destroy()==FALSE as "not yet" and re-registers itself for
+    finalization; the real Destroy is #if 0-disabled upstream and returns
+    FALSE unconditionally. The forced teardown freed the scout's manager
+    without publishing any terminal state the scout could observe, so
+    every forced cycle leaked one immortal finalizable scout (the primary
+    collectible manager eagerly materialises a LoaderAllocator, so every
+    opted-in ALC has at least one) that every subsequent
+    GC + WaitForPendingFinalizers reprocessed forever. mono_alc_cleanup
+    now records the pointer value of every force-freed manager that had a
+    materialised LoaderAllocator (weak handle non-NULL implies a scout
+    exists) in a native retired-set, and
+    ves_icall_System_Reflection_LoaderAllocatorScout_Destroy consults the
+    set BEFORE its unconditional FALSE: pure pointer-value comparison
+    (the freed manager is never dereferenced), consume the entry, return
+    TRUE -- that scout gets a terminal outcome and does not re-register.
+    Boundedness: an entry is only added when the manager's LoaderAllocator
+    witness is already dead (the quiescence gate proved it before anything
+    was freed), so its scout is already finalizable and consumes the entry
+    on the next finalization pass; the set is a GPtrArray so a recycled
+    address with a still-pending predecessor scout keeps exact counts.
+    ABA (new manager allocated at a recycled address): an entry is added
+    only at force-free time and consumed exactly once at the first Destroy
+    consult for that pointer value; consuming never frees or dereferences
+    anything, so at worst the successor scout (whose own LoaderAllocator
+    must also be dead before it can finalize) drains the predecessor's
+    entry -- permuting WHICH of two indistinguishable scouts terminally
+    dies, never touching a live manager -- and the pending population
+    still drains to zero because each force-free adds exactly one entry
+    and each entry retires exactly one scout. DISABLE_THREADS-gated like
+    the rest of the feature (registry mutated only by the forced teardown
+    and the finalizer, both single-threaded by the hard gate). A new
+    diagnostics icall InternalGetScoutRetirementStats (managed bridge
+    AssemblyLoadContext.GetScoutRetirementStats, DynamicDependency-rooted)
+    exposes the retired-set size and the monotonic terminal-destroy count
+    (-1 on a threads-enabled build) so lifecycle tests can assert the
+    scout/finalizer population plateaus across forced cycles.
+  * Reflection-hash construction GC safety (independent audit): with this
+    opt-in, collectible managers can now reach
+    mono_mem_manager_init_reflection_hashes, which allocates holders_arr and
+    then three holder object[2] arrays but publishes holders_arr into
+    LoaderAllocator.m_hashes only AFTER all four allocations -- upstream marks
+    that window "// FIXME: GC safety". Until publication the only other
+    references to those arrays are WEAK, and raw C locals are neither managed
+    roots nor move-safe (on browser-wasm SGen cannot scan stack/register
+    references at all), so a nursery collection between two of the allocations
+    could collect or move holders_arr or an earlier holder, after which the
+    following mono_array_setref_fast / MONO_OBJECT_SETREF_INTERNAL writes
+    through a stale pointer. The construction now takes a PINNED GCHandle on
+    holders_arr and on every holder across the whole window -- the same idiom
+    mono_mem_manager_get_loader_alloc a few lines above already relies on to
+    keep loader_alloc usable as a raw pointer across an allocating call
+    ("loader_alloc is pinned"); memory-manager.c has no coop-handle
+    (HANDLE_FUNCTION_ENTER/MONO_HANDLE_NEW) plumbing to follow, so pinned
+    handles are what the surrounding code actually does. The pins are dropped
+    only after the last allocating call, deliberately extending past
+    publication so the window also covers mono_weak_hash_table_new, which
+    likewise reads its holder once and then reuses that raw pointer across
+    mono_array_new_checked calls. loader_alloc itself needs nothing:
+    mem_manager->loader_allocator_handle is already a pinned strong handle,
+    released only by mono_mem_manager_start_unload. The lost-double-check
+    branch is annotated with which site owns the weak holder handles.
+    SHARED-CODE IMPACT, stated plainly: this function runs for EVERY
+    collectible memory manager, not only the ones a forced native unload
+    reclaims, so the fix is unconditional rather than hidden behind the opt-in
+    -- a collectible-only branch would make the correctness argument harder to
+    check. It is arguably upstreamable as-is.
+  * MonoWeakHashTable key_value_handle ownership (independent audit):
+    mono_mem_manager_init_reflection_hashes also creates three WEAK GCHandles
+    on the holder arrays and stores one in each table as
+    MonoWeakHashTable.key_value_handle. memory_manager_delete_objects destroys
+    the tables, but mono_weak_hash_table_destroy freed only the key/value
+    arrays and the table allocation -- never the handle -- and nothing else
+    owned it, so three handle-table slots leaked per reflection-using memory
+    manager per load/unload cycle: unbounded growth in exactly the
+    bounded-memory scenario this patch exists for. Ownership analysis over the
+    applied tree, enumerating every creation and destruction site:
+    mono_weak_hash_table_new has exactly THREE callers, all inside
+    mono_mem_manager_init_reflection_hashes (weak_type_hash,
+    weak_type_init_exception_hash, weak_refobject_hash), each handed a DISTINCT
+    handle -- no handle is shared between tables; mono_weak_hash_table_destroy
+    has exactly ONE caller, free_weak_hash from memory_manager_delete_objects;
+    the only other site that frees any of these handles is the
+    lost-double-check branch of init_reflection_hashes, where no table was ever
+    constructed. Giving the table ownership therefore frees each handed-over
+    handle exactly once -- no double free, no leak. The rule is documented at
+    the destroy site, which now calls mono_gchandle_free_internal and NULLs the
+    field.
+    SHARED-CODE IMPACT: mono_weak_hash_table_destroy is shared runtime code and
+    this fix is unconditional (not behind the opt-in and not behind the
+    DISABLE_THREADS gate). It is a plain leak fix, likewise upstreamable.
+  * Handle-ownership diagnostics: weak-hash.c keeps a two-counter ledger
+    (handles taken over by mono_weak_hash_table_new vs. handles freed by
+    mono_weak_hash_table_destroy) exposed via
+    mono_weak_hash_table_key_value_handle_stats and surfaced as kinds 2 and 3
+    of the existing InternalGetScoutRetirementStats icall (managed
+    AssemblyLoadContext.GetScoutRetirementStats). The two increments live at
+    two independent sites, so (taken - freed) is a real outstanding-population
+    measurement: it must plateau across forced cycles instead of growing by
+    three per cycle, and freed must never exceed taken. Unlike kinds 0/1 these
+    are NOT behind the DISABLE_THREADS gate, because the ownership fix they
+    observe is not either. This measures the runtime's own ownership ledger,
+    NOT sgen handle-table occupancy: no cheap occupancy counter is reachable at
+    this pin (stat_gc_handles_allocated is HEAVY_STATISTICS-only, and
+    sgen_gchandle_stats_report writes to a debug file behind
+    DISABLE_SGEN_DEBUG_HELPERS), and adding a new sgen -> gc-internals -> icall
+    counter across every GC backend was judged out of proportion.
+  * New host-invoked icall InternalForceNativeUnload: once the host has
+    proven managed quiescence it tears down the ALC natively. It is
+    OUTCOME-BASED, returning int (0=Completed, 1=NotQuiescent,
+    2=Rejected) instead of void:
+      - Rejected (2): feature unavailable (threads-enabled build, see
+        the hard gate above), or null / default / non-collectible /
+        not-yet-unloading (alc->unloading FALSE) -- would trip
+        mono_alc_cleanup's asserts.
+      - NotQuiescent (1): whole-set quiescence gate (review), ALL-OR-
+        NOTHING over the exact set of managers mono_alc_cleanup will
+        free. alc->unloading is NOT a quiescence proof; stack frames,
+        shared-generic type args, delegates and runtime handles can
+        still root a collectible LoaderAllocator (dotnet/runtime#40394,
+        #34072). Every shared/generic memory manager has its OWN
+        LoaderAllocator liveness witness, and a live cross-context
+        constructed generic keeps a SHARED manager's witness alive even
+        after the primary witness has cleared -- so the gate requires a
+        dead witness (weak-handle target NULL, read via
+        mono_gchandle_get_target_internal) for the primary manager AND
+        every shared generic manager on alc->generic_memory_managers
+        before anything is freed. If ANY witness is live, nothing is
+        freed and the managers are left intact for a later retry. A
+        NULL weak handle means no LoaderAllocator bookkeeping was ever
+        materialised for that manager, which is safe to free. This
+        mirrors the scout's own criterion.
+      - Completed (0): every witness is dead -> mono_alc_free.
+    The managed bridge maps this to AssemblyLoadContext.ForceNativeUnloadResult
+    and latches its once-only Interlocked claim ONLY on Completed, so a
+    NotQuiescent/Rejected outcome does not consume the single retry; it is
+    trim-rooted via DynamicDependency.
+  * Managed tombstone after Completed (review): a successful force frees
+    the native ALC storage, so the stale pointer must never reach an
+    icall again. ForceNativeUnload zeroes _nativeAssemblyLoadContext
+    (the field loses its readonly for this -- layout is unchanged)
+    BEFORE latching the terminal claim, and the NativeALC getter -- the
+    single funnel for every managed consumer of the native handle
+    (LoadFromAssemblyName -> RuntimeAssembly.InternalLoad,
+    InternalLoadFromPath, InternalLoad(byte[]), Assembly.Load) -- throws
+    ObjectDisposedException when the pointer is zero or the claim is
+    terminal. An ordinary API call after a successful force therefore
+    rejects deterministically in managed code instead of forwarding
+    freed storage to native (which has no liveness check on that path).
+  * jiterpreter sweep (trace-info metadata ONLY -- see scope note):
+    free_jit_mem_manager destroys interp_code_hash wholesale without
+    running the per-method jiterpreter cleanup that interp_free_method
+    runs only for dynamic methods, orphaning JS trace-info entries for
+    every regular method in the unloaded ALC. A new interp helper
+    sweeps them before the hash is destroyed. Guarded by HOST_BROWSER
+    so non-wasm builds do not pull the symbol. SCOPE: this releases the
+    JS-side trace-info metadata only. It does NOT reclaim WASM
+    function-table slots: compiled trace functions stay installed in
+    the indirect function table and the table allocator's next_index is
+    monotonic (never released or reused; upstream has no uninstall path,
+    dotnet/runtime#89980 scoped it out), so repeated load/unload cycles
+    consume bounded table capacity. On exhaustion new traces stop being
+    installed and execution of those paths stays in the interpreter
+    (performance-only degradation; installed traces keep working).
+    Table-slot ownership/reuse is the tracked follow-up
+    https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
+
+The behaviour is fully dark unless MONO_WASM_ENABLE_ALC_UNLOAD is set
+on a DISABLE_THREADS browser build: individual ALCs stay
+non-collectible, InternalForceNativeUnload returns Rejected, and the
+memory manager free keeps its poisoning path for validation runs.
+
+Round 9 (deterministic coverage amendment):
+
+  * Deterministic test GC hook for the reflection-hash construction
+    window: managed nursery churn cannot force a collection between two
+    chosen allocations (a few tens of KiB against a 4 MiB nursery), so a
+    revert of the holder pins could stay green whenever no collection
+    happened to land inside the short window.
+    mono_mem_manager_alc_unload_test_gc_hook -- compiled only under
+    DISABLE_THREADS like the rest of the machinery, inert unless
+    MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set (one cached getenv,
+    mirroring the MONO_WASM_ENABLE_ALC_UNLOAD opt-in) -- performs a real
+    nursery collection (mono_gc_collect(0), the same entry point as
+    GC.Collect(0)) and counts the fire. Call sites cover the exact
+    window the pins protect: after the holders_arr allocation and
+    between the holder allocations (memory-manager.c), plus inside
+    mono_weak_hash_table_new between the holder fetch and the table's
+    own array allocations (the pins deliberately span that call too).
+    Exposed as kind 4 of InternalGetScoutRetirementStats; a
+    threads-enabled build reports -1 even with the env var set, so the
+    hook cannot be smuggled past the DISABLE_THREADS hard gate.
+  * Kind 5 of the same icall exposes mono_weak_hash_table_rehash_count
+    (unconditional shared-runtime code, like kinds 2/3) so a lifecycle
+    test can prove a reflection workload really crossed the
+    initial-table-size load-factor boundary instead of assuming so.
+
+Round 10 (review follow-up: terminal dead-cache result, condemned
+assemblies filtered from the global enumeration):
+
+  Round 9 made a dead weak table degrade lookups to misses, but the
+  reflection-cache layer treats a miss as "construct and cache": the
+  CI-observed path InternalGetLoadedAssemblies ->
+  mono_assembly_get_object_handle -> check_or_construct_handle then
+  invoked assembly_object_construct for the condemned manager and
+  aborted on g_assert(loader_alloc) — "callers construct uncached" is
+  false for every constructor that requires the collectible
+  LoaderAllocator (assembly and type wrappers set m_keepalive from it).
+
+  * Tri-state weak-table lookup: mono_weak_hash_table_lookup_full
+    returns HIT / MISS / DEAD so a dead table is distinguishable from an
+    ordinary miss (plain mono_weak_hash_table_lookup keeps collapsing
+    DEAD to a miss for callers whose values are optional caches).
+  * check_object_handle / check_or_construct_handle plumb the DEAD
+    state through: the constructor is NOT invoked for a condemned
+    manager. Callers that can skip the item receive the state via the
+    new CHECK_OR_CONSTRUCT_HANDLE_DEAD out-param with error left OK;
+    every other caller gets a clean InvalidOperationException-shaped
+    MonoError (all existing call sites already propagate MonoError).
+    The g_assert(loader_alloc) in the constructors is deliberately NOT
+    weakened: for a live manager a NULL witness stays a fatal bug.
+    check_object_handle also drops upstream's dead first lookup block
+    (its result was unconditionally overwritten by the second lookup),
+    so exactly one lookup feeds the tri-state.
+  * cache_object_handle skips the ReflectedEntry allocation when the
+    table died between the caller's lookup and the insert (the insert
+    would no-op and leak the entry on a non-moving GC) and hands the
+    object back uncached.
+  * mono_mem_manager_init_reflection_hashes now returns FALSE for a
+    condemned manager (witness dead, hashes never built) instead of
+    publishing holders into a NULL LoaderAllocator; the cache layer
+    treats that exactly like a dead table. It must NOT create a fresh
+    LoaderAllocator: that would resurrect a condemned manager.
+  * mono_type_get_object_checked takes the same terminal path (clean
+    error) for a condemned manager, both when the hashes were never
+    built and when its weak_type_hash lookup reports DEAD.
+  * InternalGetLoadedAssemblies filters condemned assemblies via
+    mono_assembly_get_object_handle_or_condemned: they are still on the
+    loaded list while a shared-manager witness keeps the force at
+    NotQuiescent, but their wrapper can neither be found nor legally
+    re-constructed, so the enumeration skips them and returns an
+    exactly-sized array (no NULL slots). Observable as one GC earlier:
+    the wrapper was about to die anyway.
+  * Kind 6 of InternalGetScoutRetirementStats exposes
+    mono_weak_hash_table_dead_lookup_count (unconditional, like kinds
+    2/3/5) so the lifecycle test can prove the enumeration really took
+    the dead-cache path instead of passing vacuously.
+---
+ .../Runtime/Loader/AssemblyLoadContext.cs     |   7 +-
+ .../Loader/AssemblyLoadContext.Mono.cs        | 108 ++++-
+ .../mono/metadata/assembly-load-context.c     | 389 +++++++++++++++++-
+ src/mono/mono/metadata/icall-def.h            |   2 +
+ src/mono/mono/metadata/loader-internals.h     |  35 +-
+ src/mono/mono/metadata/memory-manager.c       | 155 ++++++-
+ src/mono/mono/metadata/reflection-cache.h     |  86 +++-
+ src/mono/mono/metadata/reflection-internals.h |  14 +
+ src/mono/mono/metadata/reflection.c           |  48 ++-
+ src/mono/mono/metadata/weak-hash.c            |  45 ++
+ src/mono/mono/metadata/weak-hash.h            |   7 +
+ src/mono/mono/mini/interp/interp.c            |  36 ++
+ src/mono/mono/mini/interp/interp.h            |   3 +
+ src/mono/mono/mini/mini-runtime.c             |   5 +
+ 14 files changed, 896 insertions(+), 44 deletions(-)
+
+diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
+index 9f9403738..4eac33a24 100644
+--- a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
++++ b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
+@@ -44,8 +44,11 @@ private enum InternalState
+         // AssemblyLoadContextBaseObject structure in object.h
+         // and MonoAssemblyLoadContext in object-internals.h
+ 
+-        // Contains the reference to VM's representation of the AssemblyLoadContext
+-        private readonly IntPtr _nativeAssemblyLoadContext;
++        // Contains the reference to VM's representation of the AssemblyLoadContext.
++        // Not readonly: the Mono host-triggered forced native unload (ForceNativeUnload in
++        // AssemblyLoadContext.Mono.cs) tombstones it to IntPtr.Zero once the native side has
++        // been freed, so no managed path can forward the stale pointer to an icall.
++        private IntPtr _nativeAssemblyLoadContext;
+ #endregion
+ 
+         // synchronization primitive to protect against usage of this instance while unloading
+diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+index 57db6533e..cc30e0cdb 100644
+--- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
++++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+@@ -17,11 +17,26 @@ internal IntPtr NativeALC
+         {
+             get
+             {
+-                return _nativeAssemblyLoadContext;
++                // Tombstone check (see ForceNativeUnload): once a forced native unload has
++                // Completed, the native ALC storage has been freed and the stale pointer must
++                // never reach an icall again. Every managed consumer of the native handle
++                // (LoadFromAssemblyName -> RuntimeAssembly.InternalLoad, InternalLoadFromPath,
++                // InternalLoad(byte[]), Assembly.Load) funnels through this getter, so an
++                // ordinary API call after a successful force rejects deterministically in
++                // managed code instead of dereferencing freed native memory.
++                IntPtr native = _nativeAssemblyLoadContext;
++                if (native == IntPtr.Zero || Volatile.Read(ref _nativeUnloadForced) == 2)
++                {
++                    throw new ObjectDisposedException(nameof(AssemblyLoadContext),
++                        SR.AssemblyLoadContext_Verify_NotUnloading);
++                }
++                return native;
+             }
+         }
+ 
+         [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
++        [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
++        [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
+         private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
+         {
+             if (isCollectible)
+@@ -41,6 +56,97 @@ private static void KeepLoaderAllocator()
+         [MethodImplAttribute(MethodImplOptions.InternalCall)]
+         private static extern void PrepareForAssemblyLoadContextRelease(IntPtr nativeAssemblyLoadContext, IntPtr assemblyLoadContextStrong);
+ 
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalForceNativeUnload(IntPtr nativeAssemblyLoadContext);
++
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalGetScoutRetirementStats(int kind);
++
++        // Diagnostics for the forced-unload LoaderAllocatorScout terminal-state registry (see the
++        // native ves_icall_..._InternalGetScoutRetirementStats): kind 0 returns the current
++        // retired-set size (force-freed managers whose scout has not yet finalized), kind 1 the
++        // monotonic count of scouts that received a terminal Destroy outcome. Kinds 0/1 return -1
++        // when the feature is unavailable (threads-enabled runtime). Lifecycle tests use this to
++        // assert the scout/finalizer population plateaus across forced unload cycles.
++        //
++        // Kinds 2/3 report the native MonoWeakHashTable key_value_handle ownership ledger: kind 2
++        // the monotonic count of holder handles taken over by mono_weak_hash_table_new, kind 3 the
++        // monotonic count freed by mono_weak_hash_table_destroy (their owner). (2 - 3) is the
++        // outstanding reflection-hash holder-handle population, which must plateau across forced
++        // cycles rather than growing by three per reflection-using memory manager. Unlike kinds
++        // 0/1 these are available on every build, because the ownership fix they observe is
++        // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
++        internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
++
++        // Outcome of a host-triggered native ALC teardown. The values MUST stay in sync with the
++        // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
++        // in the native assembly-load-context.c.
++        internal enum ForceNativeUnloadResult
++        {
++            // The native teardown ran to completion and the ALC was freed.
++            Completed = 0,
++            // The managed LoaderAllocator is still rooted (its weak handle target is non-NULL), so
++            // freeing now would reclaim live memory. Nothing was freed; the caller should retry
++            // later (e.g. after another GC).
++            NotQuiescent = 1,
++            // The request was rejected up front: feature unavailable (threads-enabled runtime,
++            // where the destructive teardown is compiled out), null / default / non-collectible
++            // ALC, or the managed Unload has not been initiated yet (alc->unloading is FALSE).
++            Rejected = 2,
++        }
++
++        // Tri-state native-unload claim, updated via Interlocked (0 = idle, 1 = in-flight,
++        // 2 = completed). A caller claims the transition (0 -> 1) before invoking the icall so at
++        // most one caller is ever inside the native teardown for a given ALC; otherwise two callers
++        // could both free the same native pointer (a mono_alc_free use-after-free). On Completed
++        // the claim latches at 2 (terminal — the native ALC is freed and
++        // _nativeAssemblyLoadContext is tombstoned to IntPtr.Zero); on NotQuiescent/Rejected it is
++        // released back to 0 so a correct later call can re-enter. A concurrent caller that
++        // observes 1 backs off with NotQuiescent and never re-enters.
++        private int _nativeUnloadForced;
++
++        // Invoked by a downstream host once it has proven the collectible ALC is managed-quiescent.
++        // Outcome-based and safe to retry: on Completed the ALC has been freed and this becomes an
++        // idempotent no-op; on NotQuiescent/Rejected nothing was freed and a later call will re-run
++        // the native validation. The native icall guards null/default/non-collectible/non-terminal
++        // state (Rejected) and proves GC quiescence via the LoaderAllocator weak handle (NotQuiescent).
++        internal ForceNativeUnloadResult ForceNativeUnload()
++        {
++            // Claim the transition before touching the native ALC: 0 (idle) -> 1 (in-flight). Only
++            // the winner of this claim may enter InternalForceNativeUnload for a given ALC — two
++            // callers must never free the same readonly native pointer (use-after-free).
++            int prior = System.Threading.Interlocked.CompareExchange(ref _nativeUnloadForced, 1, 0);
++            if (prior == 2)
++            {
++                return ForceNativeUnloadResult.Completed; // already torn down
++            }
++
++            if (prior == 1)
++            {
++                // Another caller owns the in-flight attempt; do NOT call the icall again. Report
++                // NotQuiescent so the host retries later rather than assuming completion.
++                return ForceNativeUnloadResult.NotQuiescent;
++            }
++
++            // prior == 0: we won the claim and are the only caller in the icall.
++            ForceNativeUnloadResult result = (ForceNativeUnloadResult)InternalForceNativeUnload(_nativeAssemblyLoadContext);
++
++            if (result == ForceNativeUnloadResult.Completed)
++            {
++                // Object-wide tombstone: the native ALC storage was freed by the icall above.
++                // Zero the stale pointer BEFORE publishing the terminal claim so no reader can
++                // observe claim == 2 together with a live-looking pointer; the NativeALC getter
++                // rejects on either signal, so ordinary API calls (LoadFromAssemblyName etc.)
++                // throw ObjectDisposedException instead of forwarding freed storage to an icall.
++                _nativeAssemblyLoadContext = IntPtr.Zero;
++            }
++
++            // Completed is terminal (stays claimed at 2); NotQuiescent/Rejected release the claim so
++            // a legitimate later attempt can re-enter.
++            System.Threading.Interlocked.Exchange(ref _nativeUnloadForced, result == ForceNativeUnloadResult.Completed ? 2 : 0);
++            return result;
++        }
++
+         [RequiresUnreferencedCode("Types and members the loaded assembly depends on might be removed")]
+         [System.Security.DynamicSecurityMethod] // Methods containing StackCrawlMark local var has to be marked DynamicSecurityMethod
+ #pragma warning disable IDE0060
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index dec9f96b6..382247fa9 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -3,6 +3,7 @@
+ 
+ #include "mono/metadata/assembly.h"
+ #include "mono/metadata/assembly-internals.h"
++#include "mono/metadata/class-internals.h"
+ #include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/exception-internals.h"
+ #include "mono/metadata/icall-decl.h"
+@@ -10,6 +11,7 @@
+ #include "mono/metadata/loaded-images-internals.h"
+ #include "mono/metadata/mono-private-unstable.h"
+ #include "mono/metadata/mono-debug.h"
++#include "mono/metadata/weak-hash.h"
+ #include "mono/utils/mono-error-internals.h"
+ #include "mono/utils/mono-logger-internals.h"
+ 
+@@ -34,13 +36,103 @@ alcs_unlock (void)
+ 	mono_coop_mutex_unlock (&alc_list_lock);
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Terminal-state registry for LoaderAllocatorScout finalizers of force-retired memory
++ * managers.
++ *
++ * The (disabled) real implementation of LoaderAllocatorScout_Destroy returns FALSE
++ * unconditionally, and the scout finalizer responds to FALSE with
++ * GC.ReRegisterForFinalize — the upstream-correct "not yet" retry. But the forced
++ * native teardown (mono_alc_cleanup below) frees a manager without publishing any
++ * terminal state the scout could observe, so after a forced unload every scout whose
++ * manager is gone would resurrect itself forever: each cycle adds one permanently
++ * finalizable object that every subsequent GC/WaitForPendingFinalizers reprocesses.
++ *
++ * The registry records the POINTER VALUE of every force-freed manager that had a
++ * materialised LoaderAllocator (weak handle non-NULL implies a scout exists). The
++ * scout's Destroy icall consults it BEFORE the unconditional FALSE and, purely by
++ * pointer-value comparison — the freed manager is never dereferenced — consumes the
++ * entry and returns TRUE, giving that scout a terminal outcome (no re-registration).
++ *
++ * Boundedness: an entry is only added when the manager's LoaderAllocator witness is
++ * already dead (the quiescence gate proved it before anything was freed), so the
++ * scout is either already on the finalizer queue or becomes finalizable at the next
++ * collection — every entry is consumed by the next finalization pass, and the set
++ * size is bounded by the number of force-freed managers whose scout has not yet
++ * finalized. A GPtrArray (with possible duplicate pointer values, consumed one
++ * occurrence per Destroy) keeps the counting exact if an address is recycled while
++ * an earlier scout is still pending.
++ *
++ * ABA (manager freed, new manager allocated at the recycled address): an entry is
++ * added only at force-free time and removed at the first Destroy consult for that
++ * pointer value. A scout only ever calls Destroy after ITS LoaderAllocator is dead,
++ * and consuming an entry never frees or dereferences anything, so a mis-matched
++ * consult (the successor scout at a recycled address draining the predecessor's
++ * entry) at worst permutes WHICH of the two indistinguishable scouts receives the
++ * terminal outcome; the pending-scout count per address still drains to zero because
++ * every force-free adds exactly one entry and every entry retires exactly one scout.
++ *
++ * Single-threaded by construction: the registry is only mutated by the forced
++ * teardown and the scout finalizer, both hard-gated to the DISABLE_THREADS browser
++ * build, so no locking is needed.
++ */
++static GPtrArray *retired_scout_targets;
++/* Monotonic count of scouts given a terminal (TRUE) Destroy outcome; diagnostics only. */
++static gint32 retired_scout_terminal_count;
++
++static void
++retired_scout_targets_add (MonoMemoryManager *memory_manager)
++{
++	if (!retired_scout_targets)
++		retired_scout_targets = g_ptr_array_new ();
++	g_ptr_array_add (retired_scout_targets, memory_manager);
++}
++
++static gboolean
++retired_scout_targets_consume (gpointer memory_manager)
++{
++	if (!retired_scout_targets)
++		return FALSE;
++	/* Pointer-value comparison only; removes a single occurrence. */
++	return g_ptr_array_remove (retired_scout_targets, memory_manager);
++}
++#endif /* DISABLE_THREADS */
++
+ static void
+ mono_alc_init (MonoAssemblyLoadContext *alc, gboolean collectible)
+ {
+ 	MonoLoadedImages *li = g_new0 (MonoLoadedImages, 1);
+ 
+-	// FIXME:
++	/*
++	 * By default every individual/unloadable ALC is forced non-collectible.
++	 * A downstream WASM worker hosting Roslyn opts into native ALC unload by
++	 * setting MONO_WASM_ENABLE_ALC_UNLOAD; only then do we honour the caller's
++	 * collectible request, which is required for correctness (cross-ALC generics
++	 * would otherwise route into the never-freed default memory manager).
++	 *
++	 * The whole feature is hard-gated to the single-threaded browser build
++	 * (DISABLE_THREADS): the destructive teardown in mono_alc_cleanup mutates
++	 * state that lock-free readers (mem_manager_cache_get) can dereference with
++	 * no lock held, which is only race-free when no other thread can exist. On
++	 * a threads-enabled runtime the opt-in is ignored entirely — collectible
++	 * stays forced FALSE, PrepareForAssemblyLoadContextRelease keeps its
++	 * !collectible early-return (no mono_mem_manager_start_unload runs, so no
++	 * manager state is ever disturbed), and InternalForceNativeUnload rejects.
++	 */
++#ifdef DISABLE_THREADS
++	static int native_alc_unload_enabled = -1;
++	if (native_alc_unload_enabled == -1) {
++		/* Explicit opt-in only: unset, empty, "0" and "false" all remain off. */
++		char *val = g_getenv ("MONO_WASM_ENABLE_ALC_UNLOAD");
++		native_alc_unload_enabled = (val && (!g_ascii_strcasecmp (val, "1") || !g_ascii_strcasecmp (val, "true"))) ? 1 : 0;
++		g_free (val);
++	}
++	if (!native_alc_unload_enabled)
++		collectible = FALSE;
++#else
+ 	collectible = FALSE;
++#endif
+ 
+ 	mono_loaded_images_init (li, alc);
+ 	alc->loaded_images = li;
+@@ -187,17 +279,88 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
+ 	mono_gchandle_free_internal (alc->memory_manager->loader_allocator_handle);
+ 	alc->memory_manager->loader_allocator_handle = NULL;
+ 
+-	// FIXME: Change to FALSE
+-	mono_mem_manager_free (alc->memory_manager, TRUE);
++	/*
++	 * Actually reclaim the primary memory manager's mempool/code-manager pages.
++	 * The poison path (debug_unload=TRUE) is still reachable through the env
++	 * gate on mono_alc_init for use-after-free validation runs.
++	 */
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++#ifdef DISABLE_THREADS
++	/* A materialised LoaderAllocator (weak handle non-NULL) implies a scout whose finalizer
++	 * will later call Destroy with this manager's pointer value. Record the pointer in the
++	 * terminal-state registry BEFORE the handle is released below, so that scout receives a
++	 * terminal TRUE outcome instead of re-registering for finalization forever. */
++	if (primary_mm->loader_allocator_weak_handle)
++		retired_scout_targets_add (primary_mm);
++#endif
++	/* Release the LoaderAllocator weak GCHandle before freeing: the quiescence gate reads it
++	 * (mono_gchandle_get_target_internal) but nothing in the base ever frees it — only the
++	 * strong handle is released (start_unload) — so a real free would leak one GCHandle slot
++	 * per reclaimed manager. memory_manager_delete never touches it, so this is not a double-free. */
++	mono_gchandle_free_internal (primary_mm->loader_allocator_weak_handle);
++	primary_mm->loader_allocator_weak_handle = NULL;
++	mono_mem_manager_free (primary_mm, FALSE);
+ 	alc->memory_manager = NULL;
+ 
+-	/*for (int i = 0; i < alc->generic_memory_managers->len; i++) {
+-		MonoGenericMemoryManager *memory_manager = (MonoGenericMemoryManager *)alc->generic_memory_managers->pdata [i];
+-		mono_mem_manager_free_generic (memory_manager, FALSE);
+-	}*/
+-	// FIXME:
+-	//g_ptr_array_free (alc->generic_memory_managers, TRUE);
+-	//mono_coop_mutex_destroy (&alc->memory_managers_lock);
++	/*
++	 * Delete the shared generic memory managers that include this dying ALC. Per the
++	 * MonoMemoryManager ownership contract (loader-internals.h), generic instances depend
++	 * on every owning ALC and must be deleted when one of them unloads. Follow the
++	 * (disabled) LoaderAllocatorScout_Destroy protocol: purge the lock-free mem-manager
++	 * cache entry first (a later ALC allocated at a recycled address must never produce a
++	 * false cache hit), detach the manager from every surviving owner's
++	 * generic_memory_managers list (no sibling may be left holding a dangling manager),
++	 * then free it. ALC-exclusive generic instances live in the primary manager, already
++	 * freed above (get_mem_manager_for_alcs returns the primary for a single-ALC set).
++	 *
++	 * Synchronization: mem_manager_cache_get() is lock-free — another thread can load a
++	 * manager pointer out of the cache and dereference it (match_mem_manager, hashing)
++	 * with no lock held. The destructive sequence below (cache-remove + owner-detach +
++	 * free) is therefore only race-free when no other thread can exist at all, so the
++	 * whole feature is hard-gated at compile time to the single-threaded browser build
++	 * (DISABLE_THREADS): on a threads-enabled runtime InternalForceNativeUnload rejects
++	 * up front and mono_alc_init never honours the collectible opt-in, so this function
++	 * is unreachable there (its only caller is mono_alc_free from the gated icall) and
++	 * no preparation (mono_mem_manager_start_unload) has mutated the shared managers.
++	 * Within the gate the loader lock brackets the whole sequence (matching the scout
++	 * protocol) and is correctly ordered above the per-owner memory_managers_lock
++	 * (loader-internals.h locking hierarchy).
++	 *
++	 * Quiescence: the caller (InternalForceNativeUnload) has already verified — before
++	 * anything was freed — that EVERY manager deleted here (the primary above and each
++	 * shared generic manager in this loop) has a dead LoaderAllocator liveness witness,
++	 * so nothing reclaimed below can still be referenced from managed code.
++	 */
++#ifdef DISABLE_THREADS
++	mono_loader_lock ();
++	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
++		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
++		if (mm == primary_mm)
++			continue;
++		mono_mem_manager_cache_remove (mm);
++		for (int j = 0; j < mm->n_alcs; ++j) {
++			MonoAssemblyLoadContext *owner = mm->alcs [j];
++			if (owner == alc)
++				continue;
++			mono_alc_memory_managers_lock (owner);
++			g_ptr_array_remove (owner->generic_memory_managers, mm);
++			mono_alc_memory_managers_unlock (owner);
++		}
++		/* Same terminal-state registration as the primary manager above: a shared manager
++		 * with a materialised LoaderAllocator also owns a scout that must terminally die. */
++		if (mm->loader_allocator_weak_handle)
++			retired_scout_targets_add (mm);
++		/* Release the shared manager's LoaderAllocator weak GCHandle before freeing it,
++		 * same rationale as the primary manager above (never freed elsewhere; no double-free). */
++		mono_gchandle_free_internal (mm->loader_allocator_weak_handle);
++		mm->loader_allocator_weak_handle = NULL;
++		mono_mem_manager_free (mm, FALSE);
++	}
++	mono_loader_unlock ();
++#endif
++	g_ptr_array_free (alc->generic_memory_managers, TRUE);
++	alc->generic_memory_managers = NULL;
++	mono_coop_mutex_destroy (&alc->memory_managers_lock);
+ 
+ 	mono_gchandle_free_internal (alc->gchandle);
+ 	alc->gchandle = NULL;
+@@ -277,8 +440,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_pointer;
+ 
+ 	// FIXME:
+-	if (!alc->collectible)
++	if (!alc->collectible) {
++		/* Native never took ownership of the strong handle on this path, so release it here. */
++		mono_gchandle_free_internal (strong_gchandle);
+ 		return;
++	}
+ 
+ 	g_assert (alc->collectible);
+ 	g_assert (!alc->unloading);
+@@ -298,6 +464,159 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	mono_alc_memory_managers_unlock (alc);
+ }
+ 
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
++{
++	/*
++	 * Host-triggered native teardown of a collectible ALC. Returns an outcome the managed
++	 * bridge maps to AssemblyLoadContext.ForceNativeUnloadResult:
++	 *   0 = Completed     — the ALC was torn down and freed.
++	 *   1 = NotQuiescent  — managed roots to the ALC still exist; nothing freed, retry later.
++	 *   2 = Rejected      — feature unavailable (threads-enabled build), or null / default /
++	 *                       non-collectible / not-yet-unloading ALC.
++	 */
++	enum { FORCE_UNLOAD_COMPLETED = 0, FORCE_UNLOAD_NOT_QUIESCENT = 1, FORCE_UNLOAD_REJECTED = 2 };
++
++#ifndef DISABLE_THREADS
++	/*
++	 * Hard gate: the destructive teardown (mono_alc_cleanup's cache-remove + owner-detach +
++	 * free of shared generic managers) races the lock-free mem_manager_cache_get () readers,
++	 * which dereference a manager pointer with no lock held. That is only sound when no other
++	 * thread can exist, i.e. the single-threaded browser build (DISABLE_THREADS). On a
++	 * threads-enabled runtime the feature is unavailable: reject before touching ANY state.
++	 * mono_alc_init also refuses the collectible opt-in there, so no preparation
++	 * (mono_mem_manager_start_unload on shared managers) ever runs either.
++	 */
++	return FORCE_UNLOAD_REJECTED;
++#else
++	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_pointer;
++
++	/*
++	 * Reject up front: freeing the default or a non-collectible ALC, or one whose managed
++	 * Unload has not been initiated (alc->unloading), would trip mono_alc_cleanup's asserts
++	 * and abort the runtime. Forced teardown is a terminal transition that requires
++	 * PrepareForAssemblyLoadContextRelease to have run first (it sets alc->unloading).
++	 */
++	if (!alc || alc == mono_alc_get_default ())
++		return FORCE_UNLOAD_REJECTED;
++	if (!alc->collectible)
++		return FORCE_UNLOAD_REJECTED;
++	if (!alc->unloading)
++		return FORCE_UNLOAD_REJECTED;
++
++	/*
++	 * Quiescence gate — ALL-OR-NOTHING over the exact set of managers the teardown will
++	 * free. alc->unloading only means the managed Unload() was requested — it is NOT proof
++	 * that the collectible LoaderAllocators have been collected. Stack frames,
++	 * shared-generic type arguments, delegates and runtime handles can still root them
++	 * (dotnet/runtime#40394, #34072). mono_mem_manager_start_unload already dropped the
++	 * strong handles, so each LoaderAllocator is now held only by managed references; while
++	 * a manager's weak-handle target is non-NULL, managed roots remain and freeing would
++	 * reclaim live memory. This is exactly the criterion the (disabled)
++	 * LoaderAllocatorScout uses.
++	 *
++	 * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
++	 * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
++	 * {default, this} manager) keeps that shared witness alive even after the primary
++	 * witness has cleared. mono_alc_cleanup deletes the primary manager AND every shared
++	 * generic manager on alc->generic_memory_managers, so each of those witnesses must be
++	 * dead before anything is freed. If ANY witness is live, free nothing and report
++	 * NotQuiescent so the host retries after another GC rather than losing its single
++	 * chance. A NULL weak handle means no LoaderAllocator bookkeeping was ever materialised
++	 * for that manager (no vtable/object of it ever existed), which is safe to free.
++	 */
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++	if (primary_mm && primary_mm->loader_allocator_weak_handle &&
++			mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
++		return FORCE_UNLOAD_NOT_QUIESCENT;
++
++	gboolean witness_live = FALSE;
++	mono_alc_memory_managers_lock (alc);
++	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
++		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
++		if (mm == primary_mm)
++			continue;
++		if (mm->loader_allocator_weak_handle &&
++				mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL) {
++			witness_live = TRUE;
++			break;
++		}
++	}
++	mono_alc_memory_managers_unlock (alc);
++	if (witness_live)
++		return FORCE_UNLOAD_NOT_QUIESCENT;
++
++	mono_alc_free (alc);
++	return FORCE_UNLOAD_COMPLETED;
++#endif
++}
++
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats (gint32 kind, MonoError *error)
++{
++	/*
++	 * Diagnostics for the LoaderAllocatorScout terminal-state registry (see
++	 * retired_scout_targets at the top of this file). Used by lifecycle tests to prove the
++	 * scout/finalizer population plateaus across forced unload cycles instead of growing:
++	 *   kind 0 — current retired-set size (entries added by forced teardown, not yet
++	 *            consumed by a scout finalizer; must drain back to 0 once finalizers run).
++	 *   kind 1 — monotonic count of scouts that received a terminal (TRUE) Destroy outcome.
++	 * Returns -1 when the feature is unavailable (threads-enabled build, where the forced
++	 * teardown is compiled out and the registry does not exist) or for an unknown kind.
++	 *
++	 * Kinds 2 and 3 report the MonoWeakHashTable key_value_handle ownership ledger (see the
++	 * OWNERSHIP RULE comment in mono_weak_hash_table_destroy):
++	 *   kind 2 — handles taken over by mono_weak_hash_table_new (monotonic).
++	 *   kind 3 — handles freed by mono_weak_hash_table_destroy, their owner (monotonic).
++	 * (kind 2 - kind 3) is the outstanding reflection-hash holder-handle population: it must
++	 * plateau across repeated load/reflect/force-unload cycles instead of growing by three per
++	 * cycle, and kind 3 must never exceed kind 2 (no double free). These two kinds are
++	 * deliberately NOT behind the DISABLE_THREADS gate: the ownership fix they observe is
++	 * unconditional shared-runtime code, so its diagnostics must be readable on a
++	 * threads-enabled build too — there the ledger simply never moves, because no ALC is ever
++	 * collectible and only collectible managers build reflection hashes.
++	 *
++	 * Kind 4 — monotonic count of deterministic test-GC-hook fires inside the reflection-hash
++	 * construction window (see mono_mem_manager_alc_unload_test_gc_hook). Compiled only on the
++	 * single-threaded build like kinds 0/1, so a threads-enabled runtime reports -1 even when
++	 * MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set — the hook cannot be smuggled past the
++	 * DISABLE_THREADS hard gate.
++	 *
++	 * Kind 5 — monotonic count of MonoWeakHashTable rehashes actually performed (see
++	 * mono_weak_hash_table_rehash_count). Unconditional like kinds 2/3: the rehash fix it
++	 * observes is shared-runtime code. A lifecycle test uses it to prove a reflection workload
++	 * genuinely crossed the initial-table-size load-factor boundary (initial size 11, rehash
++	 * before the 9th unique insertion into one table) instead of assuming so.
++	 *
++	 * Kind 6 — monotonic count of weak-table lookups that found a DEAD table (holder collected
++	 * with the condemned manager's LoaderAllocator; see DEAD-TABLE SEMANTICS in weak-hash.c and
++	 * mono_weak_hash_table_dead_lookup_count). Unconditional like kinds 2/3/5. A lifecycle test
++	 * uses it to prove the global assembly enumeration really took the terminal dead-cache path
++	 * for a condemned assembly (skipping it) instead of passing vacuously.
++	 */
++	if (kind == 2 || kind == 3)
++		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
++	if (kind == 5)
++		return mono_weak_hash_table_rehash_count ();
++	if (kind == 6)
++		return mono_weak_hash_table_dead_lookup_count ();
++
++#ifndef DISABLE_THREADS
++	return -1;
++#else
++	switch (kind) {
++	case 0:
++		return retired_scout_targets ? (int)retired_scout_targets->len : 0;
++	case 1:
++		return retired_scout_terminal_count;
++	case 4:
++		return mono_mem_manager_alc_unload_test_gc_hook_count ();
++	default:
++		return -1;
++	}
++#endif
++}
++
+ gpointer
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
+ {
+@@ -308,13 +627,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (M
+ }
+ 
+ static gboolean
+-add_assembly_to_array (MonoArrayHandle dest, int dest_idx, MonoAssembly* assm, MonoError *error)
++add_assembly_to_array (MonoArrayHandle dest, int dest_idx, MonoAssembly* assm, gboolean *condemned, MonoError *error)
+ {
+ 	HANDLE_FUNCTION_ENTER ();
+ 	error_init (error);
+-	MonoReflectionAssemblyHandle assm_obj = mono_assembly_get_object_handle (assm, error);
++	MonoReflectionAssemblyHandle assm_obj = mono_assembly_get_object_handle_or_condemned (assm, condemned, error);
+ 	goto_if_nok (error, leave);
+-	MONO_HANDLE_ARRAY_SETREF (dest, dest_idx, assm_obj);
++	if (!*condemned)
++		MONO_HANDLE_ARRAY_SETREF (dest, dest_idx, assm_obj);
+ leave:
+ 	HANDLE_FUNCTION_RETURN_VAL (is_ok (error));
+ }
+@@ -323,12 +643,35 @@ MonoArrayHandle
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies (MonoError *error)
+ {
+ 	GPtrArray *assemblies = mono_alc_get_all_loaded_assemblies ();
++	guint filled = 0;
+ 
+ 	MonoArrayHandle res = mono_array_new_handle (mono_class_get_assembly_class (), assemblies->len, error);
+ 	goto_if_nok (error, leave);
+ 	for (guint i = 0; i < assemblies->len; ++i) {
+-		if (!add_assembly_to_array (res, i, (MonoAssembly *)g_ptr_array_index (assemblies, i), error))
++		/*
++		 * Filter CONDEMNED assemblies: after a collectible ALC's managed unload has completed
++		 * (LoaderAllocator witness dead) but before the forced native teardown has freed it —
++		 * e.g. while a shared generic manager witness still reports NotQuiescent — the
++		 * assembly is still on the loaded list, yet its reflection wrapper can neither be
++		 * found (the weak caches died with the witness) nor be re-constructed
++		 * (assembly_object_construct requires the dead LoaderAllocator, and re-creating any
++		 * of it would resurrect a condemned manager). Skipping here mirrors what the array
++		 * would have looked like one GC earlier, when the wrapper was still cached but about
++		 * to die: the assembly is on its way out and must simply stop being observable.
++		 */
++		gboolean condemned = FALSE;
++		if (!add_assembly_to_array (res, filled, (MonoAssembly *)g_ptr_array_index (assemblies, i), &condemned, error))
+ 			goto leave;
++		if (!condemned)
++			filled++;
++	}
++
++	if (filled < assemblies->len) {
++		/* Condemned assemblies were skipped: hand back an exactly-sized array, no NULL tail. */
++		MonoArrayHandle compact = mono_array_new_handle (mono_class_get_assembly_class (), filled, error);
++		goto_if_nok (error, leave);
++		mono_array_handle_memcpy_refs (compact, 0, res, 0, filled);
++		MONO_HANDLE_ASSIGN (res, compact);
+ 	}
+ 
+ leave:
+@@ -701,6 +1044,22 @@ mono_alc_get_all (void)
+ MonoBoolean
+ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+ {
++#ifdef DISABLE_THREADS
++	/*
++	 * Terminal outcome for scouts whose memory manager was already freed by the forced
++	 * native teardown (see the retired_scout_targets registry at the top of this file).
++	 * The consult is a pure pointer-value comparison — the freed manager is NEVER
++	 * dereferenced — and consuming the entry retires exactly one scout: it returns TRUE,
++	 * so the finalizer does not GC.ReRegisterForFinalize and the scout population stays
++	 * bounded across forced load/unload cycles instead of growing by one immortal
++	 * finalizable object per cycle.
++	 */
++	if (retired_scout_targets_consume (native)) {
++		retired_scout_terminal_count++;
++		return TRUE;
++	}
++#endif
++
+ 	/* Not enabled yet */
+ 	return FALSE;
+ 
+diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
+index 444a41c2b..4e1a93423 100644
+--- a/src/mono/mono/metadata/icall-def.h
++++ b/src/mono/mono/metadata/icall-def.h
+@@ -472,7 +472,9 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+ 
+ ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
+ HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
++HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, int, 1, (gpointer))
+ HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
++HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
+ HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
+ HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
+ HANDLES(ALC_3, "InternalLoadFromStream", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream, MonoReflectionAssembly, 5, (gpointer, gpointer, gint32, gpointer, gint32))
+diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
+index 2f422904e..4275a39d2 100644
+--- a/src/mono/mono/metadata/loader-internals.h
++++ b/src/mono/mono/metadata/loader-internals.h
+@@ -297,6 +297,9 @@ mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collec
+ void
+ mono_mem_manager_free (MonoMemoryManager *memory_manager, gboolean debug_unload);
+ 
++void
++mono_mem_manager_cache_remove (MonoMemoryManager *memory_manager);
++
+ void
+ mono_mem_manager_free_objects (MonoMemoryManager *memory_manager);
+ 
+@@ -362,12 +365,42 @@ g_slist_prepend_mem_manager (MonoMemoryManager *memory_manager, GSList *list, gp
+ MonoGCHandle
+ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager);
+ 
+-void
++/*
++ * Returns TRUE when the manager's reflection caches are usable; FALSE for a condemned
++ * collectible manager (LoaderAllocator witness dead, tables never built — see the definition
++ * in memory-manager.c). FALSE must be treated like a dead weak table: skip the cache and never
++ * construct wrappers that require the LoaderAllocator.
++ */
++gboolean
+ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager);
+ 
+ void
+ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager);
+ 
++/*
++ * Test-only deterministic GC hook for the reflection-hash construction window (see
++ * mono_mem_manager_init_reflection_hashes). Gated twice: compiled only on the single-threaded
++ * build (DISABLE_THREADS, like the rest of the forced-unload machinery) and inert at runtime
++ * unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set — when unset the only cost is one cached
++ * getenv per process and a branch per call site. When armed, every call performs a nursery
++ * collection and increments an observable counter (scout-stats kind 4), so a regression test
++ * can prove a collection really happened INSIDE the window the pinned holder handles protect
++ * instead of relying on stochastic allocation pressure.
++ */
++#ifdef DISABLE_THREADS
++void
++mono_mem_manager_alc_unload_test_gc_hook (void);
++
++gint32
++mono_mem_manager_alc_unload_test_gc_hook_count (void);
++#else
++static inline void
++mono_mem_manager_alc_unload_test_gc_hook (void)
++{
++	/* Threads-enabled build: the forced-unload machinery (and this hook) is compiled out. */
++}
++#endif
++
+ G_END_DECLS
+ 
+ #endif
+diff --git a/src/mono/mono/metadata/memory-manager.c b/src/mono/mono/metadata/memory-manager.c
+index e7a234661..b06ce79a9 100644
+--- a/src/mono/mono/metadata/memory-manager.c
++++ b/src/mono/mono/metadata/memory-manager.c
+@@ -1,5 +1,6 @@
+ #include <mono/metadata/loader-internals.h>
+ #include <mono/metadata/gc-internals.h>
++#include <mono/metadata/mono-gc.h>
+ #include <mono/metadata/reflection-cache.h>
+ #include <mono/metadata/mono-hash-internals.h>
+ #include <mono/metadata/debug-internals.h>
+@@ -263,6 +264,14 @@ memory_manager_delete (MonoMemoryManager *memory_manager, gboolean debug_unload)
+ 		memory_manager->_mp = NULL;
+ 		mono_code_manager_destroy (memory_manager->code_mp);
+ 		memory_manager->code_mp = NULL;
++		/*
++		 * Reclaim the lock-free mempool pages too. mono_mem_manager_new allocates
++		 * lock_free_mp via lock_free_mempool_new but the poison path never freed it, so on
++		 * a real (debug_unload == FALSE) free its valloc'd chunks leaked — defeating the
++		 * bounded-memory goal on WASM where memory.grow is irreversible.
++		 */
++		lock_free_mempool_free (memory_manager->lock_free_mp);
++		memory_manager->lock_free_mp = NULL;
+ 	}
+ }
+ 
+@@ -481,6 +490,19 @@ mem_manager_cache_add (MonoMemoryManager *mem_manager)
+ 	mem_manager_cache [index] = mem_manager;
+ }
+ 
++/*
++ * Remove a memory manager from the lock-free cache before freeing it, so a later ALC
++ * allocated at a recycled address can never match a stale entry.
++ */
++void
++mono_mem_manager_cache_remove (MonoMemoryManager *mem_manager)
++{
++	guint32 hash_code = hash_alcs (mem_manager->alcs, mem_manager->n_alcs);
++	int index = hash_code % HASH_TABLE_SIZE;
++	if (mem_manager_cache [index] == mem_manager)
++		mem_manager_cache [index] = NULL;
++}
++
+ static MonoMemoryManager*
+ get_mem_manager_for_alcs (MonoAssemblyLoadContext **alcs, int nalcs)
+ {
+@@ -662,23 +684,91 @@ mono_mem_manager_get_loader_alloc (MonoMemoryManager *mem_manager)
+ 	return res;
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Deterministic test hook for the reflection-hash construction window below.
++ *
++ * The stochastic nursery churn a lifecycle test can apply from managed code is vacuous with
++ * respect to the pinned-holder fix: the workload allocates a few tens of KiB against a 4 MiB
++ * nursery and cannot place a collection between two chosen allocations, so reverting the pins
++ * could stay green whenever no collection happens to land inside the short window. When
++ * MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set (CI test legs only), each hook call forces a
++ * nursery collection at the exact points a hostile collection could strike — between the
++ * holder-array allocations and, via the call in mono_weak_hash_table_new, between a table's
++ * internal array allocations — and counts the fire so the test can assert the collections
++ * actually happened. With the pins present this must be behaviorally invisible; with the pins
++ * reverted the collected/moved holders make the reflection-cache coherence assertions (or the
++ * holder liveness asserts) fail deterministically.
++ *
++ * Same double gate as the rest of the forced-unload machinery: DISABLE_THREADS at compile
++ * time, an explicit env opt-in at runtime (cached once, mirroring MONO_WASM_ENABLE_ALC_UNLOAD
++ * in mono_alc_init). Single-threaded by construction, so plain increments suffice.
++ */
++static gint32 alc_unload_test_gc_hook_fired;
++
++static gboolean
++alc_unload_test_gc_hook_enabled (void)
++{
++	static int enabled = -1;
++	if (enabled == -1) {
++		/* Explicit opt-in only: unset, empty, "0" and "false" all remain off. */
++		char *val = g_getenv ("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK");
++		enabled = (val && (!g_ascii_strcasecmp (val, "1") || !g_ascii_strcasecmp (val, "true"))) ? 1 : 0;
++		g_free (val);
++	}
++	return enabled == 1;
++}
++
++void
++mono_mem_manager_alc_unload_test_gc_hook (void)
++{
++	if (G_LIKELY (!alc_unload_test_gc_hook_enabled ()))
++		return;
++	alc_unload_test_gc_hook_fired++;
++	/*
++	 * Nursery collection, same entry point as GC.Collect(0) (ves_icall_System_GC_InternalCollect),
++	 * called from GC-unsafe code exactly like an allocation-triggered minor collection would be.
++	 * The construction window's objects are freshly allocated, so a minor collection is what
++	 * moves or reclaims them when they are insufficiently rooted.
++	 */
++	mono_gc_collect (0);
++}
++
++gint32
++mono_mem_manager_alc_unload_test_gc_hook_count (void)
++{
++	return alc_unload_test_gc_hook_fired;
++}
++#endif /* DISABLE_THREADS */
++
+ /*
+  * Initialize reflection hashes in MEM_MANAGER.
+  * This is done on demand, see get_loader_alloc ().
++ *
++ * Returns TRUE when the manager's reflection caches are usable (non-collectible manager, or
++ * the tables exist / were just built). Returns FALSE for a CONDEMNED collectible manager: its
++ * LoaderAllocator witness has already been collected (the weak handle target is NULL), so the
++ * holder arrays cannot be published into LoaderAllocator.m_hashes — and creating a fresh
++ * LoaderAllocator here would resurrect a manager whose managed unload already completed.
++ * Callers must treat FALSE like a dead weak table (see DEAD-TABLE SEMANTICS in weak-hash.c):
++ * skip the cache and never construct wrappers that require the LoaderAllocator.
+  */
+-void
++gboolean
+ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+ {
+ 	ERROR_DECL (error);
+ 
+ 	if (!mem_manager->collectible)
+-		return;
++		return TRUE;
+ 	if (mem_manager->weak_refobject_hash)
+-		return;
++		return TRUE;
+ 
+ 	MonoGCHandle loader_alloc_handle = mono_mem_manager_get_loader_alloc (mem_manager);
+ 	MonoManagedLoaderAllocator *loader_alloc = (MonoManagedLoaderAllocator*)mono_gchandle_get_target_internal (loader_alloc_handle);
+ 
++	if (!loader_alloc)
++		return FALSE;
++
+ 	const int nhashes = 3;
+ 
+ 	/* Create a set of object[2] arrays to hold arrays of keys/values, store them into LoaderAllocator.m_hashes */
+@@ -687,15 +777,57 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+ 	MonoArray *holders_arr = mono_array_new_checked (mono_get_object_class (), nhashes, error);
+ 	mono_error_assert_ok (error);
+ 
+-	// FIXME: GC safety
++	/*
++	 * GC safety (this replaced an upstream "FIXME: GC safety").
++	 *
++	 * Every mono_array_new_checked below can trigger a collection, and until holders_arr is
++	 * published into LoaderAllocator.m_hashes the only other references to these arrays are
++	 * WEAK (holder_handles), so the raw C locals are neither GC roots nor move-safe. On
++	 * browser-wasm this is not theoretical: stack/register references are not scannable
++	 * there, so a nursery collection between two of these allocations could collect or move
++	 * holders_arr / an earlier holder, after which mono_array_setref_fast and
++	 * MONO_OBJECT_SETREF_INTERNAL would write through a stale pointer.
++	 *
++	 * Pin holders_arr and every holder for the whole construction window using the same
++	 * pinned-GCHandle idiom mono_mem_manager_get_loader_alloc above uses to keep loader_alloc
++	 * usable as a raw pointer across an allocating call ("loader_alloc is pinned"), and drop
++	 * the pins only after the last allocating call. The window deliberately extends past the
++	 * MONO_OBJECT_SETREF_INTERNAL publication so that it also covers
++	 * mono_weak_hash_table_new, which likewise reads its holder once and then reuses that raw
++	 * pointer across mono_array_new_checked calls.
++	 *
++	 * loader_alloc itself needs no extra treatment: mem_manager->loader_allocator_handle is a
++	 * PINNED strong handle taken by mono_mem_manager_get_loader_alloc and only released by
++	 * mono_mem_manager_start_unload, so it can neither die nor move here.
++	 *
++	 * Shared-code note: this function runs for every collectible memory manager, not just the
++	 * ones a forced native unload will reclaim, so the fix is unconditional rather than
++	 * hidden behind the opt-in — a collectible-only branch would make the correctness
++	 * argument harder to check, and this is arguably upstreamable as-is.
++	 */
++	MonoGCHandle holders_arr_pin = mono_gchandle_new_internal ((MonoObject*)holders_arr, TRUE);
++
++	/*
++	 * Test hook (inert unless MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK is set): force a collection at
++	 * each point of the construction window where only the pins above keep the already
++	 * allocated arrays alive and in place — after holders_arr, then between the holder
++	 * allocations. The third window (between a table's own internal array allocations, which
++	 * the pins also span) is hooked inside mono_weak_hash_table_new itself.
++	 */
++	mono_mem_manager_alc_unload_test_gc_hook ();
+ 
+ 	MonoArray *holders [16];
++	MonoGCHandle holder_pins [16];
+ 	MonoGCHandle holder_handles [16];
+ 	for (int i = 0; i < nhashes; ++i) {
+ 		holders [i] = mono_array_new_checked (mono_get_object_class (), 2, error);
+ 		mono_error_assert_ok (error);
++		/* Pin before the next iteration can allocate (and before the setref below). */
++		holder_pins [i] = mono_gchandle_new_internal ((MonoObject*)holders [i], TRUE);
+ 		mono_array_setref_fast (holders_arr, i, holders [i]);
+ 		holder_handles [i] = mono_gchandle_new_weakref_internal ((MonoObject*)holders [i], FALSE);
++		/* Between holder allocations (and after the last one, before the tables are built). */
++		mono_mem_manager_alc_unload_test_gc_hook ();
+ 	}
+ 
+ 	mono_mem_manager_lock (mem_manager);
+@@ -710,10 +842,24 @@ mono_mem_manager_init_reflection_hashes (MonoMemoryManager *mem_manager)
+ 		/* Set this last because of the double checked locking above */
+ 		mem_manager->weak_refobject_hash = hash;
+ 	} else {
++		/*
++		 * Lost the double-check race: these weak handles were never handed to a table, so
++		 * this site owns them (mono_weak_hash_table_destroy owns the ones that were).
++		 */
+ 		for (int i = 0; i < nhashes; ++i)
+ 			mono_gchandle_free_internal (holder_handles [i]);
+ 	}
+ 	mono_mem_manager_unlock (mem_manager);
++
++	/*
++	 * Construction window closed — no allocating call remains. Drop the pins: the arrays are
++	 * now reachable from LoaderAllocator.m_hashes (winner) or unreferenced garbage (loser).
++	 */
++	for (int i = 0; i < nhashes; ++i)
++		mono_gchandle_free_internal (holder_pins [i]);
++	mono_gchandle_free_internal (holders_arr_pin);
++
++	return TRUE;
+ }
+ 
+ void
+@@ -722,4 +868,5 @@ mono_mem_manager_start_unload (MonoMemoryManager *mem_manager)
+ 	/* Free the strong handle so the LoaderAllocator object can be freed */
+ 	MonoGCHandle loader_handle = mem_manager->loader_allocator_handle;
+ 	mono_gchandle_free_internal (loader_handle);
++	mem_manager->loader_allocator_handle = NULL;
+ }
+diff --git a/src/mono/mono/metadata/reflection-cache.h b/src/mono/mono/metadata/reflection-cache.h
+index de92ac2dd..af68552b6 100644
+--- a/src/mono/mono/metadata/reflection-cache.h
++++ b/src/mono/mono/metadata/reflection-cache.h
+@@ -85,7 +85,15 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 	pe.item = item;
+ 	pe.refclass = klass;
+ 
+-	mono_mem_manager_init_reflection_hashes (mem_manager);
++	if (!mono_mem_manager_init_reflection_hashes (mem_manager)) {
++		/*
++		 * Condemned collectible manager (see mono_mem_manager_init_reflection_hashes): there
++		 * is no table to cache into and one must not be materialized, so hand the caller its
++		 * own object back uncached. Identity is unobservable for a condemned manager — every
++		 * previously cached wrapper died with the LoaderAllocator.
++		 */
++		return o;
++	}
+ 
+ 	mono_mem_manager_lock (mem_manager);
+ 	if (!mem_manager->collectible) {
+@@ -102,8 +110,17 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 			MONO_HANDLE_ASSIGN (obj, o);
+ 		}
+ 	} else {
+-		obj = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (mem_manager->weak_refobject_hash, &pe));
+-		if (MONO_HANDLE_IS_NULL (obj)) {
++		gpointer cached = NULL;
++		MonoWeakHashLookupResult lookup = mono_weak_hash_table_lookup_full (mem_manager->weak_refobject_hash, &pe, &cached);
++		obj = MONO_HANDLE_NEW (MonoObject, (MonoObject *)cached);
++		if (lookup == MONO_WEAK_HASH_LOOKUP_DEAD) {
++			/*
++			 * The table died between the caller's lookup and this insert (the construction
++			 * allocates, and an allocation-triggered collection can kill the holder). Do not
++			 * allocate a ReflectedEntry the no-op insert would leak; return the object uncached.
++			 */
++			MONO_HANDLE_ASSIGN (obj, o);
++		} else if (MONO_HANDLE_IS_NULL (obj)) {
+ 			ReflectedEntry *e = alloc_reflected_entry (mem_manager);
+ 			e->item = item;
+ 			e->refclass = klass;
+@@ -122,8 +139,17 @@ cache_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ #define CACHE_OBJECT(t,mem_manager,flags,p,o,k) ((t) (cache_object ((mem_manager), (flags), (k), (p), (o))))
+ #define CACHE_OBJECT_HANDLE(t,mem_manager,flags,p,o,k) (MONO_HANDLE_CAST (t, cache_object_handle ((mem_manager), (flags), (k), (p), (o))))
+ 
++/*
++ * Looks ITEM up in MEM_MANAGER's reflection cache. *CACHE_DEAD (required) reports the terminal
++ * DEAD state of a condemned collectible manager — its LoaderAllocator witness died, so its weak
++ * tables (or the manager's ability to ever build them) died with it. DEAD is deliberately
++ * distinct from an ordinary miss: on a miss the caller constructs and caches, but a condemned
++ * manager's wrappers must NOT be constructed — the assembly/type constructors require the dead
++ * LoaderAllocator (they g_assert on it) and re-materializing any of the bookkeeping would
++ * resurrect a manager whose teardown is already pending. See DEAD-TABLE SEMANTICS in weak-hash.c.
++ */
+ static inline MonoObjectHandle
+-check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item)
++check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gboolean *cache_dead)
+ {
+ 	MonoObjectHandle obj_handle;
+ 	gpointer orig_e, orig_value;
+@@ -131,19 +157,20 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 	e.item = item;
+ 	e.refclass = klass;
+ 
+-	// FIXME: May need a memory manager for item+klass ?
++	*cache_dead = FALSE;
+ 
+-	mono_mem_manager_init_reflection_hashes (mem_manager);
++	// FIXME: May need a memory manager for item+klass ?
+ 
+-	mono_mem_manager_lock (mem_manager);
+-	if (!mem_manager->collectible) {
+-		MonoConcGHashTable *hash = mem_manager->refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_conc_g_hash_table_lookup (hash, &e));
+-	} else {
+-		MonoWeakHashTable *hash = mem_manager->weak_refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (hash, &e));
++	if (!mono_mem_manager_init_reflection_hashes (mem_manager)) {
++		/*
++		 * Condemned manager whose reflection hashes were never built: the same terminal state
++		 * as a dead table, just without a table to look into.
++		 */
++		*cache_dead = TRUE;
++		return MONO_HANDLE_NEW (MonoObject, NULL);
+ 	}
+ 
++	mono_mem_manager_lock (mem_manager);
+ 	if (!mem_manager->collectible) {
+ 		MonoConcGHashTable *hash = mem_manager->refobject_hash;
+ 		if (mono_conc_g_hash_table_lookup_extended (hash, &e, &orig_e, &orig_value))
+@@ -159,7 +186,10 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 		}
+ 	} else {
+ 		MonoWeakHashTable *hash = mem_manager->weak_refobject_hash;
+-		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)mono_weak_hash_table_lookup (hash, &e));
++		gpointer cached = NULL;
++		if (mono_weak_hash_table_lookup_full (hash, &e, &cached) == MONO_WEAK_HASH_LOOKUP_DEAD)
++			*cache_dead = TRUE;
++		obj_handle = MONO_HANDLE_NEW (MonoObject, (MonoObject *)cached);
+ 	}
+ 	mono_mem_manager_unlock (mem_manager);
+ 
+@@ -168,13 +198,29 @@ check_object_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass
+ 
+ typedef MonoObjectHandle (*ReflectionCacheConstructFunc_handle) (MonoClass*, gpointer, gpointer, MonoError *);
+ 
++/*
++ * CACHE_DEAD semantics: a NULL result is TERMINAL when the manager is condemned (see
++ * check_object_handle) — the constructor is NOT invoked, nothing is cached, nothing can be
++ * resurrected. Callers that can meaningfully handle the condemned state (skip the item) pass a
++ * non-NULL CACHE_DEAD and receive it with error left OK; for everyone else (CACHE_DEAD == NULL)
++ * the condemned state becomes a clean InvalidOperationException-shaped MonoError, never an
++ * abort.
++ */
+ static inline MonoObjectHandle
+-check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gpointer user_data, MonoError *error, ReflectionCacheConstructFunc_handle construct)
++check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass *klass, gpointer item, gpointer user_data, gboolean *cache_dead, MonoError *error, ReflectionCacheConstructFunc_handle construct)
+ {
+ 	error_init (error);
+-	MonoObjectHandle obj = check_object_handle (mem_manager, flags, klass, item);
++	gboolean dead = FALSE;
++	MonoObjectHandle obj = check_object_handle (mem_manager, flags, klass, item, &dead);
++	if (cache_dead)
++		*cache_dead = dead;
+ 	if (!MONO_HANDLE_IS_NULL (obj))
+ 		return obj;
++	if (dead) {
++		if (!cache_dead)
++			mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++		return NULL_HANDLE;
++	}
+ 	MONO_HANDLE_ASSIGN (obj, construct (klass, item, user_data, error));
+ 	return_val_if_nok (error, NULL_HANDLE);
+ 	if (MONO_HANDLE_IS_NULL (obj))
+@@ -185,6 +231,12 @@ check_or_construct_handle (MonoMemoryManager *mem_manager, int flags, MonoClass
+ 
+ #define CHECK_OR_CONSTRUCT_HANDLE(type,mem_manager,flags,item,klass,construct,user_data) \
+ 	(MONO_HANDLE_CAST (type, check_or_construct_handle ( \
+-		(mem_manager), (flags), (klass), (item), (user_data), error, (ReflectionCacheConstructFunc_handle) (construct))))
++		(mem_manager), (flags), (klass), (item), (user_data), NULL, error, (ReflectionCacheConstructFunc_handle) (construct))))
++
++/* Same as CHECK_OR_CONSTRUCT_HANDLE, but surfaces the terminal condemned-manager state to the
++ * caller through CACHE_DEAD instead of turning it into a MonoError. */
++#define CHECK_OR_CONSTRUCT_HANDLE_DEAD(type,mem_manager,flags,item,klass,construct,user_data,cache_dead) \
++	(MONO_HANDLE_CAST (type, check_or_construct_handle ( \
++		(mem_manager), (flags), (klass), (item), (user_data), (cache_dead), error, (ReflectionCacheConstructFunc_handle) (construct))))
+ 
+ #endif /*__MONO_METADATA_REFLECTION_CACHE_H__*/
+diff --git a/src/mono/mono/metadata/reflection-internals.h b/src/mono/mono/metadata/reflection-internals.h
+index 160850ae2..06b098e1f 100644
+--- a/src/mono/mono/metadata/reflection-internals.h
++++ b/src/mono/mono/metadata/reflection-internals.h
+@@ -92,6 +92,20 @@ mono_find_dynamic_image_owner (void *ptr);
+ MONO_COMPONENT_API MonoReflectionAssemblyHandle
+ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error);
+ 
++/*
++ * Like mono_assembly_get_object_handle, but instead of failing with an error when the
++ * assembly's collectible memory manager is CONDEMNED (its LoaderAllocator witness died — the
++ * managed unload ran to the point where every managed reference is gone — but the manager has
++ * not been torn down yet), reports that terminal state through *condemned and returns a NULL
++ * handle with error left OK. A condemned manager's reflection wrapper CANNOT be constructed:
++ * the constructor requires the dead LoaderAllocator (see assembly_object_construct), and
++ * re-creating one would resurrect a condemned manager. Callers that can meaningfully skip such
++ * assemblies (the global enumeration in InternalGetLoadedAssemblies) use this; everyone else
++ * keeps the plain function, which converts the condemned state into a clean MonoError.
++ */
++MonoReflectionAssemblyHandle
++mono_assembly_get_object_handle_or_condemned (MonoAssembly *assembly, gboolean *condemned, MonoError *error);
++
+ MONO_COMPONENT_API MonoReflectionType*
+ mono_type_get_object_checked (MonoType *type, MonoError *error);
+ 
+diff --git a/src/mono/mono/metadata/reflection.c b/src/mono/mono/metadata/reflection.c
+index ea3d4bb28..fd6b534b9 100644
+--- a/src/mono/mono/metadata/reflection.c
++++ b/src/mono/mono/metadata/reflection.c
+@@ -238,6 +238,13 @@ assembly_object_construct (MonoClass *unused_klass, MonoAssembly *assembly, gpoi
+  * @assembly: an assembly
+  *
+  * Return an System.Reflection.Assembly object representing the MonoAssembly @assembly.
++ *
++ * When the assembly's collectible memory manager is condemned (see
++ * mono_assembly_get_object_handle_or_condemned below), no wrapper can exist any more:
++ * assembly_object_construct requires the dead LoaderAllocator (the g_assert above stays — for
++ * a live manager a NULL target is a bug) and caching would resurrect condemned bookkeeping.
++ * The reflection-cache layer turns that terminal state into a clean MonoError here instead of
++ * invoking the constructor, so callers get an ordinary failure, never an abort.
+  */
+ MonoReflectionAssemblyHandle
+ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error)
+@@ -246,6 +253,21 @@ mono_assembly_get_object_handle (MonoAssembly *assembly, MonoError *error)
+ 	return CHECK_OR_CONSTRUCT_HANDLE (MonoReflectionAssembly, m_image_get_mem_manager (assembly->image), MONO_REFL_CACHE_NO_HOT_RELOAD_INVALIDATE, assembly, NULL, assembly_object_construct, NULL);
+ }
+ 
++/*
++ * mono_assembly_get_object_handle_or_condemned:
++ *
++ * Same as mono_assembly_get_object_handle, but reports the condemned-manager terminal state
++ * through *CONDEMNED (returning a NULL handle with error left OK) instead of raising an error,
++ * so enumeration-style callers can skip such assemblies. See reflection-internals.h.
++ */
++MonoReflectionAssemblyHandle
++mono_assembly_get_object_handle_or_condemned (MonoAssembly *assembly, gboolean *condemned, MonoError *error)
++{
++	error_init (error);
++	g_assert (condemned);
++	return CHECK_OR_CONSTRUCT_HANDLE_DEAD (MonoReflectionAssembly, m_image_get_mem_manager (assembly->image), MONO_REFL_CACHE_NO_HOT_RELOAD_INVALIDATE, assembly, NULL, assembly_object_construct, NULL, condemned);
++}
++
+ /**
+  * mono_module_get_object:
+  */
+@@ -530,13 +552,31 @@ mono_type_get_object_checked (MonoType *type, MonoError *error)
+ 			return (MonoReflectionType *)vtable->type;
+ 	}
+ 
+-	mono_mem_manager_init_reflection_hashes (memory_manager);
++	if (!mono_mem_manager_init_reflection_hashes (memory_manager)) {
++		/*
++		 * Condemned collectible manager (LoaderAllocator witness dead, reflection hashes never
++		 * built): the wrapper cannot be constructed — the alloc helper below requires the dead
++		 * LoaderAllocator — and nothing may be resurrected. Same terminal contract as the
++		 * reflection-cache layer (see check_or_construct_handle): a clean error, never an abort.
++		 */
++		mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++		return NULL;
++	}
+ 	mono_loader_lock (); /*FIXME mono_class_init_internal and mono_class_vtable acquire it*/
+ 	mono_mem_manager_lock (memory_manager);
+-	if (memory_manager->collectible)
+-		res = (MonoReflectionType *)mono_weak_hash_table_lookup (memory_manager->weak_type_hash, type);
+-	else
++	if (memory_manager->collectible) {
++		gpointer cached_value = NULL;
++		if (mono_weak_hash_table_lookup_full (memory_manager->weak_type_hash, type, &cached_value) == MONO_WEAK_HASH_LOOKUP_DEAD) {
++			/* Dead weak table: the same condemned-manager terminal state, one step later. */
++			mono_mem_manager_unlock (memory_manager);
++			mono_error_set_invalid_operation (error, "Cannot create a reflection object for a member of a collectible AssemblyLoadContext whose managed unload has already completed.");
++			res = NULL;
++			goto leave;
++		}
++		res = (MonoReflectionType *)cached_value;
++	} else {
+ 		res = (MonoReflectionType *)mono_g_hash_table_lookup (memory_manager->type_hash, type);
++	}
+ 	mono_mem_manager_unlock (memory_manager);
+ 	if (res)
+ 		goto leave;
+diff --git a/src/mono/mono/metadata/weak-hash.c b/src/mono/mono/metadata/weak-hash.c
+index 9aed30b1b..522b4319a 100644
+--- a/src/mono/mono/metadata/weak-hash.c
++++ b/src/mono/mono/metadata/weak-hash.c
+@@ -32,6 +32,31 @@ struct _MonoWeakHashTable {
+ 	MonoGCHandle key_value_handle;
+ };
+ 
++/*
++ * Diagnostics ledger for the key_value_handle ownership rule (see
++ * mono_weak_hash_table_destroy). "taken" counts handles handed over to a table by
++ * mono_weak_hash_table_new; "freed" counts the frees performed by the destroy path. Two
++ * independent sites, so the pair proves the ownership invariant rather than restating it:
++ * freed must never exceed taken (no double free), and (taken - freed) must plateau across
++ * repeated load/reflect/unload cycles instead of growing by three per cycle (no leak).
++ * Exposed to the lifecycle tests via the AssemblyLoadContext scout/handle stats icall.
++ */
++static volatile gint32 weak_hash_key_value_handles_taken;
++static volatile gint32 weak_hash_key_value_handles_freed;
++
++gint32
++mono_weak_hash_table_key_value_handle_stats (int kind)
++{
++	switch (kind) {
++	case 0:
++		return weak_hash_key_value_handles_taken;
++	case 1:
++		return weak_hash_key_value_handles_freed;
++	default:
++		return -1;
++	}
++}
++
+ #define HASH_TABLE_MAX_LOAD_FACTOR 0.7f
+ /* We didn't really do compaction before, keep it lenient for now */
+ #define HASH_TABLE_MIN_LOAD_FACTOR 0.05f
+@@ -148,7 +173,9 @@ mono_weak_hash_table_new (GHashFunc hash_func, GEqualFunc key_equal_func, MonoGH
+ 	hash->key_equal_func = key_equal_func;
+ 	hash->table_size = g_spaced_primes_closest (1);
+ 	hash->gc_type = type;
++	/* The table takes OWNERSHIP of key_value_handle; see mono_weak_hash_table_destroy. */
+ 	hash->key_value_handle = key_value_handle;
++	UnlockedIncrement (&weak_hash_key_value_handles_taken);
+ 
+ 	g_assert (type <= MONO_HASH_KEY_VALUE_GC);
+ 
+@@ -310,6 +337,24 @@ mono_weak_hash_table_destroy (MonoWeakHashTable *hash)
+ {
+ 	g_assert (hash);
+ 
++	/*
++	 * OWNERSHIP RULE for key_value_handle: mono_weak_hash_table_new takes ownership of the
++	 * handle it is given, and the table frees it here — exactly once, on the single
++	 * destruction path. Before this, nobody freed it at all: the only creator,
++	 * mono_mem_manager_init_reflection_hashes, hands a DISTINCT weak handle to each of the
++	 * three tables it builds (weak_type_hash, weak_type_init_exception_hash,
++	 * weak_refobject_hash) and frees handles itself ONLY on the lost-double-check path where
++	 * no table was ever constructed, so once a handle reaches a table this is the sole owner.
++	 * memory_manager_delete_objects -> free_weak_hash is the only destroyer. Result before
++	 * this fix: three weak GCHandle slots leaked per reflection-using memory manager per
++	 * load/unload cycle — unbounded growth in exactly the bounded-memory scenario the forced
++	 * native unload exists for. No handle is shared between tables and no other site frees a
++	 * handed-over handle, so this is neither a double free nor a leak.
++	 */
++	mono_gchandle_free_internal (hash->key_value_handle);
++	hash->key_value_handle = NULL;
++	UnlockedIncrement (&weak_hash_key_value_handles_freed);
++
+ 	if (!(hash->gc_type & MONO_HASH_KEY_GC))
+ 		g_free (hash->keys);
+ 	if (!(hash->gc_type & MONO_HASH_VALUE_GC))
+diff --git a/src/mono/mono/metadata/weak-hash.h b/src/mono/mono/metadata/weak-hash.h
+index ba5fdcc2b..a3d9d3c4a 100644
+--- a/src/mono/mono/metadata/weak-hash.h
++++ b/src/mono/mono/metadata/weak-hash.h
+@@ -20,4 +20,11 @@ void     mono_weak_hash_table_destroy         (MonoWeakHashTable *hash);
+ void     mono_weak_hash_table_replace         (MonoWeakHashTable *h, gpointer k, gpointer v);
+ void     mono_weak_hash_table_insert          (MonoWeakHashTable *h, gpointer k, gpointer v);
+ 
++/*
++ * Diagnostics only: kind 0 = key_value_handle handles taken over by mono_weak_hash_table_new,
++ * kind 1 = handles freed by mono_weak_hash_table_destroy (the owner). See the ownership rule
++ * comment in mono_weak_hash_table_destroy.
++ */
++gint32   mono_weak_hash_table_key_value_handle_stats (int kind);
++
+ #endif /* __MONO_WEAK_HASH_H__ */
+diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
+index b4f917526..a47d81246 100644
+--- a/src/mono/mono/mini/interp/interp.c
++++ b/src/mono/mono/mini/interp/interp.c
+@@ -3725,6 +3725,42 @@ interp_free_method (MonoMethod *method)
+ 	}
+ }
+ 
++#if HOST_BROWSER
++static void
++free_imethod_jiterp_cb (gpointer value, gpointer user_data)
++{
++	InterpMethod *imethod = (InterpMethod*)value;
++	if (imethod && imethod->method)
++		mono_jiterp_free_method_data (imethod->method, imethod);
++}
++#endif
++
++/*
++ * Sweep the per-method jiterpreter TRACE-INFO METADATA (JS-side trace-info /
++ * trace-cache and thread-local JIT-queue entries) for every method in a memory
++ * manager that is about to be freed. free_jit_mem_manager only runs the
++ * per-method cleanup for dynamic methods via interp_free_method, so regular
++ * methods in an unloaded ALC would otherwise leak that metadata. Must run
++ * before interp_code_hash is destroyed.
++ *
++ * Scope: this does NOT reclaim WASM function-table slots. Compiled jiterpreter
++ * trace functions stay installed in the indirect function table, and the table
++ * allocator (mono_jiterp_allocate_table_entry) only ever advances next_index —
++ * slots are never released or reused — so repeated ALC load/unload cycles
++ * consume bounded table capacity. On exhaustion new traces simply stop being
++ * installed (allocate returns 0, logging "Jiterpreter table %d is out of
++ * space") and execution of those paths stays in the interpreter; installed
++ * traces keep working. Table-slot ownership/reuse is a tracked follow-up:
++ * https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
++ */
++void
++mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
++{
++#if HOST_BROWSER
++	mono_internal_hash_table_apply (&jit_mm->interp_code_hash, free_imethod_jiterp_cb, NULL);
++#endif
++}
++
+ #if COUNT_OPS
+ static long opcode_counts[MINT_LASTOP];
+ 
+diff --git a/src/mono/mono/mini/interp/interp.h b/src/mono/mono/mini/interp/interp.h
+index a09111c49..88895bb21 100644
+--- a/src/mono/mono/mini/interp/interp.h
++++ b/src/mono/mono/mini/interp/interp.h
+@@ -57,6 +57,9 @@ typedef struct _InterpMethodArguments InterpMethodArguments;
+  */
+ MONO_API void mono_ee_interp_init (const char *);
+ 
++void
++mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm);
++
+ #ifdef TARGET_WASM
+ 
+ gpointer
+diff --git a/src/mono/mono/mini/mini-runtime.c b/src/mono/mono/mini/mini-runtime.c
+index 7cf63847f..760ca0bf9 100644
+--- a/src/mono/mono/mini/mini-runtime.c
++++ b/src/mono/mono/mini/mini-runtime.c
+@@ -4458,6 +4458,11 @@ free_jit_mem_manager (MonoMemoryManager *mem_manager)
+ 		g_hash_table_foreach (info->llvm_jit_callees, free_jit_callee_list, NULL);
+ 		g_hash_table_destroy (info->llvm_jit_callees);
+ 	}
++	/* Sweep per-method jiterpreter data before the interp code hash is torn down.
++	 * Browser-only: the sweep symbol is not linked into the AOT cross compiler. */
++#if HOST_BROWSER
++	mono_interp_free_mem_manager_jiterp (info);
++#endif
+ 	mono_internal_hash_table_destroy (&info->interp_code_hash);
+ #ifdef ENABLE_LLVM
+ 	mono_llvm_free_mem_manager (info);
+-- 
+2.43.0
+

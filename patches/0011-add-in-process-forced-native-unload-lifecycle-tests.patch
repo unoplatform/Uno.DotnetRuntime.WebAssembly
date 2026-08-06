@@ -1,0 +1,1600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Fri, 31 Jul 2026 00:00:00 +0000
+Subject: [PATCH] test: in-process lifecycle tests for host-triggered native
+ ALC unload
+
+Adds ForcedNativeUnloadTests to System.Runtime.Loader.Tests, exercising the
+opt-in native unload protocol in-process (no RemoteExecutor, so they run on
+browser-wasm where the upstream collectible tests self-skip). The bridge is
+outcome-based (ForceNativeUnload returns Completed / NotQuiescent / Rejected),
+so the tests assert the outcomes, not just "does not crash":
+
+  * RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible:
+    repeated collectible load -> cross-ALC generic instantiation (shared
+    {default, collectible} generic memory manager) -> reflection (grows the
+    collectible weak hashes) -> managed Unload -> force. With the flag on the
+    force must eventually Complete once the exercised state is collected (the
+    NotQuiescent retries must not be consumed) and repeats are a Completed
+    no-op; the ALC objects must then die under GC. Carries the tracked-residual
+    note for jiterpreter WASM function-table slots (not reclaimed, not
+    measurable from this suite -- see
+    https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166).
+  * ForcedUnload_LeavesSiblingCollectibleContextUsable: two collectible
+    siblings share a generic instantiation; forcing one down (owner-detach of
+    the shared manager) must leave the sibling fully usable.
+  * ForceNativeUnload_WithoutManagedUnload_IsRejected: a force with no prior
+    managed Unload must return Rejected and leave the context usable AND, with
+    the flag on, a later force after a proper Unload + GC must still Complete
+    (the Rejected outcome did not consume the once-only latch).
+  * ForcedUnload_OnlyCompletesOnceQuiescent: force while a loaded Type is still
+    rooted -> NotQuiescent (the ALC is NOT freed, its WeakReference stays
+    alive); drop the root, GC in a NoInlining frame, force again -> Completed
+    and the ALC WeakReference dies.
+  * ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree (whole-set
+    quiescence): a live cross-context constructed generic (boxed
+    KeyValuePair<TypeA, TypeB>, vtable in the shared {default, A, B} manager)
+    is kept rooted across the force. The shared manager's LoaderAllocator
+    witness is alive even after the primary witness clears, so the force must
+    return NotQuiescent and free NOTHING (all-or-nothing); the object must
+    remain fully usable afterwards, and once unrooted the same force must
+    Complete.
+  * ForceNativeUnload_AfterCompleted_ManagedLoadApisReject (tombstone): after
+    a Completed force, an ordinary API call on the LoadFromAssemblyName ->
+    RuntimeAssembly.InternalLoad path (which has no VerifyIsAlive of its own)
+    must throw ObjectDisposedException in managed code instead of forwarding
+    the freed native pointer to an icall; the force stays an idempotent
+    Completed no-op. With the flag off, the Rejected force must NOT tombstone
+    (the context keeps servicing loads).
+  * ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected
+    ([ConditionalFact(IsThreadingSupported)], self-skips on the
+    single-threaded wasm legs): on a threads-enabled runtime the destructive
+    teardown is compiled out (DISABLE_THREADS hard gate), so the force must
+    always report Rejected and disturb nothing -- proving the feature is
+    unavailable on multithread packs until safe retirement is implemented.
+    CI runs a dedicated multithread leg (WasmEnableThreads=true, Chrome via
+    xharness test-browser) where this test is REQUIRED to execute and pass.
+  * ForcedUnload_ScoutFinalizerPopulation_Plateaus (scout churn): the scout
+    finalizer answers Destroy()==FALSE with GC.ReRegisterForFinalize, so a
+    forced teardown that freed the scout's manager without a terminal state
+    would leak one immortal finalizable scout per cycle. Asserts against the
+    new GetScoutRetirementStats diagnostics bridge that each forced cycle
+    strictly increases the terminal scout-destroy count and that the native
+    retired-set drains back to zero once finalizers run (counter-based,
+    bounded retries; each pass collects and then awaits a JS event-loop
+    turn, because the single-threaded browser runtime has no finalizer
+    thread -- LAZY_GC_THREAD_CREATION makes WaitForPendingFinalizers an
+    immediate no-op and finalizers only run as a scheduled background job
+    on the event loop); with the flag off the registry must not move, and
+    on a threads-enabled runtime the stats must consistently report
+    unavailable (-1).
+  * ReflectionHashInit_UnderGcPressure_StaysCoherent_AndHolderHandlesDoNotLeak
+    (independent audit; covers both reflection-hash findings in patch 0009):
+      - GC safety, BEST-EFFORT and labelled as such in the test's own doc
+        comment. Eight cycles, each on a FRESH collectible ALC so
+        mono_mem_manager_init_reflection_hashes re-runs from scratch (it
+        early-returns once weak_refobject_hash is set for a manager), with
+        unrooted nursery garbage shaped like the arrays it allocates injected
+        immediately before the first reflection touch and again between the
+        checks, and with a per-cycle-varying amount so the collection point
+        moves around inside the four-allocation window. It then asserts the
+        reflection cache stays COHERENT rather than merely "did not crash":
+        identity (Assert.Same) of the Type object across repeated lookups,
+        Assembly identity, the instance's GetType(), and every declared
+        member's DeclaringType, re-checked after a second pressure burst that
+        also drives the rehash path. This is stochastic coverage, NOT a
+        deterministic interleaving -- it cannot pin a collection to a chosen
+        instruction. No GC-stress CI knob is claimed: sgen's
+        collect-before-allocs is a MONO_GC_DEBUG option that collects on
+        essentially every allocation, which would make the whole test assembly
+        (runtime startup included) unusable even on a dedicated step.
+      - Handle ownership, EXACT. Reads the new key_value_handle ledger (stats
+        kinds 2/3) and asserts freed never exceeds taken (no double free), that
+        the cycles really did construct reflection hashes (taken grew by at
+        least 3 per cycle, so the test cannot pass vacuously), and that the
+        outstanding population (taken - freed) plateaus instead of growing --
+        the pre-fix behaviour was freed never moving at all and outstanding
+        growing by exactly 3 per cycle. A slack of two managers' worth absorbs
+        a straggler set while staying well under the 24-handle pre-fix leak.
+        With the flag off or on a threads-enabled runtime, every ALC is
+        natively non-collectible and only collectible managers build reflection
+        hashes, so the ledger must not move AT ALL -- asserted exactly.
+    Always-run [Fact] on both legs, so it is added to the CI sentinel's
+    required-tests list.
+
+The tests run in BOTH env modes and on BOTH runtime flavours. The protocol
+assertions key on the flag AND !PlatformDetection.IsThreadingSupported: with
+the flag unset, collectible ALCs are forced non-collectible natively, so every
+force is Rejected and nothing is reclaimed -- the tests then assert only the
+safe no-op surface -- and on a threads-enabled runtime every force is Rejected
+regardless of the flag (DISABLE_THREADS hard gate), so the multithread leg
+runs with the flag ON and the tests assert exactly that rejection surface.
+With the flag set on the single-threaded build they assert the full teardown
+protocol. On a genuinely unpatched runtime
+(no ForceNativeUnload member) they no-op, EXCEPT when CI sets
+MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1: then a missing member is treated as a
+trim/rooting regression and fails loudly instead of silently self-skipping.
+
+Round 9 (review 4857579048 + coverage amendment):
+
+  * MT drain fix: DrainRetiredScoutsAsync is now called only when the
+    forced-teardown protocol is active -- on a threads-enabled runtime
+    kinds 0/1 report -1 by design, so the unconditional per-cycle drain
+    in the reflection-hash test spun on -1 for 20 passes and then
+    asserted -1 == 0 (the deterministic test_loader_wasm_mt failure).
+    Kinds 2/3 (the handle ledger) stay read unconditionally on MT.
+  * ST frame-roots fix: the reflection workload of each pressure cycle
+    (asm/type/member enumerations/cross-ALC List over the collectible
+    type) is confined to a NoInlining helper that returns no collectible
+    root and unloads before returning, mirroring ExerciseAndUnload --
+    the interpreter records every IL local of a live frame as a
+    reference slot and scans them conservatively (including
+    compiler-generated enumerator/temporary slots), so the old
+    same-frame locals kept the primary and shared-generic
+    LoaderAllocator witnesses alive and pinned the force at
+    NotQuiescent (the deterministic ST flag-ON failure).
+  * Deterministic window coverage: with MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK
+    armed (CI wasm legs), the pressure test asserts the native hook
+    fired at least once per reflection-hash init (stats kind 4) -- a
+    real nursery collection inside the pinned-holder construction window
+    per cycle -- while the coherence assertions still held, so reverting
+    the pins fails deterministically instead of staying vacuously green.
+    On a threads-enabled runtime it asserts kind 4 stays -1 (hook
+    compiled out with the DISABLE_THREADS gate); with the flag off, that
+    an armed hook never fires (the init early-returns).
+  * Rehash-boundary coverage:
+    ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary drives
+    reflection over RehashProbeClass (new type in the test assembly:
+    12 methods + 1 constructor + 4 fields = 17 refobject-cache entries,
+    deliberately no nested types, which go to the separate type cache)
+    so ONE weak_refobject_hash receives at least 9 unique insertions --
+    the initial size-11 table rehashes before the 9th (load factor 0.7).
+    The test asserts the member arithmetic at runtime, proves the rehash
+    actually ran via the native rehash counter (stats kind 5), and
+    re-checks identity through the rehashed table. Added to the CI
+    sentinel's required-tests list.
+
+Round 10 (review follow-up):
+
+  * GlobalAssemblyEnumeration_SkipsCondemnedAssembly_WithoutAbortOrResurrection:
+    deterministic regression for the terminal dead-cache result. Builds
+    the condemned-but-not-freed window directly — collectible ALC with
+    materialized+populated reflection hashes, a rooted cross-context
+    generic holding the shared {default, A, B} manager witness, managed
+    Unload, GC until the primary witness proxies (cached assembly/type
+    wrappers) are weak-ref dead, force pinned at NotQuiescent — then
+    drives AppDomain.CurrentDomain.GetAssemblies() through
+    InternalGetLoadedAssemblies and asserts: no abort, the condemned
+    assembly is absent while the sibling's copy stays present, the
+    dead-table lookup counter (stats kind 6) moved (non-vacuous), the
+    weak proxies stayed dead (no resurrection), the force still reports
+    NotQuiescent (nothing freed), and after releasing the last witness
+    the same context still Completes with a clean enumeration. The
+    cross pair is returned directly into a local (not via a tuple) so
+    no compiler temporary keeps the shared witness alive under the
+    interpreter's conservative frame scanning. On the dark legs (flag
+    off, or threads-enabled runtime) it asserts the Rejected surface,
+    that the assembly stays enumerable, and that kind 6 does not move.
+
+  CI follow-up (ST flag-on leg): the condemned-window precondition
+  (wrapper weak-refs must die while the cross pair stays rooted) failed
+  because the wait loop only ran bare GC.Collect rounds. The setup
+  helper's call tree is deep (global enumeration, per-assembly
+  GetLoadContext, reflection materialization, CreateCrossPair) and the
+  interpreter scans its data stack conservatively, so stale slots from
+  that tree keep wrapper references alive until a comparably deep call
+  tree overwrites them — exactly what ForceUntilCompleted's
+  MethodInfo.Invoke-based forces do between collections in every
+  passing test. The drain loop now mirrors that: collect, force (which
+  must keep reporting NotQuiescent while the shared witness lives), and
+  turn the JS event loop per attempt (as DrainRetiredScoutsAsync does),
+  bounded at 20 attempts. The positive-control enumeration moved into
+  its own NoInlining helper returning only a bool
+  (EnumerationReportsContext), which also replaces the lambda-based
+  Contains/DoesNotContain probes (no display classes or enumerator
+  temporaries in witness-sensitive frames), and the test became async
+  Task for the event-loop turns.
+
+  CI follow-up 2 (ST flag-on leg, same precondition): the drain fix was
+  not enough because the root was structural — the shared witness was a
+  ROOTED INSTANCE of KeyValuePair<TypeA, TypeB>, and a live instance
+  must keep TypeA's runtime structures (and with them A's primary
+  witness set) reachable: its field-type closure spans A, which is the
+  same soundness constraint the all-or-nothing gate encodes and exactly
+  what RunRootedCrossGenericProtocol demonstrates (primary witnesses
+  are only ever observed to die AFTER the instance is unrooted). With
+  an instance rooted, the primary-dead/shared-alive window is
+  unreachable by construction. The witness is now the METADATA-level
+  one: the composed RuntimeType wrapper for the cross-context generic
+  (CreateCrossTypeWitness — MakeGenericType only, no
+  Activator.CreateInstance). Composing the type creates the shared
+  {default, A, B} manager, materializes its LoaderAllocator and
+  reflection hashes, and caches the wrapper whose ONLY keepalive edge
+  is that shared LoaderAllocator (the reflection alloc helper sets
+  m_keepalive from the composed class's own memory manager), so
+  rooting it holds the shared witness while A's primary set stays
+  collectible — the exact condemned window the enumeration regression
+  needs, and the metadata-level shape that survives the primary in the
+  CI-observed abort.
+---
+ .../tests/ForcedNativeUnloadTests.cs          | 1308 +++++++++++++++++
+ .../TestClass.cs                              |   37 +
+ .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
+ 3 files changed, 1346 insertions(+)
+ create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+new file mode 100644
+index 000000000..6eae223ba
+--- /dev/null
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -0,0 +1,1308 @@
++// Licensed to the .NET Foundation under one or more agreements.
++// The .NET Foundation licenses this file to you under the MIT license.
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using System.Threading.Tasks;
++using Xunit;
++
++namespace System.Runtime.Loader.Tests
++{
++    /// <summary>
++    /// In-process lifecycle tests for the host-triggered native unload of collectible
++    /// AssemblyLoadContexts (opt-in via MONO_WASM_ENABLE_ALC_UNLOAD). They run in BOTH env modes.
++    ///
++    /// The native bridge is OUTCOME-BASED: AssemblyLoadContext.ForceNativeUnload returns
++    /// Completed (0) / NotQuiescent (1) / Rejected (2). The gist exercised here:
++    ///   * Rejected  — the force was refused up front (feature unavailable on a threads-enabled
++    ///     runtime, no prior managed Unload, or the ALC is non-collectible, which is the case for
++    ///     EVERY ALC when the opt-in flag is off). The context stays fully usable and the
++    ///     once-only latch is NOT consumed.
++    ///   * NotQuiescent — a managed root into the collectible ALC is still alive (into its
++    ///     primary memory manager OR into any shared generic memory manager the teardown would
++    ///     also free), so the native teardown declines to free anything (all-or-nothing).
++    ///     Nothing is freed; a retry after the root is collected must still be able to complete.
++    ///   * Completed — every LoaderAllocator witness of the managers being freed has been
++    ///     collected; the ALC is freed, its runtime strong handle released (so the managed ALC
++    ///     object finally becomes collectible), and the stale native pointer is tombstoned so
++    ///     ordinary API calls reject in managed code (ObjectDisposedException).
++    ///
++    /// With the flag OFF, collectible ALCs are forced non-collectible natively, so every force is
++    /// Rejected and nothing is ever reclaimed — the tests then only assert the safe no-op surface.
++    /// With the flag ON, on the single-threaded browser build, they assert the full managed-Unload
++    /// -> quiescence -> forced-teardown protocol, idempotence, sibling usability, that the
++    /// forced-down ALC objects die, and that the scout/finalizer population plateaus. On a
++    /// threads-enabled runtime every force is Rejected regardless of the flag (DISABLE_THREADS
++    /// hard gate), so there the tests assert only that rejection surface — the MT CI leg runs
++    /// with the flag ON to prove it.
++    /// </summary>
++    [Collection(nameof(DisableParallelization))]
++    public class ForcedNativeUnloadTests
++    {
++        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
++        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
++        private const string RehashProbeClassName = "System.Runtime.Loader.Tests.RehashProbeClass";
++
++        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult and the native
++        // ves_icall_..._InternalForceNativeUnload return codes.
++        private const int Completed = 0;
++        private const int NotQuiescent = 1;
++        private const int Rejected = 2;
++
++        // Stats kinds; MUST match ves_icall_..._InternalGetScoutRetirementStats.
++        private const int RetiredSetSize = 0;
++        private const int TerminalDestroyCount = 1;
++        // MonoWeakHashTable key_value_handle ownership ledger (available on every build, unlike
++        // kinds 0/1): handles taken over by mono_weak_hash_table_new vs. handles freed by
++        // mono_weak_hash_table_destroy, their owner.
++        private const int HolderHandlesTaken = 2;
++        private const int HolderHandlesFreed = 3;
++        // Deterministic test-GC-hook fires inside the reflection-hash construction window
++        // (mono_mem_manager_alc_unload_test_gc_hook). Behind the DISABLE_THREADS gate like kinds
++        // 0/1: a threads-enabled runtime reports -1 even when the hook env var is set.
++        private const int GcHookFiredCount = 4;
++        // MonoWeakHashTable rehashes actually performed (mono_weak_hash_table_rehash_count).
++        // Unconditional shared-runtime code, like kinds 2/3.
++        private const int WeakTableRehashCount = 5;
++        // Weak-table lookups that found a DEAD table (holder collected with the condemned
++        // manager's LoaderAllocator; mono_weak_hash_table_dead_lookup_count). Unconditional
++        // shared-runtime code, like kinds 2/3/5.
++        private const int WeakTableDeadLookupCount = 6;
++
++        private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
++            .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
++
++        private static readonly MethodInfo s_getScoutRetirementStats = typeof(AssemblyLoadContext)
++            .GetMethod("GetScoutRetirementStats", BindingFlags.NonPublic | BindingFlags.Static);
++
++        private static bool FlagEnabled
++        {
++            get
++            {
++                string value = Environment.GetEnvironmentVariable("MONO_WASM_ENABLE_ALC_UNLOAD");
++                return value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
++            }
++        }
++
++        // The full teardown protocol is only active when the host opted in AND the runtime is the
++        // single-threaded browser build: on a threads-enabled runtime the destructive teardown is
++        // compiled out (DISABLE_THREADS hard gate), mono_alc_init ignores the collectible opt-in
++        // and every force reports Rejected — even with the env flag set. The MT test leg runs with
++        // the flag ON specifically to prove that rejection, so the protocol assertions must key on
++        // both signals.
++        private static bool ProtocolActive => FlagEnabled && !PlatformDetection.IsThreadingSupported;
++
++        // Set by CI (in BOTH env modes, since both run on the opt-in patched pack) to demand that
++        // the bridge member is actually present. When set, a missing member is a trim/rooting
++        // regression, not a legitimately unpatched runtime.
++        private static bool RequireBridge =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE") == "1";
++
++        // Set by the CI wasm legs: arms the native deterministic GC hook that forces a nursery
++        // collection at each point inside the reflection-hash construction window that the
++        // pinned holder handles protect (see mono_mem_manager_alc_unload_test_gc_hook). On the
++        // single-threaded build the fire counter (kind 4) must then advance per init; on a
++        // threads-enabled runtime the hook is compiled out and kind 4 stays -1 regardless.
++        private static bool GcHookRequested =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK") == "1";
++
++        // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
++        // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
++        // masking the regression.
++        private static bool BridgeMissing()
++        {
++            if (s_forceNativeUnload != null && s_getScoutRetirementStats != null)
++            {
++                return false;
++            }
++
++            Assert.False(RequireBridge,
++                "AssemblyLoadContext.ForceNativeUnload and/or GetScoutRetirementStats is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
++            return true;
++        }
++
++        private static int ScoutStats(int kind)
++        {
++            return (int)s_getScoutRetirementStats.Invoke(null, new object[] { kind });
++        }
++
++        private static int Force(AssemblyLoadContext context)
++        {
++            // ForceNativeUnload returns the internal ForceNativeUnloadResult enum; read it as its
++            // underlying int (a boxed enum is IConvertible) since the enum type is not visible here.
++            object result = s_forceNativeUnload.Invoke(context, null);
++            return Convert.ToInt32(result);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void GcQuiesce()
++        {
++            for (int i = 0; i < 3; i++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++            }
++        }
++
++        // Retry the force across GCs. Each NotQuiescent attempt must leave the latch clear so a
++        // later attempt can still Complete — i.e. the single retry is never consumed by a premature
++        // or too-early force.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttempts)
++        {
++            int outcome = NotQuiescent;
++            for (int i = 0; i < maxAttempts; i++)
++            {
++                GcQuiesce();
++                outcome = Force(context);
++                if (outcome == Completed)
++                {
++                    break;
++                }
++            }
++
++            return outcome;
++        }
++
++        // Known residual, tracked and NOT measured here: on browser-wasm the jiterpreter's
++        // compiled trace functions stay installed in the WASM indirect function table after a
++        // forced unload, and table slots are never released or reused (the allocator's next_index
++        // is monotonic), so repeated cycles consume bounded table capacity; on exhaustion new
++        // traces stop being installed and execution stays in the interpreter (performance-only
++        // degradation). The jiterpreter occupancy counters (mono_jiterp_get_counter) are
++        // EMSCRIPTEN_KEEPALIVE exports consumed by the TypeScript runtime only — there is no
++        // managed-visible counter this suite could read without inventing new API surface — so
++        // this suite records the residual instead of measuring it. Tracked:
++        // https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
++        [Fact]
++        public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            const int Cycles = 5;
++            var refs = new WeakReference[Cycles];
++            for (int i = 0; i < Cycles; i++)
++            {
++                refs[i] = LoadExerciseUnloadAndForce();
++            }
++
++            if (ProtocolActive)
++            {
++                // Every forced-down context must be reclaimable: the native teardown released the
++                // runtime's strong handle, so nothing pins the managed ALC objects any more.
++                CollectAndAssertDead(refs);
++            }
++        }
++
++        [Fact]
++        public void ForcedUnload_LeavesSiblingCollectibleContextUsable()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunSiblingProtocol();
++        }
++
++        [Fact]
++        public void ForceNativeUnload_WithoutManagedUnload_IsRejected()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            WeakReference weakRef = AssertRejectedWithoutUnloadThenComplete();
++
++            if (ProtocolActive)
++            {
++                // The earlier Rejected force did not consume the retry: after a proper Unload() and
++                // GC the force completed, so the context object is now reclaimable.
++                CollectAndAssertDead(new[] { weakRef });
++            }
++        }
++
++        [Fact]
++        public void ForcedUnload_OnlyCompletesOnceQuiescent()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            WeakReference weakRef = RunQuiescenceProtocol();
++
++            if (ProtocolActive)
++            {
++                CollectAndAssertDead(new[] { weakRef });
++            }
++        }
++
++        [Fact]
++        public void ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunRootedCrossGenericProtocol();
++        }
++
++        [Fact]
++        public void ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunTombstoneProtocol();
++        }
++
++        // On a threads-enabled runtime the destructive native teardown is compiled out entirely
++        // (DISABLE_THREADS hard gate): mono_alc_init ignores the collectible opt-in and
++        // InternalForceNativeUnload rejects before touching ANY manager state, because the
++        // cache-remove/owner-detach/free sequence races the lock-free mem-manager cache readers.
++        // Prove the feature reports unavailable there: the force never returns anything but
++        // Rejected, and nothing is disturbed. (Skipped on the single-threaded wasm leg, where the
++        // full protocol tests above run instead.)
++        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsThreadingSupported))]
++        public void ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            RunThreadsEnabledRejectionProtocol();
++        }
++
++        // Scout/finalizer churn plateau: the (disabled) LoaderAllocatorScout.Destroy icall returns
++        // FALSE unconditionally and the scout finalizer answers FALSE with GC.ReRegisterForFinalize,
++        // so without a terminal state every force-freed memory manager would leave one permanently
++        // resurrecting finalizable scout per cycle — an ever-growing set that every subsequent
++        // GC + WaitForPendingFinalizers reprocesses. The native terminal-state registry gives those
++        // scouts a terminal TRUE outcome (without dereferencing the freed manager). Prove the
++        // population plateaus: each forced cycle terminally retires at least one scout (the primary
++        // manager's LoaderAllocator is materialised eagerly, so every opted-in ALC has one) and the
++        // retired-set drains back to zero once finalizers run — deterministic counters, no timing.
++        // Async on purpose: on single-threaded wasm finalizers never run synchronously inside a
++        // test method (see DrainRetiredScoutsAsync), so the drain must yield to the JS event loop.
++        [Fact]
++        public async Task ForcedUnload_ScoutFinalizerPopulation_Plateaus()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int baselineTerminal = ScoutStats(TerminalDestroyCount);
++            if (baselineTerminal < 0)
++            {
++                // Threads-enabled runtime: the forced teardown — and with it the registry — is
++                // compiled out (DISABLE_THREADS hard gate). The stats must consistently report
++                // unavailable (-1) and stay that way across forced cycles.
++                Assert.Equal(-1, ScoutStats(RetiredSetSize));
++                RunRejectedCycles(3);
++                Assert.Equal(-1, ScoutStats(RetiredSetSize));
++                Assert.Equal(-1, ScoutStats(TerminalDestroyCount));
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                // Flag off on the single-threaded build: every force is Rejected, nothing is ever
++                // retired, so the registry must not move at all.
++                int baselineRetired = ScoutStats(RetiredSetSize);
++                RunRejectedCycles(3);
++                Assert.Equal(baselineRetired, ScoutStats(RetiredSetSize));
++                Assert.Equal(baselineTerminal, ScoutStats(TerminalDestroyCount));
++                return;
++            }
++
++            const int Cycles = 4;
++            int previousTerminal = baselineTerminal;
++            for (int i = 0; i < Cycles; i++)
++            {
++                LoadExerciseUnloadAndForce();
++                await DrainRetiredScoutsAsync();
++
++                int terminalNow = ScoutStats(TerminalDestroyCount);
++                Assert.True(terminalNow > previousTerminal,
++                    $"Cycle {i}: expected the terminal scout-destroy count to strictly increase (was {previousTerminal}, now {terminalNow}) — a forced cycle must terminally retire its scout(s) instead of leaving them resurrecting forever.");
++                previousTerminal = terminalNow;
++            }
++
++            // Plateau: every entry the forced teardowns published has been consumed by a scout
++            // finalizer (no unconsumed residue), and at least one scout terminally died per cycle.
++            Assert.Equal(0, ScoutStats(RetiredSetSize));
++            Assert.True(previousTerminal - baselineTerminal >= Cycles,
++                $"Expected at least {Cycles} terminal scout destructions (one per forced cycle), got {previousTerminal - baselineTerminal}.");
++        }
++
++        /// <summary>
++        /// Reflection-hash initialization under GC pressure, plus the key_value_handle ownership
++        /// ledger.
++        ///
++        /// GC safety (what this does and does NOT prove): the pinned-handle fix in
++        /// mono_mem_manager_init_reflection_hashes protects a window of four consecutive
++        /// mono_array_new_checked calls during which the only other references to the arrays are
++        /// weak. This test drives that window many times over FRESH collectible ALCs with nursery
++        /// pressure applied immediately before and between the touches, and asserts the
++        /// reflection-cache stays coherent (identity of Type objects and of every declared
++        /// member's DeclaringType) rather than merely "did not crash". The managed churn alone is
++        /// BEST-EFFORT (a few tens of KiB against a 4 MiB nursery cannot force a collection into
++        /// a chosen window), which is why the CI legs additionally arm
++        /// MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK: a narrowly gated native hook that performs a REAL
++        /// nursery collection at each point inside the construction window the pinned holder
++        /// handles protect (after the holders_arr allocation, between the holder allocations, and
++        /// between each table's internal array allocations) and counts the fires (kind 4). With
++        /// the hook armed this test asserts the collections actually happened inside the window,
++        /// so reverting the pins deterministically fails the coherence assertions instead of
++        /// staying green whenever no collection happened to land there. sgen's
++        /// collect-before-allocs remains unusable here (it collects on essentially every
++        /// allocation, killing runtime startup), hence the dedicated hook.
++        ///
++        /// Handle ownership (what this DOES measure exactly): mono_weak_hash_table_new hands the
++        /// key_value_handle to the table and mono_weak_hash_table_destroy is now its sole owner.
++        /// The two counters are incremented at those two independent sites, so this asserts (a)
++        /// freed never exceeds taken — no double free, and (b) the outstanding population
++        /// (taken - freed) plateaus across cycles while taken grows by at least three per cycle.
++        /// Before the fix, freed never moved at all and outstanding grew by three per cycle. It
++        /// measures the runtime's own ownership ledger, NOT sgen handle-table occupancy: no cheap
++        /// occupancy counter is reachable at this pin (stat_gc_handles_allocated is
++        /// HEAVY_STATISTICS-only and sgen_gchandle_stats_report writes to a debug file behind
++        /// DISABLE_SGEN_DEBUG_HELPERS), and inventing a new sgen -> gc-internals -> icall counter
++        /// across all GC backends was judged out of proportion to the finding.
++        /// </summary>
++        [Fact]
++        public async Task ReflectionHashInit_UnderGcPressure_StaysCoherent_AndHolderHandlesDoNotLeak()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int takenBefore = ScoutStats(HolderHandlesTaken);
++            int freedBefore = ScoutStats(HolderHandlesFreed);
++            int hookBefore = ScoutStats(GcHookFiredCount);
++
++            // Kinds 2/3 are NOT behind the DISABLE_THREADS gate (the ownership fix they observe is
++            // unconditional shared-runtime code), so they must be readable on every leg.
++            Assert.True(takenBefore >= 0,
++                $"The key_value_handle ownership ledger must be available on every build; kind {HolderHandlesTaken} returned {takenBefore}.");
++            Assert.True(freedBefore >= 0,
++                $"The key_value_handle ownership ledger must be available on every build; kind {HolderHandlesFreed} returned {freedBefore}.");
++            Assert.True(freedBefore <= takenBefore,
++                $"More key_value_handles freed ({freedBefore}) than taken ({takenBefore}) before the test even ran — that is a double free.");
++
++            const int Cycles = 8;
++            for (int i = 0; i < Cycles; i++)
++            {
++                ReflectionHashInitUnderPressureCycle(i);
++                GcQuiesce();
++
++                if (ProtocolActive)
++                {
++                    // Only drain when the retired-scout registry is actually active: on a
++                    // threads-enabled runtime kinds 0/1 report -1 by design (the registry is
++                    // compiled out with the DISABLE_THREADS hard gate), so draining would spin on
++                    // -1 and then assert -1 == 0. Kinds 2/3 (the handle ledger) stay read
++                    // unconditionally below — the ownership fix they observe is shared code.
++                    await DrainRetiredScoutsAsync();
++                }
++            }
++
++            GcQuiesce();
++
++            int takenAfter = ScoutStats(HolderHandlesTaken);
++            int freedAfter = ScoutStats(HolderHandlesFreed);
++
++            Assert.True(freedAfter <= takenAfter,
++                $"More key_value_handles freed ({freedAfter}) than taken ({takenAfter}): mono_weak_hash_table_destroy must free each handed-over handle exactly once.");
++
++            int hookAfter = ScoutStats(GcHookFiredCount);
++            if (PlatformDetection.IsThreadingSupported)
++            {
++                // The hook is compiled out with the rest of the forced-teardown machinery
++                // (DISABLE_THREADS hard gate): even with MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK set,
++                // the counter must consistently report unavailable.
++                Assert.Equal(-1, hookAfter);
++            }
++            else if (GcHookRequested)
++            {
++                if (ProtocolActive)
++                {
++                    // Deterministic (non-vacuous) window coverage: each cycle ran
++                    // mono_mem_manager_init_reflection_hashes for a FRESH collectible ALC with the
++                    // hook armed, so a REAL nursery collection fired inside the pinned-holder
++                    // construction window at least once per init (currently seven sites per init:
++                    // holders_arr, three holders, three table-internal windows). The coherence
++                    // assertions above therefore ran against actually-collected nursery state —
++                    // reverting the holder pins makes these cycles fail instead of staying green.
++                    Assert.True(hookAfter - hookBefore >= Cycles,
++                        $"Expected the armed test GC hook to fire at least once per reflection-hash init ({Cycles} inits), but it fired {hookAfter - hookBefore} times ({hookBefore} -> {hookAfter}) — the deterministic in-window collection coverage did not actually run.");
++                }
++                else
++                {
++                    // Flag off on the single-threaded build: no ALC is collectible, the
++                    // reflection-hash init early-returns before the window, so the armed hook
++                    // must never fire.
++                    Assert.Equal(hookBefore, hookAfter);
++                }
++            }
++
++            if (!ProtocolActive)
++            {
++                // Flag off, or threads-enabled runtime: every ALC is natively non-collectible, and
++                // mono_mem_manager_init_reflection_hashes early-returns for non-collectible
++                // managers, so no reflection-hash table is ever built and the ledger must not move.
++                Assert.Equal(takenBefore, takenAfter);
++                Assert.Equal(freedBefore, freedAfter);
++                return;
++            }
++
++            int taken = takenAfter - takenBefore;
++            Assert.True(taken >= 3 * Cycles,
++                $"Expected at least {3 * Cycles} key_value_handles to be taken over ({Cycles} cycles x 3 reflection-hash tables per collectible memory manager), got {taken} — the cycles did not actually initialize reflection hashes, so this test would prove nothing.");
++
++            // Plateau, not growth. Slack of two managers' worth (6) absorbs a straggler set whose
++            // manager has not been freed yet; the pre-fix leak was 3 per cycle (24 here), so this
++            // stays well below it while remaining discriminating.
++            const int Slack = 6;
++            int outstandingBefore = takenBefore - freedBefore;
++            int outstandingAfter = takenAfter - freedAfter;
++            Assert.True(outstandingAfter - outstandingBefore <= Slack,
++                $"Outstanding reflection-hash holder handles grew from {outstandingBefore} to {outstandingAfter} across {Cycles} forced cycles that took over {taken} handles. mono_weak_hash_table_destroy must free key_value_handle, otherwise three handle-table slots leak per reflection-using memory manager per cycle.");
++        }
++
++        /// <summary>
++        /// Deterministic rehash-boundary coverage for the no-safepoints weak-table rehash fix
++        /// (patch 0010, previously a g_assert_not_reached that aborted the runtime).
++        ///
++        /// The arithmetic: a MonoWeakHashTable starts at size 11 (g_spaced_primes_closest(1)) and
++        /// mono_weak_hash_table_insert_replace rehashes when the pre-insert in_use exceeds
++        /// 11 * 0.7 = 7.7 — i.e. before the 9th unique insertion into ONE table. Reflecting over
++        /// every declared member of RehashProbeClass inserts 17 entries (12 methods + 1
++        /// constructor + 4 fields; deliberately no nested types, which go to the separate
++        /// type cache) into the collectible manager's single weak_refobject_hash, so the
++        /// boundary is necessarily crossed. The native rehash counter (stats kind 5) proves the
++        /// rehash actually ran at runtime instead of leaving the claim to construction, and the
++        /// identity re-checks prove the rehashed table still resolves every entry.
++        /// </summary>
++        [Fact]
++        public void ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int rehashBefore = ScoutStats(WeakTableRehashCount);
++            Assert.True(rehashBefore >= 0,
++                $"The weak-table rehash counter must be available on every build; kind {WeakTableRehashCount} returned {rehashBefore}.");
++
++            RunRefobjectRehashCycle();
++            GcQuiesce();
++
++            int rehashAfter = ScoutStats(WeakTableRehashCount);
++            if (ProtocolActive)
++            {
++                Assert.True(rehashAfter > rehashBefore,
++                    $"Reflecting over all declared members of {RehashProbeClassName} must cross the initial weak_refobject_hash load-factor boundary (size 11, rehash before the 9th unique insertion) and perform a real rehash, but the native rehash counter did not move ({rehashBefore} -> {rehashAfter}) — the rehash regression coverage is vacuous.");
++            }
++            else
++            {
++                // Flag off, or threads-enabled runtime: no ALC is collectible, so no weak table
++                // is ever built and the counter must not move.
++                Assert.Equal(rehashBefore, rehashAfter);
++            }
++        }
++
++        /// <summary>
++        /// Terminal dead-cache regression for the global assembly enumeration (round 10).
++        ///
++        /// The state under test is condemned-but-not-freed: a collectible ALC whose managed
++        /// Unload has completed to the point where its primary LoaderAllocator witness (and with
++        /// it the object[2] holders of its reflection weak tables) has been collected, while a
++        /// SHARED generic memory manager witness — kept alive by a rooted cross-context
++        /// constructed-generic TYPE wrapper — holds the forced native teardown at NotQuiescent.
++        /// The witness is deliberately the composed RuntimeType object, NOT an instance: a live
++        /// INSTANCE of KeyValuePair&lt;TypeA, TypeB&gt; must keep TypeA's runtime structures — and
++        /// with them A's primary witness set — reachable (its field-type closure spans A; the
++        /// all-or-nothing gate exists precisely because freeing an owner under a live instance
++        /// would be unsound, see RunRootedCrossGenericProtocol), so with an instance rooted the
++        /// primary witness can never die and this window is unreachable. The composed TYPE
++        /// wrapper's only keepalive edge is its OWN manager's LoaderAllocator (the shared
++        /// {default, A, B} one — see the reflection alloc helper: m_keepalive is set from
++        /// m_class_get_mem_manager of the composed class), so it holds the shared witness alone
++        /// and the primary set can be collected. The ALC's assemblies are still on the runtime's
++        /// loaded list in that window, so the global enumeration
++        /// (AppDomain.CurrentDomain.GetAssemblies -> AssemblyLoadContext.GetLoadedAssemblies ->
++        /// InternalGetLoadedAssemblies) reaches them. Before the fix, the dead weak table
++        /// degraded the cache lookup to a miss, check_or_construct_handle invoked
++        /// assembly_object_construct, and the runtime aborted on g_assert(loader_alloc).
++        ///
++        /// With the fix the dead table is a DISTINCT terminal result: the constructor is never
++        /// invoked, the condemned assembly is filtered out of the returned array, and nothing is
++        /// resurrected — the LoaderAllocator is not re-created and the wrapper weak refs stay
++        /// dead. Kind 6 (dead-table lookups) proves the enumeration really took the dead-cache
++        /// path rather than passing vacuously (e.g. because the assembly was already off the
++        /// loaded list).
++        /// </summary>
++        [Fact]
++        public async Task GlobalAssemblyEnumeration_SkipsCondemnedAssembly_WithoutAbortOrResurrection()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int deadBefore = ScoutStats(WeakTableDeadLookupCount);
++            Assert.True(deadBefore >= 0,
++                $"The dead-table lookup counter must be available on every build; kind {WeakTableDeadLookupCount} returned {deadBefore}.");
++
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            // The shared witness (the composed cross-context TYPE wrapper, see the summary) is
++            // returned DIRECTLY into a local: a tuple return would leave a compiler-generated
++            // ValueTuple temporary holding a second reference to it, which the interpreter's
++            // conservative frame scanning would keep alive past the null-out below and pin the
++            // final force at NotQuiescent forever. The weak witness proxies travel via an array
++            // the helper fills in — WeakReference objects are safe to root anywhere.
++            var witnessRefs = new WeakReference[2];
++            object sharedWitness = CondemnPrimaryKeepingSharedWitness(contextA, contextB, witnessRefs);
++            WeakReference weakAssembly = witnessRefs[0];
++            WeakReference weakType = witnessRefs[1];
++
++            if (!ProtocolActive)
++            {
++                // Dark surface (flag off on the single-threaded build, or a threads-enabled
++                // runtime): the force is Rejected, nothing is ever condemned, the enumeration
++                // keeps reporting A's assembly, and the dead-table counter (unconditional, like
++                // kinds 2/3/5) must not move.
++                Assert.Equal(Rejected, Force(contextA));
++                Assert.True(EnumerationReportsContext(contextA),
++                    "With the protocol inactive nothing is ever condemned, so the global enumeration must keep reporting A's assembly.");
++                Assert.Equal(deadBefore, ScoutStats(WeakTableDeadLookupCount));
++
++                contextB.Unload();
++                Assert.Equal(Rejected, Force(contextB));
++                GC.KeepAlive(sharedWitness);
++                GC.KeepAlive(contextA);
++                GC.KeepAlive(contextB);
++                return;
++            }
++
++            // The primary witness — proxied by the cached wrapper objects, whose weak-table
++            // entries die with the holder — must be collectible now that every A-side strong
++            // reference is confined to the returned-from helper frame. sharedWitness (the ONLY
++            // intentionally live witness, a composed-type wrapper whose keepalive edge reaches
++            // only the shared LoaderAllocator) keeps the shared {default, A, B} manager alive.
++            //
++            // Draining needs more than bare GC.Collect loops here (CI-evidenced): the setup
++            // helper's call tree was deep (global enumeration, per-assembly GetLoadContext,
++            // reflection materialization, CreateCrossPair), and the interpreter scans its data
++            // stack conservatively — stale slots left by that deep tree still hold wrapper
++            // references until a comparably deep call tree overwrites them. This is the exact
++            // mechanism ForceUntilCompleted already relies on in every passing test: each
++            // Force() goes through MethodInfo.Invoke, whose deep interpreter frames scrub the
++            // stale region between collections. Mirror that here — each attempt collects,
++            // forces (which must keep reporting NotQuiescent while sharedWitness lives: the
++            // all-or-nothing gate must decline as long as the shared witness is alive), and
++            // then turns the JS event loop (as DrainRetiredScoutsAsync does) so the scheduled
++            // background GC/finalizer pump can run on the single-threaded runtime.
++            for (int attempt = 0; attempt < 20 && (weakAssembly.IsAlive || weakType.IsAlive); attempt++)
++            {
++                GcQuiesce();
++                Assert.Equal(NotQuiescent, Force(contextA));
++                await Task.Delay(1);
++            }
++            Assert.False(weakAssembly.IsAlive,
++                "A's cached RuntimeAssembly wrapper must die with the primary LoaderAllocator once the helper frame is gone — otherwise this test is not exercising the condemned state.");
++            Assert.False(weakType.IsAlive,
++                "A's cached Type wrapper must die with the primary LoaderAllocator once the helper frame is gone — otherwise this test is not exercising the condemned state.");
++
++            // The rooted cross-context generic keeps the shared witness alive: the all-or-nothing
++            // gate must still decline, leaving the condemned-but-not-freed window in place.
++            Assert.Equal(NotQuiescent, Force(contextA));
++
++            // THE REGRESSION PATH: global enumeration inside that window. Must not abort, must
++            // skip the condemned assembly, must keep the sibling's copy.
++            AssertEnumerationSkipsCondemned(contextA, contextB);
++
++            int deadAfter = ScoutStats(WeakTableDeadLookupCount);
++            Assert.True(deadAfter > deadBefore,
++                $"The enumeration must have looked into A's DEAD weak table at least once (kind {WeakTableDeadLookupCount}: {deadBefore} -> {deadAfter}) — if the counter did not move, the condemned path was never exercised and this test is vacuous.");
++
++            // No resurrection: the wrappers stayed dead (no LoaderAllocator or cache was
++            // re-created to satisfy the enumeration) and the manager is still merely condemned —
++            // a further force still reports NotQuiescent while the shared witness lives, so
++            // nothing was freed by the enumeration either.
++            Assert.False(weakAssembly.IsAlive,
++                "The enumeration must not resurrect the condemned manager's Assembly wrapper.");
++            Assert.False(weakType.IsAlive,
++                "The enumeration must not resurrect the condemned manager's Type wrapper.");
++            Assert.Equal(NotQuiescent, Force(contextA));
++
++            // Release the last witness: the same context must now complete (the skip-filter did
++            // not consume or corrupt the teardown), and the enumeration stays clean after the
++            // assembly really leaves the loaded list.
++            GC.KeepAlive(sharedWitness);
++            sharedWitness = null;
++            Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            Assert.Equal(Completed, Force(contextA));
++            AssertEnumerationSkipsCondemned(contextA, contextB);
++
++            contextB.Unload();
++            Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        // Builds the condemned-but-not-freed state: loads the test assembly into A, materializes
++        // A's reflection hashes AND caches its RuntimeAssembly/Type wrappers (so the later
++        // enumeration finds a DEAD table, not an uninitialized one), asserts the positive
++        // control (the global enumeration reports A while everything is alive), creates the
++        // cross-context constructed-generic TYPE witness that lives in the shared
++        // {default, A, B} manager, and unloads A. Every A-side strong reference except the
++        // returned shared witness is confined to this frame (see ExerciseAndUnload for why the
++        // interpreter's conservative frame scanning makes that mandatory); the weak references —
++        // written into the caller-owned witnessRefs array ([0] = assembly wrapper, [1] = type
++        // wrapper) — let the caller observe that the primary witness genuinely died and was not
++        // resurrected.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CondemnPrimaryKeepingSharedWitness(
++            AssemblyLoadContext contextA, AssemblyLoadContext contextB, WeakReference[] witnessRefs)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++
++            // Materialize the primary manager's weak tables and populate them: the regression
++            // must find tables that EXISTED and died, exactly like the CI-observed state.
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            foreach (MemberInfo member in typeA.GetMembers(Declared))
++            {
++                Assert.Same(typeA, member.DeclaringType);
++            }
++
++            // Positive control while everything is alive: the global enumeration reports A's
++            // assembly (this also caches the RuntimeAssembly wrapper in the weak refobject
++            // hash). Runs in its own NoInlining frame so the enumeration's Assembly[] and
++            // per-assembly temporaries never occupy THIS frame's slots.
++            Assert.True(EnumerationReportsContext(contextA),
++                "Positive control failed: the global enumeration must report the collectible ALC's assembly while everything is alive.");
++
++            object sharedWitness = CreateCrossTypeWitness(contextA, contextB);
++
++            witnessRefs[0] = new WeakReference(asmA);
++            witnessRefs[1] = new WeakReference(typeA);
++
++            contextA.Unload();
++            return sharedWitness;
++        }
++
++        // The METADATA-level shared-manager witness: the RuntimeType wrapper for the
++        // cross-context constructed generic KeyValuePair<TypeA, TypeB>. Composing the type
++        // creates the shared {default, A, B} generic memory manager, materializes its
++        // LoaderAllocator and reflection hashes, and caches this wrapper in them; the wrapper's
++        // ONLY keepalive edge is that shared LoaderAllocator (the reflection alloc helper sets
++        // m_keepalive from the composed class's own memory manager), so rooting it holds the
++        // shared witness WITHOUT keeping any of A's primary witness set alive. Deliberately no
++        // Activator.CreateInstance here: a live INSTANCE must keep TypeA's runtime structures
++        // (and so A's primary witnesses) reachable — that instance-rooted scenario is
++        // RunRootedCrossGenericProtocol's, and it makes the primary-dead/shared-alive window
++        // this witness exists for unreachable. All other loads/wrappers are confined to this
++        // frame.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CreateCrossTypeWitness(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            Type crossType = typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB);
++            Assert.NotNull(crossType);
++            return crossType;
++        }
++
++        // The enumeration itself lives in its own frame so the wrapper objects it creates (for
++        // the sibling's and default-ALC assemblies) die with it and cannot keep any witness
++        // alive across the caller's later forces. Returns only a bool — nothing collectible
++        // escapes into the caller's frame. No lambdas: a predicate would drag a display class
++        // and enumerator temporaries into the picture for no benefit.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static bool EnumerationReportsContext(AssemblyLoadContext context)
++        {
++            Assembly[] all = AppDomain.CurrentDomain.GetAssemblies();
++            foreach (Assembly assembly in all)
++            {
++                if (ReferenceEquals(AssemblyLoadContext.GetLoadContext(assembly), context))
++                {
++                    return true;
++                }
++            }
++
++            return false;
++        }
++
++        // The condemned assembly must be absent while the sibling's copy stays present. Both
++        // probes run in EnumerationReportsContext's own frame (see above).
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void AssertEnumerationSkipsCondemned(AssemblyLoadContext condemned, AssemblyLoadContext live)
++        {
++            Assert.False(EnumerationReportsContext(condemned),
++                "The global enumeration must skip the condemned assembly instead of reporting (or aborting on) it.");
++            Assert.True(EnumerationReportsContext(live),
++                "The global enumeration must keep reporting the live sibling context's assembly.");
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunRefobjectRehashCycle()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            // All collectible roots are confined to the helper frame (see
++            // ReflectionHashInitUnderPressureCycle for why that matters on the interpreter).
++            ExerciseRehashProbe(context);
++
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
++        }
++
++        // Drives >= 9 unique insertions into ONE weak_refobject_hash and re-checks identity
++        // through the rehashed table. Returns no collectible root; unloads before returning.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseRehashProbe(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type probe = asm.GetType(RehashProbeClassName, throwOnError: true);
++
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            MemberInfo[] first = probe.GetMembers(Declared);
++
++            // Assert (not assume) the arithmetic behind the boundary claim: only MethodBase and
++            // FieldInfo entries populate weak_refobject_hash — nested types would go to the type
++            // cache — and crossing the initial size-11 table's 0.7 load factor needs at least 9.
++            int refobjectEntries = 0;
++            foreach (MemberInfo member in first)
++            {
++                if (member is MethodBase || member is FieldInfo)
++                {
++                    refobjectEntries++;
++                }
++
++                Assert.Same(probe, member.DeclaringType);
++            }
++
++            Assert.True(refobjectEntries >= 9,
++                $"{RehashProbeClassName} must contribute at least 9 unique weak_refobject_hash entries to force a rehash of the initial size-11 table (load factor 0.7), but only {refobjectEntries} of its {first.Length} declared members are methods/constructors/fields.");
++
++            // Post-rehash integrity: a second enumeration resolves through the rehashed table and
++            // must hand back the SAME cached reflection objects, in the same metadata order.
++            MemberInfo[] second = probe.GetMembers(Declared);
++            Assert.Equal(first.Length, second.Length);
++            for (int i = 0; i < first.Length; i++)
++            {
++                Assert.Same(first[i], second[i]);
++            }
++
++            context.Unload();
++        }
++
++        // Load/unload/force cycles for the modes where the force must be Rejected (flag off, or
++        // threads-enabled runtime); the per-cycle assertions live in LoadExerciseUnloadAndForce.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunRejectedCycles(int cycles)
++        {
++            for (int i = 0; i < cycles; i++)
++            {
++                LoadExerciseUnloadAndForce();
++            }
++        }
++
++        // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
++        // each pass collects (queueing/re-queueing any scouts whose LoaderAllocator is dead,
++        // including ones that re-registered with FALSE on an earlier pass) and then lets finalizers
++        // run, so a scout whose manager is in the registry terminally dies within a pass or two;
++        // the bound only guards against a hypothetical runaway.
++        //
++        // The finalizer step MUST yield to the JS event loop: on the single-threaded browser
++        // runtime there is no finalizer thread (LAZY_GC_THREAD_CREATION), so
++        // GC.WaitForPendingFinalizers returns immediately (gc.c bails when gc_thread is NULL) and
++        // mono_gc_finalize_notify merely schedules mono_runtime_do_background_work on the JS event
++        // loop (mono_main_thread_schedule_background_job). Finalizers therefore never run inside a
++        // synchronous test method — awaiting Task.Delay turns the event loop and runs the pump.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static async Task DrainRetiredScoutsAsync()
++        {
++            for (int attempt = 0; attempt < 20; attempt++)
++            {
++                if (ScoutStats(RetiredSetSize) == 0)
++                {
++                    return;
++                }
++
++                GC.Collect();
++                GC.WaitForPendingFinalizers(); // immediate no-op on single-threaded wasm; real wait elsewhere
++                await Task.Delay(1); // turn the JS event loop so the scheduled finalizer pump runs
++            }
++
++            Assert.Equal(0, ScoutStats(RetiredSetSize));
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference LoadExerciseUnloadAndForce()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            ExerciseAndUnload(context);
++
++            if (ProtocolActive)
++            {
++                // Eventually completes once the exercised state is collected — the earlier
++                // NotQuiescent attempts must not have consumed the retry.
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                // Idempotence: a second force after Completed is a Completed no-op, not a double free.
++                Assert.Equal(Completed, Force(context));
++            }
++            else
++            {
++                // Opt-in off (natively non-collectible) or threads-enabled runtime (hard gate):
++                // rejected and never freed, both times.
++                Assert.Equal(Rejected, Force(context));
++                Assert.Equal(Rejected, Force(context));
++            }
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseAndUnload(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++
++            // A default-ALC open generic instantiated over a collectible type argument creates a
++            // shared {default, collectible} generic memory manager (the owner-detach path in the
++            // native cleanup); reflection over the assembly grows the collectible weak bookkeeping
++            // tables (the rehash path, patch 0010). All locals are confined to this frame so the
++            // context can become quiescent once it returns.
++            var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
++            list.Add(Activator.CreateInstance(type));
++            Assert.Equal(1, list.Count);
++
++            context.Unload();
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference AssertRejectedWithoutUnloadThenComplete()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            Type type = LoadReturningType(context);
++
++            // Forced teardown is a terminal transition: without a prior managed Unload the native
++            // icall rejects the request (alc->unloading is false), regardless of the env flag.
++            Assert.Equal(Rejected, Force(context));
++
++            // The context is still fully usable after a rejected force.
++            Assert.NotNull(Activator.CreateInstance(type));
++            GC.KeepAlive(type);
++            type = null;
++
++            context.Unload();
++
++            if (ProtocolActive)
++            {
++                // The rejected force did not latch the once-only flag, so a correct later force
++                // can still complete.
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                // Opt-in off or threads-enabled runtime: still rejected, never freed.
++                Assert.Equal(Rejected, Force(context));
++            }
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference RunQuiescenceProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            Type rooted = LoadUnloadReturningRootedType(context);
++
++            // GC cannot reclaim the LoaderAllocator while `rooted` references a type of this ALC.
++            GcQuiesce();
++
++            if (!ProtocolActive)
++            {
++                // Opt-in off or threads-enabled runtime: rejected regardless of roots.
++                Assert.Equal(Rejected, Force(context));
++                GC.KeepAlive(rooted);
++                context = null;
++                return weakRef;
++            }
++
++            // Flag on: a live managed root must block the native free.
++            Assert.Equal(NotQuiescent, Force(context));
++            Assert.True(weakRef.IsAlive, "The ALC must not be freed while a loaded type is still rooted.");
++
++            // Drop the root; only once the LoaderAllocator is collected may the teardown complete.
++            GC.KeepAlive(rooted);
++            rooted = null;
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++
++            context = null;
++            return weakRef;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunSiblingProtocol()
++        {
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            // A generic instantiation spanning BOTH collectible contexts creates a shared generic
++            // memory manager owned by {A, B} (+ the default ALC of the open generic). Forcing A down
++            // deletes that manager via the owner-detach protocol; B must remain fully usable. All
++            // A-side and cross refs are confined to the helper frame so A can become quiescent.
++            CreateCrossPair(contextA, contextB);
++
++            contextA.Unload();
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextA));
++            }
++
++            // Sibling usability after A's forced teardown: instantiation, a fresh generic
++            // instantiation and reflection over B must all still work (no dangling shared state).
++            Assert.NotNull(Activator.CreateInstance(typeB));
++            Assert.NotNull(Activator.CreateInstance(typeof(List<>).MakeGenericType(typeB)));
++            Assert.NotEmpty(asmB.GetTypes());
++
++            contextB.Unload();
++            if (ProtocolActive)
++            {
++                GC.KeepAlive(typeB);
++                typeB = null;
++                asmB = null;
++                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextB));
++            }
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        // Whole-set quiescence: a live cross-context constructed generic keeps the SHARED generic
++        // memory manager's LoaderAllocator witness alive even after the forced context's primary
++        // witness has cleared. The native gate must check EVERY manager it would free
++        // (all-or-nothing): while the object is rooted the force must report NotQuiescent and free
++        // nothing (the object stays fully usable); once unrooted, the same force must complete.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunRootedCrossGenericProtocol()
++        {
++            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            object crossPair = CreateCrossPair(contextA, contextB);
++
++            contextA.Unload();
++            GcQuiesce();
++
++            if (ProtocolActive)
++            {
++                // The rooted cross-context generic must block the native free: freeing the shared
++                // {default, A, B} manager now would reclaim the live object's vtable.
++                Assert.Equal(NotQuiescent, Force(contextA));
++
++                // Nothing was freed — the refused force must leave the object fully usable.
++                Assert.NotNull(crossPair.ToString());
++                Assert.Equal(crossPair.GetHashCode(), crossPair.GetHashCode());
++
++                // Unroot; with the shared witness dead the same force must now complete.
++                GC.KeepAlive(crossPair);
++                crossPair = null;
++                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            }
++            else
++            {
++                // Opt-in off or threads-enabled runtime: rejected regardless of roots.
++                Assert.Equal(Rejected, Force(contextA));
++                GC.KeepAlive(crossPair);
++                crossPair = null;
++            }
++
++            contextB.Unload();
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(contextB));
++            }
++
++            GC.KeepAlive(contextA);
++            GC.KeepAlive(contextB);
++        }
++
++        // Object-wide tombstone: after a Completed force the stale native ALC pointer must never
++        // reach an icall again. Every managed consumer funnels through the NativeALC getter, so an
++        // ordinary API call (the LoadFromAssemblyName -> RuntimeAssembly.InternalLoad path has no
++        // VerifyIsAlive check of its own) must reject deterministically in managed code with
++        // ObjectDisposedException instead of forwarding freed native storage.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunTombstoneProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            ExerciseAndUnload(context);
++
++            if (!ProtocolActive)
++            {
++                // Protocol inactive (flag off, or threads-enabled runtime): the force is Rejected and
++                // must NOT tombstone — the context keeps
++                // servicing loads (the already-loaded assembly stays resolvable).
++                Assert.Equal(Rejected, Force(context));
++                Assert.NotNull(context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++                GC.KeepAlive(context);
++                return;
++            }
++
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++
++            // A successful force followed by an ordinary API call must reject in managed code.
++            Assert.Throws<ObjectDisposedException>(
++                () => context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++
++            // And the force itself stays an idempotent Completed no-op.
++            Assert.Equal(Completed, Force(context));
++            GC.KeepAlive(context);
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunThreadsEnabledRejectionProtocol()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            Type type = LoadReturningType(context);
++
++            context.Unload();
++            GcQuiesce();
++
++            // Regardless of MONO_WASM_ENABLE_ALC_UNLOAD, a threads-enabled runtime must reject —
++            // the destructive reclamation is unavailable until safe retirement is implemented —
++            // and a rejected force must not consume state, so it stays Rejected on retry.
++            Assert.Equal(Rejected, Force(context));
++            Assert.Equal(Rejected, Force(context));
++
++            // Nothing was disturbed by the rejected forces: the loaded type is still usable.
++            Assert.NotNull(Activator.CreateInstance(type));
++            GC.KeepAlive(type);
++            GC.KeepAlive(context);
++        }
++
++        // Returns the boxed cross-context KeyValuePair<TypeA, TypeB> instance. Its vtable lives
++        // in the SHARED generic memory manager owned by {default, A, B}, so while the returned
++        // object is rooted, that shared manager's LoaderAllocator witness stays alive — even
++        // after contextA's primary witness has cleared. Callers that want the contexts to become
++        // quiescent must simply not root the result.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object CreateCrossPair(AssemblyLoadContext contextA, AssemblyLoadContext contextB)
++        {
++            Assembly asmA = contextA.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Assembly asmB = contextB.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type typeA = asmA.GetType(TestClassName, throwOnError: true);
++            Type typeB = asmB.GetType(TestClassName, throwOnError: true);
++
++            object crossPair = Activator.CreateInstance(
++                typeof(KeyValuePair<,>).MakeGenericType(typeA, typeB));
++            Assert.NotNull(crossPair);
++            return crossPair;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static Type LoadReturningType(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++            return type;
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static Type LoadUnloadReturningRootedType(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotEmpty(asm.GetTypes());
++            context.Unload();
++            return type;
++        }
++
++        // Deliberately unrooted nursery garbage, shaped like what
++        // mono_mem_manager_init_reflection_hashes allocates (small object[]), used to bring the
++        // nursery close to a collection right before a first-reflection touch.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void Churn(int rounds)
++        {
++            for (int i = 0; i < rounds; i++)
++            {
++                object[] garbage = new object[8];
++                garbage[0] = new object();
++                garbage[7] = garbage[0];
++                GC.KeepAlive(garbage);
++            }
++        }
++
++        // One reflection-hash-initialization cycle under allocation pressure. A FRESH collectible
++        // ALC each time, so every cycle re-runs mono_mem_manager_init_reflection_hashes from
++        // scratch (the function early-returns once weak_refobject_hash is set for a manager).
++        //
++        // The reflection workload — and EVERY collectible object it creates — is confined to the
++        // NoInlining helper below, mirroring ExerciseAndUnload: the Mono interpreter records every
++        // IL local of a live frame as a reference slot and scans them conservatively (including
++        // compiler-generated enumerator/temporary slots, so nulling source locals is not enough).
++        // Holding asm/type/list in THIS frame across the force would keep the primary and
++        // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
++        // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
++        // it until a Completed force regardless (see LoadExerciseUnloadAndForce).
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ReflectionHashInitUnderPressureCycle(int seed)
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++
++            ExerciseReflectionHashInitUnderPressure(context, seed);
++
++            if (ProtocolActive)
++            {
++                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
++        }
++
++        // The reflection-hash workload for one pressure cycle. Returns no collectible root and
++        // calls context.Unload() before returning, so once this frame dies the context can become
++        // quiescent for the force performed by the caller.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void ExerciseReflectionHashInitUnderPressure(AssemblyLoadContext context, int seed)
++        {
++            // Pressure IMMEDIATELY before the first reflection touch, so the four
++            // mono_array_new_checked calls inside mono_mem_manager_init_reflection_hashes are as
++            // likely as this suite can make them to straddle a nursery collection — the exact
++            // window the pinned-handle fix protects. The amount varies per cycle to move the
++            // collection point around inside that window. (With MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK
++            // armed, the native hook additionally forces a REAL collection at each point inside
++            // that window, making this coverage deterministic rather than stochastic.)
++            Churn(96 + ((seed * 37) % 384));
++
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++
++            // First reflection touch on this collectible ALC: materialises LoaderAllocator.m_hashes
++            // plus the three MonoWeakHashTables.
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotNull(type);
++
++            // Reflection-cache integrity after the pressured construction. The runtime must hand
++            // back the SAME managed Type object for the same underlying MonoType, and every
++            // declared member must point back at it. Had a collection moved or reclaimed
++            // holders_arr or an earlier holder mid-construction, the published key/value arrays
++            // would be stale: these lookups would assert, crash, or resolve to a different object.
++            Churn(192);
++            Assert.Same(type, asm.GetType(TestClassName, throwOnError: true));
++            Assert.Same(asm, type.Assembly);
++            Assert.NotEmpty(asm.GetTypes());
++            Assert.Same(type, Activator.CreateInstance(type).GetType());
++
++            // Populate the weak tables while still under pressure, then re-check identity through
++            // a second, independent enumeration. (TestClass alone does NOT cross the rehash
++            // boundary — the dedicated rehash-boundary test below drives that path with
++            // RehashProbeClass and proves it via the native rehash counter.)
++            const BindingFlags Declared = BindingFlags.Public | BindingFlags.NonPublic
++                | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
++            foreach (MemberInfo member in type.GetMembers(Declared))
++            {
++                Assert.Same(type, member.DeclaringType);
++            }
++
++            Churn(192);
++            foreach (MemberInfo member in type.GetMembers(Declared))
++            {
++                Assert.Same(type, member.DeclaringType);
++            }
++
++            // Cross-ALC generic over the collectible type argument: adds a shared generic memory
++            // manager, which the forced teardown must also reclaim (whole-set quiescence).
++            var list = (IList)Activator.CreateInstance(typeof(List<>).MakeGenericType(type));
++            list.Add(Activator.CreateInstance(type));
++            Assert.Equal(1, list.Count);
++
++            context.Unload();
++        }
++
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void CollectAndAssertDead(WeakReference[] refs)
++        {
++            for (int attempt = 0; attempt < 10; attempt++)
++            {
++                GC.Collect();
++                GC.WaitForPendingFinalizers();
++
++                bool anyAlive = false;
++                foreach (WeakReference weakRef in refs)
++                {
++                    anyAlive |= weakRef.IsAlive;
++                }
++
++                if (!anyAlive)
++                {
++                    return;
++                }
++            }
++
++            foreach (WeakReference weakRef in refs)
++            {
++                Assert.False(weakRef.IsAlive,
++                    "A forced-down collectible AssemblyLoadContext should be reclaimable once the native teardown released the runtime's strong handle.");
++            }
++        }
++    }
++}
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+index 4a54cb27b..5cad40171 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
+@@ -43,4 +43,41 @@ public class GenericTestClass<T>
+         // Allow to store a static reference (either an instance of the ALC or an instance outside of it)
+         public static T StaticObjectRef;
+     }
++
++    // Rehash-boundary probe for the collectible reflection caches. Reflecting over ALL declared
++    // members of this type inserts each MethodInfo/ConstructorInfo/FieldInfo into the owning
++    // memory manager's SINGLE weak_refobject_hash (nested types would go to the separate type
++    // cache instead, hence there are none). A MonoWeakHashTable starts at size 11 with a 0.7
++    // load factor, so a rehash triggers before the 9th unique insertion into one table: the
++    // 17 entries below (12 methods + 1 constructor + 4 fields) cross that boundary with room to
++    // spare. Keep the member count comfortably above 8 — the forced-native-unload lifecycle
++    // tests assert the arithmetic and the actual rehash at runtime.
++    public class RehashProbeClass
++    {
++        public int Field0;
++        public int Field1;
++        public string Field2;
++        public object Field3;
++
++        public RehashProbeClass()
++        {
++            Field0 = 0;
++            Field1 = 1;
++            Field2 = string.Empty;
++            Field3 = new object();
++        }
++
++        public void Method0() { }
++        public void Method1() { }
++        public void Method2() { }
++        public void Method3() { }
++        public void Method4() { }
++        public void Method5() { }
++        public int Method6() => Field0;
++        public int Method7() => Field1;
++        public string Method8() => Field2;
++        public object Method9() => Field3;
++        public static void Method10() { }
++        public static void Method11() { }
++    }
+ }
+diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+index fba550cf1..bbdad35cc 100644
+--- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
++++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
+@@ -31,6 +31,7 @@
+     <Compile Include="SatelliteAssemblies.cs" />
+     <Compile Include="LoaderLinkTest.cs" />
+     <Compile Include="AssemblyResolutionDowngradeTest.cs" />
++    <Compile Include="ForcedNativeUnloadTests.cs" />
+     <Compile Include="$(CommonTestPath)TestUtilities\System\DisableParallelization.cs" Link="Common\TestUtilities\System\DisableParallelization.cs" />
+     <EmbeddedResource Include="MainStrings*.resx" />
+   </ItemGroup>
+-- 
+2.43.0
+
