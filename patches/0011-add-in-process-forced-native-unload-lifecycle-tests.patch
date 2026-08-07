@@ -256,7 +256,7 @@ new file mode 100644
 index 000000000..9413046a7
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1490 @@
+@@ -0,0 +1,1496 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -550,7 +550,7 @@ index 000000000..9413046a7
 +        /// — after which collections stay clean and the probe is reclaimable.
 +        /// </summary>
 +        [Fact]
-+        public void ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
++        public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -558,10 +558,10 @@ index 000000000..9413046a7
 +            }
 +
 +            // Phase 1 — the deterministic regression: a rooted LARGE pointer-free array (LOS).
-+            RunPointerFreeWitnessProtocol(losArray: true);
++            await RunPointerFreeWitnessProtocol(losArray: true);
 +
 +            // Phase 2 — the small-object promotion path (copy_object_no_checks).
-+            RunPointerFreeWitnessProtocol(losArray: false);
++            await RunPointerFreeWitnessProtocol(losArray: false);
 +        }
 +
 +        [Fact]
@@ -1403,7 +1403,7 @@ index 000000000..9413046a7
 +        // would keep the witness alive on pre-fix code too, and the test would stay green while the
 +        // regression it exists to catch returned.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunPointerFreeWitnessProtocol(bool losArray)
++        private static async Task RunPointerFreeWitnessProtocol(bool losArray)
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakProbe = new WeakReference[1];
@@ -1431,11 +1431,17 @@ index 000000000..9413046a7
 +            //
 +            // So: scrub first, observe the death, and only then treat a refusal as evidence. This is
 +            // the same discipline the weakAssembly/weakType gate in
-+            // ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree already applies.
++            // ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree already applies — including its
++            // event-loop turn, which is what actually lets the wrappers die.
 +            for (int attempt = 0; attempt < 20 && (weakWrappers[0].IsAlive || weakWrappers[1].IsAlive); attempt++)
 +            {
 +                GcQuiesce();
 +                Assert.Equal(NotQuiescent, Force(context));
++                // Turn the JS event loop (as DrainRetiredScoutsAsync does) so the scheduled
++                // background GC/finalizer pump can actually run on the single-threaded runtime.
++                // GcQuiesce alone does not yield, so without this the wrappers never die and the
++                // gate below fails even though the production behaviour is correct.
++                await Task.Delay(1);
 +            }
 +
 +            Assert.False(weakWrappers[0].IsAlive,
