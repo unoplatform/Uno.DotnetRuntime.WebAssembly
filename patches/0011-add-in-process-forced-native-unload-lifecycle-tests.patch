@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Fri, 31 Jul 2026 00:00:00 +0000
+Date: Fri, 7 Aug 2026 00:00:00 +0000
 Subject: [PATCH] test: in-process lifecycle tests for host-triggered native
  ALC unload
 
@@ -216,19 +216,47 @@ Round 10 (review follow-up):
   collectible — the exact condemned window the enumeration regression
   needs, and the metadata-level shape that survives the primary in the
   CI-observed abort.
+
+Round 11 (pointer-free witness regression):
+
+  * ForcedUnload_RootedPointerFreeObjects_BlockNativeFree: regression
+    for the sgen witness fix in patch 0009 round 11 (pointer-free
+    instances of collectible classes must keep their LoaderAllocator
+    witness alive in every scan path, not only the in-place major mark
+    macro). New pointer-free probe types in the test assembly:
+    PointerFreeTestClass (no reference fields) and PointerFreeElement
+    (16-byte struct; a 4096-element array is 64 KiB, above
+    SGEN_MAX_SMALL_OBJ_SIZE = 8000 bytes, so the array probe lives in
+    the large object space). Phase 1 roots the LOS array across the
+    force — pre-fix the array never rooted the witness at any
+    collection (the LOS mark/pin enqueues were reference-gated), so
+    once the loader frame's stale interpreter slots were scrubbed by
+    the per-attempt deep-invoke forces the witness died and the force
+    returned Completed while the array was still rooted: the
+    deterministic red assertion, after which later collections crash
+    on the freed vtable with the downstream-observed
+    "should not be reached" at sgen-scan-object.h:93. Phase 2 roots a
+    small pointer-free instance (the copy/promotion enqueue). Both
+    phases assert NotQuiescent on EVERY force attempt while the probe
+    is rooted, probe usability through the collectible vtable after
+    refused forces, Completed (and idempotent Completed) only after
+    release, probe reclaimability, and clean collections afterwards.
+    On the dark legs (flag off, or threads-enabled runtime) they
+    assert the Rejected surface with the probe untouched. Always-run
+    [Fact]; added to the CI sentinel's required-tests list.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 1308 +++++++++++++++++
- .../TestClass.cs                              |   37 +
+ .../tests/ForcedNativeUnloadTests.cs          | 1456 +++++++++++++++++
+ .../TestClass.cs                              |   61 +
  .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
- 3 files changed, 1346 insertions(+)
+ 3 files changed, 1518 insertions(+)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 000000000..6eae223ba
+index 000000000..9413046a7
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1308 @@
+@@ -0,0 +1,1456 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -276,6 +304,13 @@ index 000000000..6eae223ba
 +        private const string TestAssembly = "System.Runtime.Loader.Test.Assembly";
 +        private const string TestClassName = "System.Runtime.Loader.Tests.TestClass";
 +        private const string RehashProbeClassName = "System.Runtime.Loader.Tests.RehashProbeClass";
++        private const string PointerFreeClassName = "System.Runtime.Loader.Tests.PointerFreeTestClass";
++        private const string PointerFreeElementName = "System.Runtime.Loader.Tests.PointerFreeElement";
++
++        // 4096 x 16-byte PointerFreeElement = 64 KiB, comfortably above sgen's small-object
++        // limit (SGEN_MAX_SMALL_OBJ_SIZE, 8000 bytes), so the array probe is a large (LOS)
++        // object — the LOS mark/pin paths never go through the small-object major mark macro.
++        private const int PointerFreeArrayLength = 4096;
 +
 +        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult and the native
 +        // ves_icall_..._InternalForceNativeUnload return codes.
@@ -485,6 +520,48 @@ index 000000000..6eae223ba
 +            }
 +
 +            RunRootedCrossGenericProtocol();
++        }
++
++        /// <summary>
++        /// Pointer-free instances must block the forced native free (sgen witness regression).
++        ///
++        /// The quiescence gate reads each memory manager's LoaderAllocator weak-handle target,
++        /// and the LoaderAllocator is kept alive PER SCAN: every scanned object of a collectible
++        /// class reports its vtable's class object (sgen-scan-object.h). An object whose GC
++        /// descriptor has no reference slots is only enqueued for scanning where the enqueue
++        /// condition is collectible-aware. The in-place major mark macro
++        /// (MS_MARK_OBJECT_AND_ENQUEUE) is; before the fix, the copy/promotion path
++        /// (copy_object_no_checks) and the large-object mark/pin paths (the LOS branch of the
++        /// major gray-stack drain, and sgen_los_pin_objects) were not — they enqueued only when
++        /// the descriptor had references. A live pointer-free LOS array therefore NEVER rooted
++        /// its witness: the gate observed a dead witness while the array was still reachable,
++        /// the force Completed, the array's vtable was freed with its manager, and the next
++        /// collection that marked the array read a garbage descriptor through the dangling
++        /// vtable — crashing on the descriptor switch's g_assert_not_reached in
++        /// sgen-scan-object.h. A small pointer-free instance has the same exposure in the
++        /// collection that promotes it out of the nursery.
++        ///
++        /// Phase 1 roots a large pointer-free struct array (LOS mark paths; the deterministic
++        /// pre-fix red: within a few scrubbed-frame force attempts the witness died and the
++        /// force returned Completed while the array was rooted). Phase 2 roots a small
++        /// pointer-free instance (copy/promotion path; protocol coverage). In both phases the
++        /// force must report NotQuiescent on EVERY attempt while the probe is rooted, the probe
++        /// must stay fully usable, and only after the probe is released may the force Complete
++        /// — after which collections stay clean and the probe is reclaimable.
++        /// </summary>
++        [Fact]
++        public void ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            // Phase 1 — the deterministic regression: a rooted LARGE pointer-free array (LOS).
++            RunPointerFreeWitnessProtocol(losArray: true);
++
++            // Phase 2 — the small-object promotion path (copy_object_no_checks).
++            RunPointerFreeWitnessProtocol(losArray: false);
 +        }
 +
 +        [Fact]
@@ -1314,6 +1391,105 @@ index 000000000..6eae223ba
 +            GC.KeepAlive(contextB);
 +        }
 +
++        // One pointer-free witness phase (see ForcedUnload_RootedPointerFreeObjects_BlockNativeFree).
++        // The probe is the ONLY intentional root into the collectible ALC: every other collectible
++        // reference (assembly, Type wrappers, creation temporaries) is confined to the loader
++        // helper's frame, whose stale interpreter slots the deep MethodInfo.Invoke trees of the
++        // per-attempt forces scrub between collections — the same proven mechanism every other
++        // test here relies on (see ForceUntilCompleted and the round-10 notes). Pre-fix, phase 1's
++        // LOS array never rooted the witness at any collection, so once those slots were scrubbed
++        // the witness died and a force returned Completed while the array was still rooted — the
++        // red assertion below.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void RunPointerFreeWitnessProtocol(bool losArray)
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakProbe = new WeakReference[1];
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray, weakProbe);
++
++            if (!ProtocolActive)
++            {
++                // Opt-in off or threads-enabled runtime: rejected regardless of roots, nothing
++                // freed, the probe untouched.
++                GcQuiesce();
++                Assert.Equal(Rejected, Force(context));
++                AssertPointerFreeProbeUsable(rooted, losArray);
++                GC.KeepAlive(rooted);
++                return;
++            }
++
++            // While the pointer-free probe is rooted, EVERY force must report NotQuiescent: the
++            // probe's class-object report is the only thing keeping the witness alive, across
++            // enough collect+force cycles that the loader frame's stale slots are long gone.
++            for (int attempt = 0; attempt < 10; attempt++)
++            {
++                GcQuiesce();
++                Assert.Equal(NotQuiescent, Force(context));
++            }
++
++            // Nothing was freed: the probe stays fully usable through its collectible vtable.
++            AssertPointerFreeProbeUsable(rooted, losArray);
++            Assert.Equal(NotQuiescent, Force(context));
++
++            // Release the probe; the same force must now complete and stay an idempotent no-op.
++            GC.KeepAlive(rooted);
++            rooted = null;
++            Assert.Equal(Completed, ForceUntilCompleted(context, 20));
++            Assert.Equal(Completed, Force(context));
++
++            // Post-teardown hygiene: the released probe is reclaimable, and further collections
++            // over the survivors are clean (no dangling-vtable scans).
++            CollectAndAssertDead(weakProbe);
++            GcQuiesce();
++        }
++
++        // Loads the assembly, creates ONE pointer-free probe (a large PointerFreeElement[] in
++        // LOS, or a small PointerFreeTestClass instance in the nursery), unloads, and returns
++        // only the probe boxed in a default-ALC object[] — so no ALC-typed local, wrapper or
++        // temporary survives in the caller's frame. weakProbe[0] observes the probe's death
++        // after release.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object[] LoadUnloadReturningRootedPointerFreeProbe(
++            AssemblyLoadContext context, bool losArray, WeakReference[] weakProbe)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            object probe;
++            if (losArray)
++            {
++                Type elementType = asm.GetType(PointerFreeElementName, throwOnError: true);
++                probe = Array.CreateInstance(elementType, PointerFreeArrayLength);
++            }
++            else
++            {
++                Type classType = asm.GetType(PointerFreeClassName, throwOnError: true);
++                probe = Activator.CreateInstance(classType);
++            }
++
++            weakProbe[0] = new WeakReference(probe);
++            context.Unload();
++            return new object[] { probe };
++        }
++
++        // Usability probes for the rooted pointer-free object. GetType() goes through the
++        // (collectible) vtable, so this doubles as a liveness check of the probe's runtime
++        // structures after a refused force. Runs in its own frame: the RuntimeType wrappers it
++        // materializes root the witness while alive, and must never occupy the caller's slots
++        // across the release+force below (the caller's deep-invoke forces scrub this frame's
++        // stale region, as everywhere else in this suite).
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void AssertPointerFreeProbeUsable(object[] rooted, bool losArray)
++        {
++            if (losArray)
++            {
++                Assert.Equal("PointerFreeElement[]", rooted[0].GetType().Name);
++                Assert.Equal(PointerFreeArrayLength, ((Array)rooted[0]).Length);
++            }
++            else
++            {
++                Assert.Equal("PointerFreeTestClass", rooted[0].GetType().Name);
++            }
++        }
++
 +        // Object-wide tombstone: after a Completed force the stale native ALC pointer must never
 +        // reach an icall again. Every managed consumer funnels through the NativeALC getter, so an
 +        // ordinary API call (the LoadFromAssemblyName -> RuntimeAssembly.InternalLoad path has no
@@ -1538,13 +1714,37 @@ index 000000000..6eae223ba
 +    }
 +}
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
-index 4a54cb27b..5cad40171 100644
+index 4a54cb27b..7d3bb5ebe 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
-@@ -43,4 +43,41 @@ public class GenericTestClass<T>
+@@ -43,4 +43,65 @@ public class GenericTestClass<T>
          // Allow to store a static reference (either an instance of the ALC or an instance outside of it)
          public static T StaticObjectRef;
      }
++
++    // Pointer-free witness probes for the forced-native-unload lifecycle tests. Instances of
++    // PointerFreeTestClass, and arrays of PointerFreeElement, have GC descriptors with NO
++    // reference slots, so the reference-driven scan never visits them; the only thing that
++    // keeps their collectible LoaderAllocator witness alive is the per-scan class-object
++    // report, which every mark/copy/pin path must therefore perform even for objects it will
++    // never scan for references. The lifecycle tests root these across a forced unload: the
++    // force must stay NotQuiescent for as long as either probe is alive.
++    public class PointerFreeTestClass
++    {
++        public int IntValue;
++        public long LongValue;
++        public double DoubleValue;
++    }
++
++    // Element type for the large pointer-free array probe: 16 bytes per element, so a
++    // 4096-element array is 64 KiB — comfortably above sgen's small-object limit (8000
++    // bytes), forcing the array into the large object space, whose mark/pin paths never go
++    // through the small-object major mark macro.
++    public struct PointerFreeElement
++    {
++        public long A;
++        public long B;
++    }
 +
 +    // Rehash-boundary probe for the collectible reflection caches. Reflecting over ALL declared
 +    // members of this type inserts each MethodInfo/ConstructorInfo/FieldInfo into the owning
