@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Mon, 6 Jul 2026 00:00:00 +0000
+Date: Fri, 7 Aug 2026 00:00:00 +0000
 Subject: [PATCH] feat: host-triggered native unload of collectible
  AssemblyLoadContexts on a WASM worker
 
@@ -324,6 +324,76 @@ assemblies filtered from the global enumeration):
     mono_weak_hash_table_dead_lookup_count (unconditional, like kinds
     2/3/5) so the lifecycle test can prove the enumeration really took
     the dead-cache path instead of passing vacuously.
+
+Round 11 (downstream crash follow-up: pointer-free instances must keep
+their collectible LoaderAllocator witness alive in every scan path):
+
+  A downstream host loading previewed apps into collectible ALCs on
+  browser-wasm (flag ON, single-threaded, interpreter) observed, after
+  several unload cycles whose forces did not all complete, a fatal GC
+  assertion during a later collection:
+
+    * Assertion: should not be reached at .../sgen/sgen-scan-object.h:93
+
+  That line is the default case of the object-scan descriptor switch
+  (upstream code, untouched by this patch series), reachable only when
+  an object's descriptor has 0 in its low type bits — i.e. when the
+  descriptor was read through a dangling vtable (freed memory typically
+  holds an aligned free-list pointer there, whose low three bits are
+  000). Root cause, established in the applied tree:
+
+  * The quiescence gate above reads each manager's LoaderAllocator
+    weak-handle target, and the LoaderAllocator is kept alive PER SCAN:
+    every scanned object of a collectible class reports its vtable's
+    class object (sgen-scan-object.h's trailing HANDLE_PTR block,
+    upstream collectible-ALC machinery).
+  * An object whose descriptor has no reference slots (pointer-free
+    class instances, arrays of pointer-free value types) is only pushed
+    to the gray stack — and hence scanned — where the enqueue condition
+    is collectible-aware. Upstream made the in-place major mark macros
+    (MS_MARK_OBJECT_AND_ENQUEUE/_PAR: has_references OR
+    sgen_vtable_has_class_obj) aware, but NOT:
+      - copy_object_no_checks / copy_object_no_checks_par
+        (sgen-copy-object.h) — every nursery promotion/evacuation copy;
+      - the LOS branch of the major gray-stack drain
+        (sgen-marksweep-drain-gray-stack.h);
+      - sgen_los_pin_objects (sgen-los.c) — conservatively pinned LOS.
+  * A live POINTER-FREE object of a collectible class in the large
+    object space (e.g. a big array of an unloadable value type)
+    therefore never roots its witness at ANY major collection; a small
+    pointer-free instance has the same exposure in the exact collection
+    that promotes it out of the nursery. Once every reference-carrying
+    root is gone, the witness dies while such instances are still live,
+    the force (correctly trusting the witness) reports Completed,
+    mono_alc_cleanup frees the manager — and with it the instances'
+    MonoVTables — and the next collection that marks a still-live
+    instance reads a garbage descriptor through the dangling vtable and
+    hits the assertion. Upstream never reaches this state because its
+    teardown chain is disabled; the forced free makes witness
+    completeness load-bearing.
+
+  Fix: make the three remaining enqueue conditions collectible-aware,
+  identical to MS_MARK_OBJECT_AND_ENQUEUE (has_references ||
+  sgen_vtable_has_class_obj). An enumeration of every gray-stack
+  enqueue site in the applied tree shows the remaining ones (the
+  nursery pin queue and the late OOM pin_object) already enqueue
+  unconditionally, and scanning a pointer-free descriptor is a no-op
+  switch case followed by the class-object report, so the change is
+  well-defined for every descriptor type.
+
+  Safety direction: the fix makes the witness live LONGER (it now also
+  reflects genuinely live pointer-free instances), so a force that
+  would previously have freed live memory now reports NotQuiescent
+  until those instances are released — strictly more conservative, and
+  nothing is ever reported through a freed pointer. Cost: one NULL
+  field check per copied/pinned pointer-free object (non-collectible
+  vtables have a NULL loader_alloc), the same check the major mark
+  macro already pays.
+  SHARED-CODE IMPACT: unconditional (not behind the opt-in), because
+  witness completeness is what makes upstream's own collectible-ALC
+  accounting truthful; with the flag off no ALC is collectible, every
+  vtable has a NULL loader_alloc, and behaviour is unchanged. Arguably
+  upstreamable as-is.
 ---
  .../Runtime/Loader/AssemblyLoadContext.cs     |   7 +-
  .../Loader/AssemblyLoadContext.Mono.cs        | 108 ++++-
@@ -339,7 +409,10 @@ assemblies filtered from the global enumeration):
  src/mono/mono/mini/interp/interp.c            |  36 ++
  src/mono/mono/mini/interp/interp.h            |   3 +
  src/mono/mono/mini/mini-runtime.c             |   5 +
- 14 files changed, 896 insertions(+), 44 deletions(-)
+ src/mono/mono/sgen/sgen-copy-object.h         |  15 +-
+ src/mono/mono/sgen/sgen-los.c                 |   7 +-
+ .../sgen/sgen-marksweep-drain-gray-stack.h    |   9 +-
+ 17 files changed, 923 insertions(+), 48 deletions(-)
 
 diff --git a/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs b/src/libraries/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.cs
 index 9f9403738..4eac33a24 100644
@@ -1679,6 +1752,77 @@ index 7cf63847f..760ca0bf9 100644
  	mono_internal_hash_table_destroy (&info->interp_code_hash);
  #ifdef ENABLE_LLVM
  	mono_llvm_free_mem_manager (info);
+diff --git a/src/mono/mono/sgen/sgen-copy-object.h b/src/mono/mono/sgen/sgen-copy-object.h
+index 17a6e64fa..0692863ce 100644
+--- a/src/mono/mono/sgen/sgen-copy-object.h
++++ b/src/mono/mono/sgen/sgen-copy-object.h
+@@ -82,7 +82,17 @@ copy_object_no_checks (GCObject *obj, SgenGrayQueue *queue)
+ 	/* set the forwarding pointer */
+ 	SGEN_FORWARD_OBJECT (obj, destination);
+ 
+-	if (has_references) {
++	/*
++	 * Objects of collectible classes must be enqueued for scanning even when their
++	 * descriptor has no reference slots: the scan is what reports the vtable's class
++	 * object (sgen-scan-object.h) and thereby keeps the class's LoaderAllocator alive
++	 * while instances exist. The in-place major mark path (MS_MARK_OBJECT_AND_ENQUEUE)
++	 * already does this; without the same treatment here, a pointer-free instance that
++	 * is promoted during the collection that decides the LoaderAllocator's liveness
++	 * fails to root it. Non-collectible vtables have no class object, so this is a
++	 * single NULL check for them.
++	 */
++	if (has_references || sgen_vtable_has_class_obj (vt)) {
+ 		SGEN_LOG (9, "Enqueuing gray object %p (%s)", destination, sgen_client_vtable_get_name (vt));
+ 		GRAY_OBJECT_ENQUEUE_SERIAL (queue, (GCObject *)destination, sgen_vtable_get_descriptor (vt));
+ 	}
+@@ -119,7 +129,8 @@ copy_object_no_checks_par (GCObject *obj, SgenGrayQueue *queue)
+ 
+ 		if (destination == final_destination) {
+ 			/* In a racing case, only the worker that allocated the object enqueues it */
+-			if (has_references) {
++			/* Collectible classes: enqueue pointer-free objects too, see copy_object_no_checks. */
++			if (has_references || sgen_vtable_has_class_obj (vt)) {
+ 				SGEN_LOG (9, "Enqueuing gray object %p (%s)", destination, sgen_client_vtable_get_name (vt));
+ 				GRAY_OBJECT_ENQUEUE_PARALLEL (queue, (GCObject *)destination, sgen_vtable_get_descriptor (vt));
+ 			}
+diff --git a/src/mono/mono/sgen/sgen-los.c b/src/mono/mono/sgen/sgen-los.c
+index e72f5d421..281c4456e 100644
+--- a/src/mono/mono/sgen/sgen-los.c
++++ b/src/mono/mono/sgen/sgen-los.c
+@@ -886,7 +886,12 @@ sgen_los_pin_objects (SgenGrayQueue *gray_queue, gboolean finish_concurrent_mode
+ 				continue;
+ 			}
+ 			sgen_los_pin_object (obj->data);
+-			if (SGEN_OBJECT_HAS_REFERENCES (obj->data))
++			/*
++			 * Collectible classes: enqueue pointer-free LOS objects too, so the scan
++			 * reports the vtable's class object and keeps the class's LoaderAllocator
++			 * alive (see the LOS branch in sgen-marksweep-drain-gray-stack.h).
++			 */
++			if (SGEN_OBJECT_HAS_REFERENCES (obj->data) || sgen_vtable_has_class_obj (SGEN_LOAD_VTABLE (obj->data)))
+ 				GRAY_OBJECT_ENQUEUE_SERIAL (gray_queue, obj->data, sgen_obj_get_descriptor ((GCObject*)obj->data));
+ 			sgen_pin_stats_register_object (obj->data, GENERATION_OLD);
+ 			SGEN_LOG (6, "Marked large object %p (%s) size: %lu from roots", obj->data,
+diff --git a/src/mono/mono/sgen/sgen-marksweep-drain-gray-stack.h b/src/mono/mono/sgen/sgen-marksweep-drain-gray-stack.h
+index f926ee6d3..a745d3402 100644
+--- a/src/mono/mono/sgen/sgen-marksweep-drain-gray-stack.h
++++ b/src/mono/mono/sgen/sgen-marksweep-drain-gray-stack.h
+@@ -205,7 +205,14 @@ COPY_OR_MARK_FUNCTION_NAME (GCObject **ptr, GCObject *obj, SgenGrayQueue *queue)
+ 
+ 			if (first) {
+ 				sgen_binary_protocol_pin (obj, (gpointer)SGEN_LOAD_VTABLE (obj), sgen_safe_object_get_size (obj));
+-				if (SGEN_OBJECT_HAS_REFERENCES (obj))
++				/*
++				 * Large objects of collectible classes must be enqueued for scanning even
++				 * when pointer-free: the scan reports the vtable's class object
++				 * (sgen-scan-object.h), which is what keeps the class's LoaderAllocator
++				 * alive while instances exist — LOS objects are never marked through
++				 * MS_MARK_OBJECT_AND_ENQUEUE, so this branch is their only chance.
++				 */
++				if (SGEN_OBJECT_HAS_REFERENCES (obj) || sgen_vtable_has_class_obj (SGEN_LOAD_VTABLE (obj)))
+ #ifdef COPY_OR_MARK_PARALLEL
+ 					GRAY_OBJECT_ENQUEUE_PARALLEL (queue, obj, desc);
+ #else
 -- 
 2.43.0
 
