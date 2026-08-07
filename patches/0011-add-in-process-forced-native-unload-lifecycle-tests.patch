@@ -256,7 +256,7 @@ new file mode 100644
 index 000000000..9413046a7
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1456 @@
+@@ -0,0 +1,1490 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -1395,17 +1395,20 @@ index 000000000..9413046a7
 +        // The probe is the ONLY intentional root into the collectible ALC: every other collectible
 +        // reference (assembly, Type wrappers, creation temporaries) is confined to the loader
 +        // helper's frame, whose stale interpreter slots the deep MethodInfo.Invoke trees of the
-+        // per-attempt forces scrub between collections — the same proven mechanism every other
-+        // test here relies on (see ForceUntilCompleted and the round-10 notes). Pre-fix, phase 1's
-+        // LOS array never rooted the witness at any collection, so once those slots were scrubbed
-+        // the witness died and a force returned Completed while the array was still rooted — the
-+        // red assertion below.
++        // per-attempt forces scrub between collections.
++        //
++        // That scrub is ASSERTED, not assumed: the helper hands back weak references to its
++        // Assembly and Type wrappers, and the protocol below refuses to treat any NotQuiescent
++        // result as evidence until both are observed dead. Without that gate a surviving wrapper
++        // would keep the witness alive on pre-fix code too, and the test would stay green while the
++        // regression it exists to catch returned.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void RunPointerFreeWitnessProtocol(bool losArray)
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakProbe = new WeakReference[1];
-+            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray, weakProbe);
++            var weakWrappers = new WeakReference[2];
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray, weakProbe, weakWrappers);
 +
 +            if (!ProtocolActive)
 +            {
@@ -1418,9 +1421,32 @@ index 000000000..9413046a7
 +                return;
 +            }
 +
-+            // While the pointer-free probe is rooted, EVERY force must report NotQuiescent: the
-+            // probe's class-object report is the only thing keeping the witness alive, across
-+            // enough collect+force cycles that the loader frame's stale slots are long gone.
++            // NON-VACUITY GATE. The loader helper's RuntimeAssembly and Type wrappers each carry an
++            // m_keepalive edge to the same collectible LoaderAllocator, and the interpreter
++            // conservatively scans the stale frame slots they left behind. Until BOTH are provably
++            // dead, a NotQuiescent result says nothing about the pointer-free probe: a surviving
++            // wrapper produces exactly the same result on pre-fix code, and the differently shaped
++            // ForceUntilCompleted call tree below would then scrub it and report Completed — the
++            // whole test passing without ever exercising the regression.
++            //
++            // So: scrub first, observe the death, and only then treat a refusal as evidence. This is
++            // the same discipline the weakAssembly/weakType gate in
++            // ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree already applies.
++            for (int attempt = 0; attempt < 20 && (weakWrappers[0].IsAlive || weakWrappers[1].IsAlive); attempt++)
++            {
++                GcQuiesce();
++                Assert.Equal(NotQuiescent, Force(context));
++            }
++
++            Assert.False(weakWrappers[0].IsAlive,
++                "The loader helper's RuntimeAssembly wrapper must die before a refusal can be attributed to the pointer-free probe — otherwise this test is vacuous.");
++            Assert.False(weakWrappers[1].IsAlive,
++                "The loader helper's Type wrapper must die before a refusal can be attributed to the pointer-free probe — otherwise this test is vacuous.");
++
++            // THE RED ASSERTION. Every other root into the collectible ALC is now provably gone, so
++            // the probe's class-object report is the ONLY thing that can keep the witness alive.
++            // Pre-fix, phase 1's LOS array never rooted the witness at any collection, so these
++            // forces returned Completed while the array was still rooted.
 +            for (int attempt = 0; attempt < 10; attempt++)
 +            {
 +                GcQuiesce();
@@ -1450,22 +1476,30 @@ index 000000000..9413046a7
 +        // after release.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static object[] LoadUnloadReturningRootedPointerFreeProbe(
-+            AssemblyLoadContext context, bool losArray, WeakReference[] weakProbe)
++            AssemblyLoadContext context, bool losArray, WeakReference[] weakProbe, WeakReference[] weakWrappers)
 +        {
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            // One Type local shared by both shapes: every collectible-typed local left in this frame
++            // is a slot the conservative interpreter scan can keep alive, and each one the caller
++            // has to prove dead before a NotQuiescent result means anything.
++            Type collectibleType;
 +            object probe;
 +            if (losArray)
 +            {
-+                Type elementType = asm.GetType(PointerFreeElementName, throwOnError: true);
-+                probe = Array.CreateInstance(elementType, PointerFreeArrayLength);
++                collectibleType = asm.GetType(PointerFreeElementName, throwOnError: true);
++                probe = Array.CreateInstance(collectibleType, PointerFreeArrayLength);
 +            }
 +            else
 +            {
-+                Type classType = asm.GetType(PointerFreeClassName, throwOnError: true);
-+                probe = Activator.CreateInstance(classType);
++                collectibleType = asm.GetType(PointerFreeClassName, throwOnError: true);
++                probe = Activator.CreateInstance(collectibleType);
 +            }
 +
 +            weakProbe[0] = new WeakReference(probe);
++            // Both wrappers carry an m_keepalive edge to the same collectible LoaderAllocator, so
++            // the caller must observe their death before attributing a refusal to the probe.
++            weakWrappers[0] = new WeakReference(asm);
++            weakWrappers[1] = new WeakReference(collectibleType);
 +            context.Unload();
 +            return new object[] { probe };
 +        }
