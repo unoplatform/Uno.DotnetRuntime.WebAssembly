@@ -94,6 +94,17 @@ for default consumers.
 
 Fixes https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 Refs dotnet/runtime#89980.
+
+ * No-trace sentinel: mono_jiterp_free_method_data calls
+ *   mono_wasm_free_method_data once with a sentinel index when a method has no
+ *   trace entry points, purely to drain the general JIT queues. That sentinel was
+ *   0 -- but trace indexes are allocated from zero, so 0 aliases a real trace that
+ *   typically belongs to a live default-ALC method. Upstream that only dropped the
+ *   wrong traceInfo entry; with slot reclamation it would also hand a LIVE table
+ *   slot back to the allocator, after which the still-live call site would dispatch
+ *   to whichever trace was installed next. The sentinel is now -1 and every
+ *   traceInfo/slot operation is guarded on traceIndex >= 0.
+
 ---
  .../tests/ForcedNativeUnloadTests.cs          |  15 +-
  .../tests/JiterpreterTableReclamationTests.cs | 304 ++++++++++++++++++
@@ -110,10 +121,10 @@ Refs dotnet/runtime#89980.
  create mode 100644 src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 6eae223ba..89807864e 100644
+index efaaffd..89b4c64 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -167,16 +167,11 @@ private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttem
+@@ -174,16 +174,11 @@ namespace System.Runtime.Loader.Tests
              return outcome;
          }
  
@@ -137,10 +148,10 @@ index 6eae223ba..89807864e 100644
          {
 diff --git a/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 new file mode 100644
-index 000000000..315569387
+index 0000000..e9abe36
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,365 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -391,6 +402,67 @@ index 000000000..315569387
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
++        /// <summary>
++        /// Regression for the no-trace sentinel. `mono_jiterp_free_method_data` calls
++        /// `mono_wasm_free_method_data` once with a sentinel index for a method that has NO trace
++        /// entry points, purely to drain the general JIT queues. That sentinel used to be `0` — but
++        /// trace indexes are allocated from zero, so `0` aliases a real trace that typically belongs
++        /// to a live method in the default ALC. With slot reclamation in place, sweeping any
++        /// trace-less method would have handed that live slot back to the allocator, after which the
++        /// still-live call site would dispatch to whichever trace was installed next.
++        /// <para>
++        /// Unloading an ALC whose methods were never driven hot is exactly that case: every method
++        /// takes the sentinel path and none owns a trace. Nothing may be released.
++        /// </para>
++        /// </summary>
++        [Fact]
++        public void ForcedUnload_WithoutAnyCompiledTrace_ReleasesNoSlots()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!FlagEnabled || PlatformDetection.IsThreadingSupported)
++            {
++                // Feature dark — the stats are unavailable and nothing is reclaimable anyway.
++                Assert.Equal(-1, TraceStat(StatTotalFreed));
++                return;
++            }
++
++            int freedBefore = TraceStat(StatTotalFreed);
++            Assert.True(freedBefore >= 0, $"total-freed must be available with the opt-in active (got {freedBefore})");
++
++            // Asserts Completed internally, so reaching the next line proves the sweep really ran
++            // over the unloaded ALC's methods rather than the force having been refused.
++            LoadUnloadAndForceWithoutHotLoop();
++
++            Assert.Equal(freedBefore, TraceStat(StatTotalFreed));
++        }
++
++        // Loads the collectible assembly and unloads it WITHOUT driving the trace bait, so no trace
++        // is ever compiled inside it and every swept method takes the no-trace sentinel path.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void LoadUnloadAndForceWithoutHotLoop()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            TouchWithoutCompilingATrace(context);
++            context.Unload();
++            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++        }
++
++        // One cheap reflection touch so the assembly is really loaded and its methods really enter
++        // the interp code hash — but far below the jiterpreter hit-count threshold, so no trace is
++        // compiled and the sweep has only trace-less methods to free.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void TouchWithoutCompilingATrace(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Assert.NotNull(type);
++            Assert.NotEmpty(asm.GetTypes());
++        }
++
 +        private static WeakReference LoadRunHotLoopUnloadAndForce()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
@@ -446,7 +518,7 @@ index 000000000..315569387
 +    }
 +}
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
-index 5cad40171..300d21636 100644
+index 7d3bb5e..d8bc7f3 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 @@ -1,6 +1,7 @@
@@ -457,7 +529,7 @@ index 5cad40171..300d21636 100644
  using System.Runtime.InteropServices;
  
  namespace System.Runtime.Loader.Tests
-@@ -35,6 +36,39 @@ public static void TestDelegateMarshalling()
+@@ -35,6 +36,39 @@ namespace System.Runtime.Loader.Tests
          public class COMClass
          {
          }
@@ -498,7 +570,7 @@ index 5cad40171..300d21636 100644
  
      // Used to test LoaderAllocator used for a generic type instance allocation
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-index bbdad35cc..09a06f1b3 100644
+index bbdad35..09a06f1 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 @@ -32,6 +32,7 @@
@@ -510,10 +582,10 @@ index bbdad35cc..09a06f1b3 100644
      <EmbeddedResource Include="MainStrings*.resx" />
    </ItemGroup>
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index cc30e0cdb..8682a1521 100644
+index cc30e0c..8682a15 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -37,6 +37,7 @@ internal IntPtr NativeALC
+@@ -37,6 +37,7 @@ namespace System.Runtime.Loader
          [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
          [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
          [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
@@ -521,7 +593,7 @@ index cc30e0cdb..8682a1521 100644
          private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
          {
              if (isCollectible)
-@@ -78,6 +79,21 @@ private static void KeepLoaderAllocator()
+@@ -78,6 +79,21 @@ namespace System.Runtime.Loader
          // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
          internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
  
@@ -544,7 +616,7 @@ index cc30e0cdb..8682a1521 100644
          // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
          // in the native assembly-load-context.c.
 diff --git a/src/mono/browser/runtime/cwraps.ts b/src/mono/browser/runtime/cwraps.ts
-index e693c5223..c02fbd777 100644
+index e693c52..c02fbd7 100644
 --- a/src/mono/browser/runtime/cwraps.ts
 +++ b/src/mono/browser/runtime/cwraps.ts
 @@ -120,6 +120,7 @@ const fn_signatures: SigLine[] = [
@@ -565,40 +637,54 @@ index e693c5223..c02fbd777 100644
      mono_jiterp_get_counter(counter: number): number;
      mono_jiterp_modify_counter(counter: number, delta: number): number;
 diff --git a/src/mono/browser/runtime/jiterpreter.ts b/src/mono/browser/runtime/jiterpreter.ts
-index 6ba17a3ab..5e778f857 100644
+index 6ba17a3..09ba3a4 100644
 --- a/src/mono/browser/runtime/jiterpreter.ts
 +++ b/src/mono/browser/runtime/jiterpreter.ts
-@@ -1088,8 +1088,26 @@ export function mono_wasm_free_method_data (
+@@ -1088,10 +1088,38 @@ export function mono_wasm_free_method_data (
          mono_wasm_profiler_free_method(method);
      }
  
 -    // TODO: Uninstall the trace function pointer from the function pointer table,
 -    //  so that the compiled trace module can be freed by the browser eventually
-+    // Uninstall the compiled trace function from the function pointer table and recycle
-+    //  its slot, so repeated assembly-load-context unload cycles do not permanently
-+    //  consume table capacity (and so the engine can eventually collect the trace module).
-+    // mono_jiterp_free_table_entry only accepts the release when the runtime opted into
-+    //  forced ALC unload (MONO_WASM_ENABLE_ALC_UNLOAD on a single-threaded build) and the
-+    //  slot is a real, not-already-released allocation, so default configurations keep
-+    //  the upstream monotonic allocator behavior unchanged.
-+    const info = traceInfo[traceIndex];
-+    if (info && info.fnPtr) {
-+        if (cwraps.mono_jiterp_free_table_entry(JiterpreterTable.Trace, info.fnPtr) > 0) {
-+            // Repoint the slot at the safe placeholder (the same fill value used when the
-+            //  table was created), so a stale indirect call through it bails out to the
-+            //  interpreter instead of invoking a trace whose method has been freed.
-+            getWasmFunctionTable().set(info.fnPtr, getRawCwrap("mono_jiterp_placeholder_trace"));
-+            // Capacity is available again, so re-enable trace generation if the table had
-+            //  filled up. (Traces already tiered to NOT_JITTED/nop stay that way; only
-+            //  newly-created trace entry points benefit.)
-+            traceTableIsFull = false;
+-    // Release the trace info object, if present
+-    delete traceInfo[traceIndex];
++    // A negative traceIndex means "this method has no trace entry points" — the native side
++    //  still calls once, purely to drain the general JIT queues (see the need_extra_free HACK in
++    //  mono_jiterp_free_method_data). It is NOT an index into traceInfo. Guarding on it matters:
++    //  trace indexes are allocated from zero, so the old 0 sentinel aliased a real trace that
++    //  typically belongs to a live default-ALC method. Treating it as owned by the method being
++    //  freed would delete that trace's info and — with slot reclamation below — hand its live
++    //  table slot back to the allocator, after which the still-live call site would dispatch to
++    //  whichever trace was installed next.
++    if (traceIndex >= 0) {
++        // Uninstall the compiled trace function from the function pointer table and recycle
++        //  its slot, so repeated assembly-load-context unload cycles do not permanently
++        //  consume table capacity (and so the engine can eventually collect the trace module).
++        // mono_jiterp_free_table_entry only accepts the release when the runtime opted into
++        //  forced ALC unload (MONO_WASM_ENABLE_ALC_UNLOAD on a single-threaded build) and the
++        //  slot is a real, not-already-released allocation, so default configurations keep
++        //  the upstream monotonic allocator behavior unchanged.
++        const info = traceInfo[traceIndex];
++        if (info && info.fnPtr) {
++            if (cwraps.mono_jiterp_free_table_entry(JiterpreterTable.Trace, info.fnPtr) > 0) {
++                // Repoint the slot at the safe placeholder (the same fill value used when the
++                //  table was created), so a stale indirect call through it bails out to the
++                //  interpreter instead of invoking a trace whose method has been freed.
++                getWasmFunctionTable().set(info.fnPtr, getRawCwrap("mono_jiterp_placeholder_trace"));
++                // Capacity is available again, so re-enable trace generation if the table had
++                //  filled up. (Traces already tiered to NOT_JITTED/nop stay that way; only
++                //  newly-created trace entry points benefit.)
++                traceTableIsFull = false;
++            }
 +        }
++        // Release the trace info object, if present
++        delete traceInfo[traceIndex];
 +    }
-     // Release the trace info object, if present
-     delete traceInfo[traceIndex];
      // Remove any AOT data and queue entries associated with the method
+     mono_jiterp_free_method_data_interp_entry(imethod);
+     mono_jiterp_free_method_data_jit_call(method);
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 382247fa9..206c1a653 100644
+index 382247f..206c1a6 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -617,6 +617,37 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
@@ -640,7 +726,7 @@ index 382247fa9..206c1a653 100644
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
 diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
-index 4e1a93423..e4ca6f1d6 100644
+index 4e1a934..e4ca6f1 100644
 --- a/src/mono/mono/metadata/icall-def.h
 +++ b/src/mono/mono/metadata/icall-def.h
 @@ -473,6 +473,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
@@ -652,7 +738,7 @@ index 4e1a93423..e4ca6f1d6 100644
  HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
  HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index a47d81246..4db8b85bd 100644
+index a47d812..4db8b85 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -3743,15 +3743,17 @@ free_imethod_jiterp_cb (gpointer value, gpointer user_data)
@@ -683,10 +769,22 @@ index a47d81246..4db8b85bd 100644
  void
  mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
 diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
-index 887038ca4..b323e8fcd 100644
+index 887038c..86cbdc9 100644
 --- a/src/mono/mono/mini/interp/jiterpreter.c
 +++ b/src/mono/mono/mini/interp/jiterpreter.c
-@@ -1476,6 +1476,46 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
+@@ -988,7 +988,10 @@ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
+ 	if (need_extra_free) {
+ 		// HACK: Perform a single free operation to clear out any stuff from the jit queues
+ 		// This will happen if we didn't encounter any jiterpreter traces in the method
+-		mono_wasm_free_method_data (method, imethod, 0);
++		// Pass -1, NOT 0: trace indexes are allocated from zero (trace_count++), so 0 is a
++		// real trace that very likely belongs to a live method in another (default) ALC.
++		// The JS side treats a negative index as "no trace" and skips all per-trace work.
++		mono_wasm_free_method_data (method, imethod, -1);
+ 	}
+ }
+ 
+@@ -1476,6 +1479,46 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
  JiterpreterTableInfo tables[JITERPRETER_TABLE_LAST + 1] = { 0 };
  int mono_jiterp_first_trace_fn_ptr = 0;
  
@@ -733,7 +831,7 @@ index 887038ca4..b323e8fcd 100644
  static void
  atomically_set_value_once (gint32 *address, gint32 value) {
  #ifdef DISABLE_THREADS
-@@ -1530,6 +1570,17 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1530,6 +1573,17 @@ mono_jiterp_allocate_table_entry (int type) {
  #ifdef DISABLE_THREADS
  	if (table->next_index == 0)
  		table->next_index = table->first_index;
@@ -751,7 +849,7 @@ index 887038ca4..b323e8fcd 100644
  	int index = table->next_index++;
  #else
  	gint32 expected = 0;
-@@ -1546,6 +1597,88 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1546,6 +1600,88 @@ mono_jiterp_allocate_table_entry (int type) {
  	return index;
  }
  
@@ -840,6 +938,3 @@ index 887038ca4..b323e8fcd 100644
  int
  mono_jiterp_increment_counter (volatile int *counter) {
  #ifdef DISABLE_THREADS
--- 
-2.53.0.vfs.0.0
-
