@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Sat, 8 Aug 2026 00:00:00 +0000
+Date: Mon, 10 Aug 2026 00:00:00 +0000
 Subject: [PATCH] test: in-process lifecycle tests for host-triggered native
  ALC unload
 
@@ -245,52 +245,77 @@ Round 11 (pointer-free witness regression):
     assert the Rejected surface with the probe untouched. Always-run
     [Fact]; added to the CI sentinel's required-tests list.
 
-Round 12 (base-advance follow-up: deterministic stale-slot scrub +
-conservative LOS pin coverage):
+Rounds 12-13 (base-advance follow-up + review 4884863576: path-specific
+coverage, control-context non-vacuity, event-loop witness waits):
 
-  * Deterministic interpreter-slot scrub. After the pinned base advanced
-    (toolset update included), the single-threaded flag-ON leg went red
-    in three tests whose only common dependency is witness/wrapper death
-    across collect+force cycles: ReflectionHashInit... and
-    ForcedUnload_ScoutFinalizerPopulation_Plateaus stuck at NotQuiescent
-    in ForceUntilCompleted, and the pointer-free non-vacuity gate
-    reporting the RuntimeAssembly wrapper alive after all 20 attempts —
-    even with the event-loop turn. The suite's established scrub
-    mechanism (the deep MethodInfo.Invoke trees of per-attempt forces
-    overwriting stale conservative slots between collections,
-    CI-evidenced in round 10) is IL-shape-dependent, and the new
-    toolset's generated temp layouts changed enough that it stopped
-    converging; the witness machinery itself is fine at the new base
-    (every other witness-death test passed). GcQuiesce now calls
-    ScrubStaleInterpreterSlots before every collection: a NoInlining
-    recursion (depth 128, zero-initialized locals plus a 256-byte
-    stackalloc pad per frame, ~50+ KiB coverage) that deterministically
-    overwrites the popped-frame region of the interpreter stacks with
-    zeroes, replacing the shape-dependent heuristic with a guarantee.
-    Live frames sit below the caller and are never touched, so
-    intentionally stack-rooted probes keep their slots. Because
-    ForceUntilCompleted funnels through GcQuiesce, all three red tests
-    inherit the fix without body changes; the wrapper gate keeps its
-    retries and event-loop turn as belt-and-braces.
+  * Every witness-death wait now runs its attempts after a fresh
+    event-loop dispatch: ForceUntilCompleted is ForceUntilCompletedAsync
+    (collect -> force -> await Task.Delay(1)), and every caller
+    (tombstone, repeated-unload, reject-then-complete, quiescence,
+    sibling, cross-generic, rehash, reflection-hash cycles, scout
+    cycles, pointer-free phases) awaits it. Structural rationale: a
+    synchronous wait collects underneath the whole live xunit/reflection
+    invocation tree, and interp_mark_stack scans the live slot region
+    conservatively (stack_start..stack_pointer plus the data-stack
+    fragments up to their live positions); whether some live slot still
+    carries a stale reference into the collectible manager is a function
+    of the toolset's generated temp layout, which the base advance
+    reshuffled — turning formerly-converging synchronous waits into
+    10-20 futile attempts on the flag-ON leg. After an await the
+    continuation is re-dispatched from the JS event loop, so the
+    collections run on a nearly empty interpreter stack: the
+    wrapper-producing frames are structurally absent from the scanned
+    live region rather than hoped to have been overwritten. (A recursive
+    "scrub" of the popped region was tried and is withdrawn: everything
+    it writes is popped again — and therefore back outside
+    stack_pointer/fragment positions — by the time GC.Collect runs, so
+    the scanned live region is exactly what it would have been anyway;
+    an exact-head run regressing to six flag-ON failures confirmed it.)
+  * The pointer-free regression's non-vacuity gate is DIFFERENTIAL, via
+    a control context — NOT a wait for the probe context's own wrapper
+    objects to die, which is impossible by construction post-fix: a
+    manager's reflection caches are managed arrays reachable from
+    LoaderAllocator.m_hashes (mono_weak_hash_table publishes its
+    key/value arrays through object[] holders into m_hashes), so every
+    cached wrapper is STRONGLY reachable from the LoaderAllocator — by
+    design, the cache lives exactly as long as the manager — and the
+    fixed sgen keeps the LoaderAllocator alive at every scan while the
+    probe is rooted. "Probe rooted" therefore IMPLIES "wrappers alive";
+    a wrapper-death gate waits on a contradiction (it failed on every
+    head that carried it). Instead, each phase runs a CONTROL context
+    with the byte-identical loader shape (same load, same reflection
+    touches, same probe creation, same unload) that DROPS the probe, and
+    requires its force to Complete before the probe context's refusals
+    count as evidence: the control completing empirically proves nothing
+    environmental roots this exact shape's witnesses once user
+    references are gone, so the probe context's sustained NotQuiescent
+    is attributable to the single differing bit — probe retention.
+    Pre-fix, the probe does not root the witness, the probe context
+    behaves exactly like the control, and the first red-loop force
+    returns Completed: a deterministic red conditioned on a gate that
+    can actually open.
   * Phase 3 — conservative LOS pin path (review: mutation-sensitive
-    proof for the sgen_los_pin_objects hunk). A synchronous protocol
-    (async would lift the local into a heap state-machine field and
-    reroute the reach through the major drain) roots the LOS
-    pointer-free array SOLELY in a live interpreter frame slot;
+    proof for the sgen_los_pin_objects hunk). The control gate and both
+    release waits are async (fresh-dispatch collections; interpreter
+    -local copies of the probe die with each dispatch's frames), while
+    the RED LOOP runs in a synchronous NoInlining helper whose parameter
+    slot — plus a caller local never live across an await, with the
+    state-machine field nulled first — is the probe's only strong root.
     interp_mark_stack scans interpreter slots only in the non-precise
-    pass, so the array reaches the collector exclusively through the
-    conservative pin queue and sgen_los_pin_objects is the only site
-    that can enqueue it — the drain branch skips objects the pin stage
-    already marked pinned. Reverting that hunk uniquely turns the red
-    loop's NotQuiescent into Completed while the array is pinned-live.
-    Same non-vacuity wrapper gate as the other phases.
-  * Phase separation is now scrub-backed and mutation-specific: with
-    stale slots zeroed before every collection, phase 1's array is
-    reached only through its heap root (major drain LOS branch), phase
-    2's instance is promoted by copy_object_no_checks in the same first
-    collection that decides the witness's liveness (so reverting the
-    serial-copy hunk kills the witness in that collection and the force
-    Completes against the live instance), and phase 3 is pin-queue-only.
+    pass, so during the red loop the array reaches the collector
+    exclusively through the conservative pin queue: sgen_los_pin_objects
+    is the only site that can enqueue it (the drain branch skips objects
+    the pin stage already marked pinned), and reverting that hunk
+    uniquely flips the red loop to Completed while the array is
+    pinned-live.
+  * Path separation across the phases: phase 1's array is rooted only
+    through a heap reference (the async state machine's field), so the
+    major drain's LOS branch is the only enqueue site that can root its
+    witness; phase 2's small instance is promoted by
+    copy_object_no_checks in the same first collection that decides its
+    witness's liveness, so reverting the serial-copy hunk kills the
+    witness in that collection and the force Completes against the live
+    instance; phase 3 is pin-queue-only as above.
     copy_object_no_checks_par stays uncovered by construction — no GC
     workers exist on the single-threaded build and the threads-enabled
     leg rejects the forced unload (DISABLE_THREADS hard gate) — so its
@@ -298,18 +323,18 @@ conservative LOS pin coverage):
     matching upstream's own MS_MARK_OBJECT_AND_ENQUEUE/_PAR symmetry,
     rather than by a vacuous test.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 1647 +++++++++++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 1666 +++++++++++++++++
  .../TestClass.cs                              |   61 +
  .../tests/System.Runtime.Loader.Tests.csproj  |    1 +
- 3 files changed, 1709 insertions(+)
+ 3 files changed, 1728 insertions(+)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 new file mode 100644
-index 000000000..5810bdfb4
+index 000000000..a30a5a290
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -0,0 +1,1647 @@
+@@ -0,0 +1,1666 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -461,57 +486,36 @@ index 000000000..5810bdfb4
 +        {
 +            for (int i = 0; i < 3; i++)
 +            {
-+                ScrubStaleInterpreterSlots(ScrubDepth);
 +                GC.Collect();
 +                GC.WaitForPendingFinalizers();
 +            }
 +        }
 +
-+        // 128 frames x (256-byte pad + locals + frame overhead) ≈ 50+ KiB of interpreter data
-+        // stack overwritten per scrub — several times the deepest setup tree in this suite
-+        // (assembly load from an embedded resource, reflection materialization, generic
-+        // instantiation), while staying far below the interpreter's stack budget.
-+        private const int ScrubDepth = 128;
-+
-+        // Deterministically overwrite the interpreter data-stack region ABOVE the caller's live
-+        // frames, where popped setup helpers leave stale reference slots that the interpreter's
-+        // conservative scan keeps treating as roots. This suite historically relied on the deep
-+        // MethodInfo.Invoke trees of the per-attempt forces to overwrite that region between
-+        // collections; that is IL-shape-dependent, and a toolset advance changed the generated
-+        // temp layouts enough that the heuristic stopped converging (witnesses and wrappers
-+        // stayed alive through 10-20 collect+force attempts). This scrub replaces the heuristic
-+        // with a guarantee: each recursion level claims a frame whose zero-initialized locals
-+        // and stackalloc pad overwrite the slots of whatever frame previously occupied that
-+        // stack extent, so after ScrubDepth levels every stale slot within the covered region
-+        // reads as zero at the next collection. Live frames sit BELOW the caller and are never
-+        // touched, so intentional stack-rooted probes (see the conservatively pinned LOS phase)
-+        // keep their frame slots.
++        // Retry the force across collections until it completes, with every attempt running
++        // AFTER a fresh event-loop dispatch. This is the only witness-death wait shape that has
++        // converged in every run at the current base, and the reason is structural:
++        //
++        //   * A SYNCHRONOUS wait collects underneath the whole live xunit/reflection invocation
++        //     tree, and the interpreter scans the live slot region conservatively
++        //     (interp_mark_stack covers stack_start..stack_pointer plus the data-stack
++        //     fragments up to their live positions). Whether some slot in that live region
++        //     still carries a stale reference into the collectible manager is a function of the
++        //     generated IL's temp layout — which the base's toolset update reshuffled, turning
++        //     formerly-converging synchronous waits into 10-20 futile attempts. (A recursive
++        //     "scrub" cannot fix this: anything it writes is popped again — and therefore back
++        //     OUTSIDE stack_pointer/fragment positions — by the time GC.Collect runs, so the
++        //     scanned live region is exactly what it would have been anyway.)
++        //   * After `await Task.Delay(1)`, the continuation is re-dispatched from the JS event
++        //     loop, so the collections run on a nearly empty interpreter stack: the
++        //     wrapper-producing frames are structurally absent from the scanned live region,
++        //     not merely hoped to have been overwritten. The turn also lets the scheduled
++        //     background GC/finalizer pump run (single-threaded runtime, see
++        //     DrainRetiredScoutsAsync).
++        //
++        // Each NotQuiescent attempt must leave the once-only latch clear so a later attempt can
++        // still Complete — i.e. the single retry is never consumed by a premature force.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void ScrubStaleInterpreterSlots(int depth)
-+        {
-+            // Zero-initialized (InitLocals) pad: 32 pointer-sized slots of zeroes per frame,
-+            // plus the zeroed reference locals below. Touch the pad so it cannot be elided.
-+            Span<byte> pad = stackalloc byte[256];
-+            pad[0] = (byte)depth;
-+            pad[pad.Length - 1] = (byte)depth;
-+
-+            object a = null, b = null, c = null, d = null;
-+            if (depth > 0)
-+            {
-+                ScrubStaleInterpreterSlots(depth - 1);
-+            }
-+
-+            GC.KeepAlive(a);
-+            GC.KeepAlive(b);
-+            GC.KeepAlive(c);
-+            GC.KeepAlive(d);
-+        }
-+
-+        // Retry the force across GCs. Each NotQuiescent attempt must leave the latch clear so a
-+        // later attempt can still Complete — i.e. the single retry is never consumed by a premature
-+        // or too-early force.
-+        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static int ForceUntilCompleted(AssemblyLoadContext context, int maxAttempts)
++        private static async Task<int> ForceUntilCompletedAsync(AssemblyLoadContext context, int maxAttempts)
 +        {
 +            int outcome = NotQuiescent;
 +            for (int i = 0; i < maxAttempts; i++)
@@ -522,6 +526,8 @@ index 000000000..5810bdfb4
 +                {
 +                    break;
 +                }
++
++                await Task.Delay(1);
 +            }
 +
 +            return outcome;
@@ -538,7 +544,7 @@ index 000000000..5810bdfb4
 +        // this suite records the residual instead of measuring it. Tracked:
 +        // https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 +        [Fact]
-+        public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
++        public async Task RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -549,7 +555,7 @@ index 000000000..5810bdfb4
 +            var refs = new WeakReference[Cycles];
 +            for (int i = 0; i < Cycles; i++)
 +            {
-+                refs[i] = LoadExerciseUnloadAndForce();
++                refs[i] = await LoadExerciseUnloadAndForce();
 +            }
 +
 +            if (ProtocolActive)
@@ -561,25 +567,25 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [Fact]
-+        public void ForcedUnload_LeavesSiblingCollectibleContextUsable()
++        public async Task ForcedUnload_LeavesSiblingCollectibleContextUsable()
 +        {
 +            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            RunSiblingProtocol();
++            await RunSiblingProtocol();
 +        }
 +
 +        [Fact]
-+        public void ForceNativeUnload_WithoutManagedUnload_IsRejected()
++        public async Task ForceNativeUnload_WithoutManagedUnload_IsRejected()
 +        {
 +            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            WeakReference weakRef = AssertRejectedWithoutUnloadThenComplete();
++            WeakReference weakRef = await AssertRejectedWithoutUnloadThenComplete();
 +
 +            if (ProtocolActive)
 +            {
@@ -590,14 +596,14 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [Fact]
-+        public void ForcedUnload_OnlyCompletesOnceQuiescent()
++        public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
 +        {
 +            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            WeakReference weakRef = RunQuiescenceProtocol();
++            WeakReference weakRef = await RunQuiescenceProtocol();
 +
 +            if (ProtocolActive)
 +            {
@@ -606,14 +612,14 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [Fact]
-+        public void ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
++        public async Task ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
 +        {
 +            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            RunRootedCrossGenericProtocol();
++            await RunRootedCrossGenericProtocol();
 +        }
 +
 +        /// <summary>
@@ -636,9 +642,13 @@ index 000000000..5810bdfb4
 +        /// collection that promotes it out of the nursery.
 +        ///
 +        /// The three phases pin the three sgen enqueue sites the fix made collectible-aware,
-+        /// each through the only reach that exercises it (ScrubStaleInterpreterSlots zeroes
-+        /// stale conservative slots before every collection, so no accidental pin can blur
-+        /// which path roots the witness):
++        /// each through the only reach that exercises it. Each phase runs a CONTROL context —
++        /// byte-identical loader shape, probe dropped instead of retained — whose force must
++        /// Complete before the probe context's refusals count as evidence (see
++        /// RunPointerFreeWitnessProtocol for why waiting on the probe context's own wrapper
++        /// objects instead can never succeed post-fix), and every witness-death wait runs its
++        /// attempts after fresh event-loop dispatches, so the collections never scan the deep
++        /// synchronous invocation tree (see ForceUntilCompletedAsync):
 +        ///   Phase 1 — a large pointer-free struct array rooted through a HEAP reference (the
 +        ///     async state machine's field): reached precisely, so the LOS branch of the major
 +        ///     gray-stack drain is the only site that can enqueue it. The deterministic pre-fix
@@ -679,18 +689,18 @@ index 000000000..5810bdfb4
 +            await RunPointerFreeWitnessProtocol(losArray: false);
 +
 +            // Phase 3 — the conservative LOS pin path (sgen_los_pin_objects): stack-rooted.
-+            RunConservativelyPinnedLosWitnessProtocol();
++            await RunConservativelyPinnedLosWitnessProtocol();
 +        }
 +
 +        [Fact]
-+        public void ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
++        public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
 +        {
 +            if (BridgeMissing())
 +            {
 +                return;
 +            }
 +
-+            RunTombstoneProtocol();
++            await RunTombstoneProtocol();
 +        }
 +
 +        // On a threads-enabled runtime the destructive native teardown is compiled out entirely
@@ -737,7 +747,7 @@ index 000000000..5810bdfb4
 +                // compiled out (DISABLE_THREADS hard gate). The stats must consistently report
 +                // unavailable (-1) and stay that way across forced cycles.
 +                Assert.Equal(-1, ScoutStats(RetiredSetSize));
-+                RunRejectedCycles(3);
++                await RunRejectedCycles(3);
 +                Assert.Equal(-1, ScoutStats(RetiredSetSize));
 +                Assert.Equal(-1, ScoutStats(TerminalDestroyCount));
 +                return;
@@ -748,7 +758,7 @@ index 000000000..5810bdfb4
 +                // Flag off on the single-threaded build: every force is Rejected, nothing is ever
 +                // retired, so the registry must not move at all.
 +                int baselineRetired = ScoutStats(RetiredSetSize);
-+                RunRejectedCycles(3);
++                await RunRejectedCycles(3);
 +                Assert.Equal(baselineRetired, ScoutStats(RetiredSetSize));
 +                Assert.Equal(baselineTerminal, ScoutStats(TerminalDestroyCount));
 +                return;
@@ -758,7 +768,7 @@ index 000000000..5810bdfb4
 +            int previousTerminal = baselineTerminal;
 +            for (int i = 0; i < Cycles; i++)
 +            {
-+                LoadExerciseUnloadAndForce();
++                await LoadExerciseUnloadAndForce();
 +                await DrainRetiredScoutsAsync();
 +
 +                int terminalNow = ScoutStats(TerminalDestroyCount);
@@ -833,7 +843,7 @@ index 000000000..5810bdfb4
 +            const int Cycles = 8;
 +            for (int i = 0; i < Cycles; i++)
 +            {
-+                ReflectionHashInitUnderPressureCycle(i);
++                await ReflectionHashInitUnderPressureCycle(i);
 +                GcQuiesce();
 +
 +                if (ProtocolActive)
@@ -925,7 +935,7 @@ index 000000000..5810bdfb4
 +        /// identity re-checks prove the rehashed table still resolves every entry.
 +        /// </summary>
 +        [Fact]
-+        public void ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary()
++        public async Task ReflectionOverManyMembers_CrossesWeakRefobjectRehashBoundary()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -936,7 +946,7 @@ index 000000000..5810bdfb4
 +            Assert.True(rehashBefore >= 0,
 +                $"The weak-table rehash counter must be available on every build; kind {WeakTableRehashCount} returned {rehashBefore}.");
 +
-+            RunRefobjectRehashCycle();
++            await RunRefobjectRehashCycle();
 +            GcQuiesce();
 +
 +            int rehashAfter = ScoutStats(WeakTableRehashCount);
@@ -1037,16 +1047,18 @@ index 000000000..5810bdfb4
 +            //
 +            // Draining needs more than bare GC.Collect loops here (CI-evidenced): the setup
 +            // helper's call tree was deep (global enumeration, per-assembly GetLoadContext,
-+            // reflection materialization, CreateCrossPair), and the interpreter scans its data
-+            // stack conservatively — stale slots left by that deep tree still hold wrapper
-+            // references until a comparably deep call tree overwrites them. This is the exact
-+            // mechanism ForceUntilCompleted already relies on in every passing test: each
-+            // Force() goes through MethodInfo.Invoke, whose deep interpreter frames scrub the
-+            // stale region between collections. Mirror that here — each attempt collects,
-+            // forces (which must keep reporting NotQuiescent while sharedWitness lives: the
-+            // all-or-nothing gate must decline as long as the shared witness is alive), and
-+            // then turns the JS event loop (as DrainRetiredScoutsAsync does) so the scheduled
-+            // background GC/finalizer pump can run on the single-threaded runtime.
++            // reflection materialization, CreateCrossPair), and the interpreter scans the live
++            // slot region conservatively. Each attempt therefore collects, forces (which must
++            // keep reporting NotQuiescent while sharedWitness lives: the all-or-nothing gate
++            // must decline as long as the shared witness is alive), and then awaits an
++            // event-loop turn, so the next attempt runs on a fresh, nearly empty dispatch
++            // whose collections no longer see that tree — the same footing
++            // ForceUntilCompletedAsync gives every witness-death wait in this suite (and the
++            // turn lets the scheduled background GC/finalizer pump run, as
++            // DrainRetiredScoutsAsync documents). NOTE: unlike the pointer-free phases, A's
++            // wrapper weak-refs CAN die here — nothing user-side roots A's primary
++            // LoaderAllocator, so the whole cache (which the LoaderAllocator strongly holds via
++            // m_hashes) goes down with it; sharedWitness only holds the SHARED manager alive.
 +            for (int attempt = 0; attempt < 20 && (weakAssembly.IsAlive || weakType.IsAlive); attempt++)
 +            {
 +                GcQuiesce();
@@ -1085,12 +1097,12 @@ index 000000000..5810bdfb4
 +            // assembly really leaves the loaded list.
 +            GC.KeepAlive(sharedWitness);
 +            sharedWitness = null;
-+            Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextA, 10));
 +            Assert.Equal(Completed, Force(contextA));
 +            AssertEnumerationSkipsCondemned(contextA, contextB);
 +
 +            contextB.Unload();
-+            Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextB, 10));
 +
 +            GC.KeepAlive(contextA);
 +            GC.KeepAlive(contextB);
@@ -1196,7 +1208,7 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunRefobjectRehashCycle()
++        private static async Task RunRefobjectRehashCycle()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +
@@ -1206,7 +1218,7 @@ index 000000000..5810bdfb4
 +
 +            if (ProtocolActive)
 +            {
-+                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +            }
 +            else
 +            {
@@ -1258,11 +1270,11 @@ index 000000000..5810bdfb4
 +        // Load/unload/force cycles for the modes where the force must be Rejected (flag off, or
 +        // threads-enabled runtime); the per-cycle assertions live in LoadExerciseUnloadAndForce.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunRejectedCycles(int cycles)
++        private static async Task RunRejectedCycles(int cycles)
 +        {
 +            for (int i = 0; i < cycles; i++)
 +            {
-+                LoadExerciseUnloadAndForce();
++                await LoadExerciseUnloadAndForce();
 +            }
 +        }
 +
@@ -1297,7 +1309,7 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static WeakReference LoadExerciseUnloadAndForce()
++        private static async Task<WeakReference> LoadExerciseUnloadAndForce()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakRef = new WeakReference(context);
@@ -1307,7 +1319,7 @@ index 000000000..5810bdfb4
 +            {
 +                // Eventually completes once the exercised state is collected — the earlier
 +                // NotQuiescent attempts must not have consumed the retry.
-+                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +                // Idempotence: a second force after Completed is a Completed no-op, not a double free.
 +                Assert.Equal(Completed, Force(context));
 +            }
@@ -1343,7 +1355,7 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static WeakReference AssertRejectedWithoutUnloadThenComplete()
++        private static async Task<WeakReference> AssertRejectedWithoutUnloadThenComplete()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakRef = new WeakReference(context);
@@ -1364,7 +1376,7 @@ index 000000000..5810bdfb4
 +            {
 +                // The rejected force did not latch the once-only flag, so a correct later force
 +                // can still complete.
-+                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +            }
 +            else
 +            {
@@ -1377,7 +1389,7 @@ index 000000000..5810bdfb4
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static WeakReference RunQuiescenceProtocol()
++        private static async Task<WeakReference> RunQuiescenceProtocol()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakRef = new WeakReference(context);
@@ -1402,14 +1414,14 @@ index 000000000..5810bdfb4
 +            // Drop the root; only once the LoaderAllocator is collected may the teardown complete.
 +            GC.KeepAlive(rooted);
 +            rooted = null;
-+            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +
 +            context = null;
 +            return weakRef;
 +        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunSiblingProtocol()
++        private static async Task RunSiblingProtocol()
 +        {
 +            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
@@ -1426,7 +1438,7 @@ index 000000000..5810bdfb4
 +            contextA.Unload();
 +            if (ProtocolActive)
 +            {
-+                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(contextA, 10));
 +            }
 +            else
 +            {
@@ -1445,7 +1457,7 @@ index 000000000..5810bdfb4
 +                GC.KeepAlive(typeB);
 +                typeB = null;
 +                asmB = null;
-+                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(contextB, 10));
 +            }
 +            else
 +            {
@@ -1462,7 +1474,7 @@ index 000000000..5810bdfb4
 +        // (all-or-nothing): while the object is rooted the force must report NotQuiescent and free
 +        // nothing (the object stays fully usable); once unrooted, the same force must complete.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunRootedCrossGenericProtocol()
++        private static async Task RunRootedCrossGenericProtocol()
 +        {
 +            var contextA = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var contextB = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
@@ -1485,7 +1497,7 @@ index 000000000..5810bdfb4
 +                // Unroot; with the shared witness dead the same force must now complete.
 +                GC.KeepAlive(crossPair);
 +                crossPair = null;
-+                Assert.Equal(Completed, ForceUntilCompleted(contextA, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(contextA, 10));
 +            }
 +            else
 +            {
@@ -1498,7 +1510,7 @@ index 000000000..5810bdfb4
 +            contextB.Unload();
 +            if (ProtocolActive)
 +            {
-+                Assert.Equal(Completed, ForceUntilCompleted(contextB, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(contextB, 10));
 +            }
 +            else
 +            {
@@ -1509,80 +1521,82 @@ index 000000000..5810bdfb4
 +            GC.KeepAlive(contextB);
 +        }
 +
-+        // One pointer-free witness phase (see ForcedUnload_RootedPointerFreeObjects_BlockNativeFree).
-+        // The probe is the ONLY intentional root into the collectible ALC: every other collectible
-+        // reference (assembly, Type wrappers, creation temporaries) is confined to the loader
-+        // helper's frame, whose stale interpreter slots ScrubStaleInterpreterSlots (run by every
-+        // GcQuiesce) deterministically zeroes before each collection.
++        // One heap-rooted pointer-free witness phase (phases 1 and 2 of
++        // ForcedUnload_RootedPointerFreeObjects_BlockNativeFree). Non-vacuity is established
++        // DIFFERENTIALLY, with a control context, not by waiting for the probe context's own
++        // wrapper objects to die:
 +        //
-+        // That scrub is ASSERTED, not assumed: the helper hands back weak references to its
-+        // Assembly and Type wrappers, and the protocol below refuses to treat any NotQuiescent
-+        // result as evidence until both are observed dead. Without that gate a surviving wrapper
-+        // would keep the witness alive on pre-fix code too, and the test would stay green while the
-+        // regression it exists to catch returned.
++        //   WHY THE OLD WRAPPER GATE COULD NEVER OPEN (CI: it failed in every run that carried
++        //   it). A manager's reflection caches are managed arrays reachable from
++        //   LoaderAllocator.m_hashes - mono_weak_hash_table stores its keys and values in
++        //   object[] holders published into m_hashes, so every cached wrapper (the
++        //   RuntimeAssembly and RuntimeType objects the loader created) is STRONGLY reachable
++        //   from the LoaderAllocator. That is by design: the cache must live exactly as long as
++        //   the manager. But with the sgen fix in place, the rooted probe reports its vtable's
++        //   class object at every scan and keeps the LoaderAllocator alive - and the
++        //   LoaderAllocator keeps the wrappers alive. Post-fix, "probe rooted" IMPLIES "wrappers
++        //   alive": gating the red assertions on wrapper death was waiting for a condition the
++        //   fix itself makes impossible.
++        //
++        //   THE CONTROL. The control context runs the byte-identical loader shape - same load,
++        //   same reflection touches, same probe creation, same unload - except the probe is
++        //   dropped inside the helper instead of returned. Its force must reach Completed:
++        //   that empirically proves that, in this exact shape and current ambient state,
++        //   nothing environmental (stale conservative slots, caches, finalization backlog)
++        //   roots the witnesses once user references are gone. Only then is the probe context's
++        //   sustained refusal attributable to the single differing bit - probe retention.
++        //   Pre-fix, the probe does not root the witness, so the probe context behaves exactly
++        //   like the control and the first red-loop force returns Completed: a deterministic
++        //   red, conditioned on a gate that can actually open.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static async Task RunPointerFreeWitnessProtocol(bool losArray)
 +        {
-+            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextControl = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextProbe = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakProbe = new WeakReference[1];
-+            var weakWrappers = new WeakReference[2];
-+            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray, weakProbe, weakWrappers);
++
++            LoadUnloadDroppingProbe(contextControl, losArray);
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(contextProbe, losArray, weakProbe);
 +
 +            if (!ProtocolActive)
 +            {
 +                // Opt-in off or threads-enabled runtime: rejected regardless of roots, nothing
 +                // freed, the probe untouched.
 +                GcQuiesce();
-+                Assert.Equal(Rejected, Force(context));
++                Assert.Equal(Rejected, Force(contextControl));
++                Assert.Equal(Rejected, Force(contextProbe));
 +                AssertPointerFreeProbeUsable(rooted, losArray);
 +                GC.KeepAlive(rooted);
 +                return;
 +            }
 +
-+            // NON-VACUITY GATE. The loader helper's RuntimeAssembly and Type wrappers each carry an
-+            // m_keepalive edge to the same collectible LoaderAllocator, and the interpreter
-+            // conservatively scans the stale frame slots they left behind. Until BOTH are provably
-+            // dead, a NotQuiescent result says nothing about the pointer-free probe: a surviving
-+            // wrapper produces exactly the same result on pre-fix code, and the differently shaped
-+            // ForceUntilCompleted call tree below would then scrub it and report Completed — the
-+            // whole test passing without ever exercising the regression.
-+            //
-+            // So: scrub first, observe the death, and only then treat a refusal as evidence.
-+            // GcQuiesce's ScrubStaleInterpreterSlots zeroes the popped frames' slots before every
-+            // collection, so the wrappers die deterministically at the first scrubbed collection —
-+            // retries and the event-loop turn (which lets the scheduled background GC/finalizer
-+            // pump run, as DrainRetiredScoutsAsync does) remain only as belt-and-braces.
-+            for (int attempt = 0; attempt < 20 && (weakWrappers[0].IsAlive || weakWrappers[1].IsAlive); attempt++)
-+            {
-+                GcQuiesce();
-+                Assert.Equal(NotQuiescent, Force(context));
-+                await Task.Delay(1);
-+            }
++            // NON-VACUITY GATE: the control (identical shape, probe dropped) must complete.
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextControl, 20));
 +
-+            Assert.False(weakWrappers[0].IsAlive,
-+                "The loader helper's RuntimeAssembly wrapper must die before a refusal can be attributed to the pointer-free probe — otherwise this test is vacuous.");
-+            Assert.False(weakWrappers[1].IsAlive,
-+                "The loader helper's Type wrapper must die before a refusal can be attributed to the pointer-free probe — otherwise this test is vacuous.");
-+
-+            // THE RED ASSERTION. Every other root into the collectible ALC is now provably gone, so
-+            // the probe's class-object report is the ONLY thing that can keep the witness alive.
-+            // Pre-fix, phase 1's LOS array never rooted the witness at any collection, so these
-+            // forces returned Completed while the array was still rooted.
++            // THE RED ASSERTION. The environment demonstrably lets this shape's witnesses die
++            // (the control just completed), so the probe's class-object report is the only
++            // thing that can keep the probe context's witness alive. Pre-fix these forces
++            // returned Completed while the probe was still rooted. Each attempt runs after a
++            // fresh event-loop dispatch, the same footing the control's wait used.
 +            for (int attempt = 0; attempt < 10; attempt++)
 +            {
 +                GcQuiesce();
-+                Assert.Equal(NotQuiescent, Force(context));
++                Assert.Equal(NotQuiescent, Force(contextProbe));
++                await Task.Delay(1);
 +            }
 +
 +            // Nothing was freed: the probe stays fully usable through its collectible vtable.
 +            AssertPointerFreeProbeUsable(rooted, losArray);
-+            Assert.Equal(NotQuiescent, Force(context));
++            Assert.Equal(NotQuiescent, Force(contextProbe));
 +
 +            // Release the probe; the same force must now complete and stay an idempotent no-op.
++            // (`rooted` is hoisted into the async state machine; nulling it clears the heap
++            // root, and any interpreter-local copies die with the current dispatch's frames at
++            // the first await inside the wait below.)
 +            GC.KeepAlive(rooted);
 +            rooted = null;
-+            Assert.Equal(Completed, ForceUntilCompleted(context, 20));
-+            Assert.Equal(Completed, Force(context));
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextProbe, 20));
++            Assert.Equal(Completed, Force(contextProbe));
 +
 +            // Post-teardown hygiene: the released probe is reclaimable, and further collections
 +            // over the survivors are clean (no dangling-vtable scans).
@@ -1590,19 +1604,41 @@ index 000000000..5810bdfb4
 +            GcQuiesce();
 +        }
 +
++        // The CONTROL loader: byte-identical shape to LoadUnloadReturningRootedPointerFreeProbe
++        // - same load, same GetType, same probe creation, same unload - but the probe is
++        // dropped on the floor. The caller requires this context's force to Complete before
++        // attributing the probe context's refusals to the probe.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void LoadUnloadDroppingProbe(AssemblyLoadContext context, bool losArray)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type collectibleType;
++            object probe;
++            if (losArray)
++            {
++                collectibleType = asm.GetType(PointerFreeElementName, throwOnError: true);
++                probe = Array.CreateInstance(collectibleType, PointerFreeArrayLength);
++            }
++            else
++            {
++                collectibleType = asm.GetType(PointerFreeClassName, throwOnError: true);
++                probe = Activator.CreateInstance(collectibleType);
++            }
++
++            GC.KeepAlive(probe);
++            context.Unload();
++        }
++
 +        // Loads the assembly, creates ONE pointer-free probe (a large PointerFreeElement[] in
 +        // LOS, or a small PointerFreeTestClass instance in the nursery), unloads, and returns
-+        // only the probe boxed in a default-ALC object[] — so no ALC-typed local, wrapper or
++        // only the probe boxed in a default-ALC object[] - so no ALC-typed local, wrapper or
 +        // temporary survives in the caller's frame. weakProbe[0] observes the probe's death
 +        // after release.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static object[] LoadUnloadReturningRootedPointerFreeProbe(
-+            AssemblyLoadContext context, bool losArray, WeakReference[] weakProbe, WeakReference[] weakWrappers)
++            AssemblyLoadContext context, bool losArray, WeakReference[] weakProbe)
 +        {
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
-+            // One Type local shared by both shapes: every collectible-typed local left in this frame
-+            // is a slot the conservative interpreter scan can keep alive, and each one the caller
-+            // has to prove dead before a NotQuiescent result means anything.
 +            Type collectibleType;
 +            object probe;
 +            if (losArray)
@@ -1617,63 +1653,80 @@ index 000000000..5810bdfb4
 +            }
 +
 +            weakProbe[0] = new WeakReference(probe);
-+            // Both wrappers carry an m_keepalive edge to the same collectible LoaderAllocator, so
-+            // the caller must observe their death before attributing a refusal to the probe.
-+            weakWrappers[0] = new WeakReference(asm);
-+            weakWrappers[1] = new WeakReference(collectibleType);
++            GC.KeepAlive(collectibleType);
 +            context.Unload();
 +            return new object[] { probe };
 +        }
 +
-+        // Phase 3 — the conservative LOS pin path (sgen_los_pin_objects), mutation-specific by
-+        // construction. The LOS probe's ONLY strong root is the `probe` IL local of THIS frame:
-+        //   * The method is deliberately SYNCHRONOUS — an async method would lift `probe` into a
-+        //     heap-allocated state machine field, turning the root into a precise heap reference
-+        //     that reaches the object through the major drain instead of the pin queue.
-+        //   * The loader helper hands the array back as its direct return value, never boxed
-+        //     into any heap container, and the interpreter scans this live frame's slot
-+        //     conservatively, so at every collection the array enters the collector exclusively
-+        //     through the conservative pin queue: sgen_los_pin_objects pins it and — with the
-+        //     fix — enqueues it for scanning. The major drain's LOS branch cannot substitute
-+        //     (it skips objects the pin stage already marked pinned), so reverting the
-+        //     sgen_los_pin_objects hunk uniquely makes the witness die here and the force
-+        //     Complete while the array is still pinned-live — the red assertion.
-+        //   * GcQuiesce's ScrubStaleInterpreterSlots only overwrites POPPED frames above this
-+        //     one, so the live `probe` slot is untouched — and, conversely, no stale slot from
-+        //     the loader can masquerade as the root.
++        // Phase 3 - the conservative LOS pin path (sgen_los_pin_objects), mutation-specific by
++        // construction, with the same control-context non-vacuity gate as phases 1/2. The path
++        // claim only concerns the RED LOOP's collections, during which the probe's only strong
++        // root is an interpreter frame slot:
++        //   * The red loop runs in a SYNCHRONOUS NoInlining helper - an async frame would lift
++        //     the probe into a heap state-machine field, turning the root into a precise heap
++        //     reference that reaches the object through the major drain instead of the pin
++        //     queue. interp_mark_stack scans interpreter slots only in the non-precise pass, so
++        //     a live frame slot enters the collector exclusively through the conservative pin
++        //     queue.
++        //   * The probe is copied into a plain local and the state-machine field is nulled
++        //     BEFORE the helper runs, so during the red loop no precise heap root exists.
++        //     (Release builds keep un-awaited locals as real interpreter slots; a Debug build
++        //     would hoist them and soften the path specificity, not the correctness.)
++        //   * The drain branch cannot substitute for the pin path: it skips objects the pin
++        //     stage already marked pinned. Reverting the sgen_los_pin_objects hunk therefore
++        //     uniquely makes the witness die here and the force Complete while the array is
++        //     pinned-live - the red assertion.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunConservativelyPinnedLosWitnessProtocol()
++        private static async Task RunConservativelyPinnedLosWitnessProtocol()
 +        {
-+            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextControl = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var contextProbe = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakProbe = new WeakReference[1];
-+            var weakWrappers = new WeakReference[2];
-+            object probe = LoadUnloadReturningStackRootedLosProbe(context, weakProbe, weakWrappers);
++
++            LoadUnloadDroppingProbe(contextControl, losArray: true);
++            object probe = LoadUnloadReturningStackRootedLosProbe(contextProbe, weakProbe);
 +
 +            if (!ProtocolActive)
 +            {
 +                GcQuiesce();
-+                Assert.Equal(Rejected, Force(context));
++                Assert.Equal(Rejected, Force(contextControl));
++                Assert.Equal(Rejected, Force(contextProbe));
 +                Assert.Equal(PointerFreeArrayLength, ((Array)probe).Length);
 +                GC.KeepAlive(probe);
 +                return;
 +            }
 +
-+            // Same non-vacuity gate as RunPointerFreeWitnessProtocol: the loader's wrappers must
-+            // be provably dead before a refusal can be attributed to the pinned probe.
-+            for (int attempt = 0; attempt < 20 && (weakWrappers[0].IsAlive || weakWrappers[1].IsAlive); attempt++)
-+            {
-+                GcQuiesce();
-+                Assert.Equal(NotQuiescent, Force(context));
-+            }
++            // NON-VACUITY GATE, as in phases 1/2. While this waits, the probe is heap-rooted
++            // through the async state machine - harmless: the pin-path claim only concerns the
++            // red loop below, and an object does not remember how it was reached.
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextControl, 20));
 +
-+            Assert.False(weakWrappers[0].IsAlive,
-+                "The loader helper's RuntimeAssembly wrapper must die before a refusal can be attributed to the conservatively pinned probe — otherwise this phase is vacuous.");
-+            Assert.False(weakWrappers[1].IsAlive,
-+                "The loader helper's Type wrapper must die before a refusal can be attributed to the conservatively pinned probe — otherwise this phase is vacuous.");
++            // Move the probe's only root onto the interpreter stack: `stackProbe` is never
++            // used across an await, so it stays a real frame slot; nulling `probe` clears the
++            // state-machine field (the heap root).
++            object stackProbe = probe;
++            probe = null;
++            AssertConservativelyPinnedProbeBlocksForce(contextProbe, stackProbe);
++            GC.KeepAlive(stackProbe);
++            stackProbe = null;
 +
-+            // THE RED ASSERTION for the pin path: the conservatively pinned pointer-free array is
-+            // the only root left, so only sgen_los_pin_objects' enqueue can keep the witness
-+            // alive. Without it these forces return Completed while the array is pinned-live.
++            // Release wait: the awaits re-dispatch this continuation on fresh frames, so no
++            // interpreter-local copy of the probe survives into these collections.
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(contextProbe, 20));
++            Assert.Equal(Completed, Force(contextProbe));
++
++            CollectAndAssertDead(weakProbe);
++            GcQuiesce();
++        }
++
++        // THE RED LOOP for the conservative pin path. `probe`'s only strong root is this
++        // frame's parameter slot (plus the caller's un-hoisted local): at every collection the
++        // array enters the collector exclusively through the conservative pin queue, so only
++        // the sgen_los_pin_objects enqueue can keep the witness alive. Without it these forces
++        // return Completed while the array is pinned-live.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void AssertConservativelyPinnedProbeBlocksForce(AssemblyLoadContext context, object probe)
++        {
 +            for (int attempt = 0; attempt < 10; attempt++)
 +            {
 +                GcQuiesce();
@@ -1683,43 +1736,33 @@ index 000000000..5810bdfb4
 +            // Nothing was freed: the pinned array stays usable through its collectible vtable.
 +            Assert.Equal(PointerFreeArrayLength, ((Array)probe).Length);
 +            Assert.Equal(NotQuiescent, Force(context));
-+
-+            // Release the only root; the same force must now complete and stay idempotent.
 +            GC.KeepAlive(probe);
-+            probe = null;
-+            Assert.Equal(Completed, ForceUntilCompleted(context, 20));
-+            Assert.Equal(Completed, Force(context));
-+
-+            CollectAndAssertDead(weakProbe);
-+            GcQuiesce();
 +        }
 +
 +        // Loads the assembly, creates the LOS pointer-free array probe, unloads, and returns the
-+        // array DIRECTLY — the caller's IL local becomes its only strong root (no object[] box:
-+        // a heap container would add a precise reference and reroute the reach through the major
-+        // drain instead of the conservative pin queue). Wrapper weak references as in
-+        // LoadUnloadReturningRootedPointerFreeProbe.
++        // array DIRECTLY - never boxed into any heap container, so the caller controls exactly
++        // which root (state-machine field vs. interpreter slot) keeps it alive at each stage.
++        // weakProbe[0] observes the probe's death after release.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static object LoadUnloadReturningStackRootedLosProbe(
-+            AssemblyLoadContext context, WeakReference[] weakProbe, WeakReference[] weakWrappers)
++            AssemblyLoadContext context, WeakReference[] weakProbe)
 +        {
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
 +            Type elementType = asm.GetType(PointerFreeElementName, throwOnError: true);
 +            object probe = Array.CreateInstance(elementType, PointerFreeArrayLength);
 +
 +            weakProbe[0] = new WeakReference(probe);
-+            weakWrappers[0] = new WeakReference(asm);
-+            weakWrappers[1] = new WeakReference(elementType);
++            GC.KeepAlive(elementType);
 +            context.Unload();
 +            return probe;
 +        }
 +
 +        // Usability probes for the rooted pointer-free object. GetType() goes through the
 +        // (collectible) vtable, so this doubles as a liveness check of the probe's runtime
-+        // structures after a refused force. Runs in its own frame: the RuntimeType wrappers it
-+        // materializes root the witness while alive, and must never occupy the caller's slots
-+        // across the release+force below (GcQuiesce's deterministic scrub zeroes this frame's
-+        // stale region once it is popped, as everywhere else in this suite).
++        // structures after a refused force. Runs in its own frame so the RuntimeType wrappers
++        // it materializes never occupy the caller's slots across the release+force below; the
++        // release wait's event-loop re-dispatch guarantees this frame's residue is out of the
++        // scanned live region by the time those collections run.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void AssertPointerFreeProbeUsable(object[] rooted, bool losArray)
 +        {
@@ -1734,13 +1777,14 @@ index 000000000..5810bdfb4
 +            }
 +        }
 +
++
 +        // Object-wide tombstone: after a Completed force the stale native ALC pointer must never
 +        // reach an icall again. Every managed consumer funnels through the NativeALC getter, so an
 +        // ordinary API call (the LoadFromAssemblyName -> RuntimeAssembly.InternalLoad path has no
 +        // VerifyIsAlive check of its own) must reject deterministically in managed code with
 +        // ObjectDisposedException instead of forwarding freed native storage.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void RunTombstoneProtocol()
++        private static async Task RunTombstoneProtocol()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            ExerciseAndUnload(context);
@@ -1756,7 +1800,7 @@ index 000000000..5810bdfb4
 +                return;
 +            }
 +
-+            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +
 +            // A successful force followed by an ordinary API call must reject in managed code.
 +            Assert.Throws<ObjectDisposedException>(
@@ -1854,7 +1898,7 @@ index 000000000..5810bdfb4
 +        // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
 +        // it until a Completed force regardless (see LoadExerciseUnloadAndForce).
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void ReflectionHashInitUnderPressureCycle(int seed)
++        private static async Task ReflectionHashInitUnderPressureCycle(int seed)
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +
@@ -1862,7 +1906,7 @@ index 000000000..5810bdfb4
 +
 +            if (ProtocolActive)
 +            {
-+                Assert.Equal(Completed, ForceUntilCompleted(context, 10));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +            }
 +            else
 +            {
