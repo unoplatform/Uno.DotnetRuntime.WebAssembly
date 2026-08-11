@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Nick Randolph <noreply@platform.uno>
-Date: Wed, 5 Aug 2026 00:00:00 +0000
+Date: Wed, 12 Aug 2026 00:00:00 +0000
 Subject: [PATCH] feat: reclaim jiterpreter WASM function-table slots on forced
  ALC unload
 
@@ -34,6 +34,19 @@ upstream monotonic one.
     mono_jiterp_free_method_data) on forced unload, and by
     interp_free_method for dynamic methods. That callback now offers
     the recorded slot back to the runtime.
+  * No-trace sentinel: mono_jiterp_free_method_data calls
+    mono_wasm_free_method_data once with a sentinel index when a
+    method has no trace entry points, purely to drain the general JIT
+    queues. That sentinel was 0 -- but trace indexes are allocated
+    from zero, so 0 aliases a real trace that typically belongs to a
+    live default-ALC method. Upstream that only dropped the wrong
+    traceInfo entry; with slot reclamation it would also hand a LIVE
+    table slot back to the allocator, after which the still-live call
+    site would dispatch to whichever trace was installed next. The
+    sentinel is now -1, every traceInfo/slot operation is guarded on
+    traceIndex >= 0, and the sweep counts each sentinel pass in a
+    monotonic diagnostic so the lifecycle tests can prove the branch
+    executed.
   * New EMSCRIPTEN_KEEPALIVE mono_jiterp_free_table_entry(type, index)
     (jiterpreter.c, crossing the boundary via cwraps like the existing
     mono_jiterp_allocate_table_entry): validates that the index is a
@@ -65,22 +78,33 @@ upstream monotonic one.
     icall InternalGetJiterpreterTableStat (on the same internal type
     as InternalForceNativeUnload; returns -1 whenever reclamation is
     unavailable or not opted in, so the surface is as dark as the
-    feature) exposes per-table {fresh next_index allocations, current
-    free count, monotonic total-freed, monotonic total-reused}. New
-    JiterpreterTableReclamationTests drive repeated
-    load / hot-loop / unload / force cycles against a trace-bait
-    method added to the loader test assembly (pure int arithmetic,
-    well above the 5000 hit-count threshold; trace compilation is
-    synchronous at the threshold on the single-threaded runtime) and
-    assert (a) every cycle's forced unload increases total-freed and
-    (b) released slots are consumed by later allocations
-    (total-reused increases). The assertions intentionally use the
-    monotonic counters, NOT an exact next_index plateau: trace entry
-    points in default-ALC code (CoreLib/xunit) accumulate hit counts
-    across cycles and can compile at unpredictable moments, so a
-    plateau assertion would be flaky while the counter assertions
-    cannot be. With the flag off the tests assert the surface stays
-    dark (stats -1, force Rejected) -- the zero-change guarantee.
+    feature) exposes per-table {successful fresh allocations (a
+    dedicated counter -- next_index advances before the allocator's
+    bounds check, so deriving the stat from it would count failed
+    allocations and could read negative on an untouched table),
+    current free count, monotonic total-freed, monotonic total-reused,
+    monotonic no-trace sentinel sweeps}. JiterpreterTableReclamationTests
+    drive repeated load / hot-loop / unload / force cycles against a
+    trace-bait method added to the loader test assembly (pure int
+    arithmetic, well above the 5000 hit-count threshold; trace
+    compilation is synchronous at the threshold on the single-threaded
+    runtime): after warm-up cycles seed the free set and drain the
+    harness's one-time compilations, every measured cycle must
+    increase total-freed AND total-reused, and the window's NET
+    capacity consumption (fresh + reused allocations minus releases)
+    must stay below one slot per cycle -- an identity that is
+    independent of free-set buffering, so a sweep that leaks even one
+    slot category per cycle fails it while bounded one-time
+    default-ALC compilations do not. A separate regression proves the
+    no-trace sentinel sweep is exercised for real: it invokes a
+    deliberately jiterpreter-ineligible collectible method once
+    (creating an InterpMethod in the collectible memory manager
+    without any trace entry points), asserts the sentinel-sweep
+    counter moved during the forced unload, and asserts total-freed
+    did not -- with the old 0 sentinel that sweep would have released
+    the live trace-0 slot of a default-ALC method. With the flag off
+    the tests assert the surface stays dark (stats -1, force Rejected)
+    -- the zero-change guarantee.
 
 SCOPE / still not covered: only JITERPRETER_TABLE_TRACE slots are ever
 released (the sweep only knows trace ownership). The jit-call and
@@ -94,37 +118,26 @@ for default consumers.
 
 Fixes https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 Refs dotnet/runtime#89980.
-
- * No-trace sentinel: mono_jiterp_free_method_data calls
- *   mono_wasm_free_method_data once with a sentinel index when a method has no
- *   trace entry points, purely to drain the general JIT queues. That sentinel was
- *   0 -- but trace indexes are allocated from zero, so 0 aliases a real trace that
- *   typically belongs to a live default-ALC method. Upstream that only dropped the
- *   wrong traceInfo entry; with slot reclamation it would also hand a LIVE table
- *   slot back to the allocator, after which the still-live call site would dispatch
- *   to whichever trace was installed next. The sentinel is now -1 and every
- *   traceInfo/slot operation is guarded on traceIndex >= 0.
-
 ---
  .../tests/ForcedNativeUnloadTests.cs          |  15 +-
- .../tests/JiterpreterTableReclamationTests.cs | 304 ++++++++++++++++++
- .../TestClass.cs                              |  34 ++
+ .../tests/JiterpreterTableReclamationTests.cs | 440 ++++++++++++++++++
+ .../TestClass.cs                              |  46 ++
  .../tests/System.Runtime.Loader.Tests.csproj  |   1 +
- .../Loader/AssemblyLoadContext.Mono.cs        |  16 +
+ .../Loader/AssemblyLoadContext.Mono.cs        |  17 +
  src/mono/browser/runtime/cwraps.ts            |   3 +
- src/mono/browser/runtime/jiterpreter.ts       |  22 +-
+ src/mono/browser/runtime/jiterpreter.ts       |  36 +-
  .../mono/metadata/assembly-load-context.c     |  31 ++
  src/mono/mono/metadata/icall-def.h            |   1 +
  src/mono/mono/mini/interp/interp.c            |  20 +-
- src/mono/mono/mini/interp/jiterpreter.c       | 133 ++++++++
- 11 files changed, 559 insertions(+), 21 deletions(-)
+ src/mono/mono/mini/interp/jiterpreter.c       | 173 ++++++-
+ 11 files changed, 759 insertions(+), 24 deletions(-)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index efaaffd..89b4c64 100644
+index a30a5a290..60708a1b5 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -174,16 +174,11 @@ namespace System.Runtime.Loader.Tests
+@@ -196,16 +196,11 @@ private static async Task<int> ForceUntilCompletedAsync(AssemblyLoadContext cont
              return outcome;
          }
  
@@ -144,14 +157,14 @@ index efaaffd..89b4c64 100644
 +        // by JiterpreterTableReclamationTests via the GetJiterpreterTableStat diagnostic bridge.
 +        // This suite keeps asserting the teardown protocol only.
          [Fact]
-         public void RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
+         public async Task RepeatedForcedUnload_DoesNotCrash_IsIdempotent_AndAlcIsCollectible()
          {
 diff --git a/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 new file mode 100644
-index 0000000..e9abe36
+index 000000000..62275c790
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
-@@ -0,0 +1,365 @@
+@@ -0,0 +1,440 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -174,23 +187,33 @@ index 0000000..e9abe36
 +    ///
 +    /// Measurement goes through the diagnostic bridge AssemblyLoadContext.GetJiterpreterTableStat
 +    /// (table, kind), which surfaces per-table counters from the native allocator:
-+    ///   kind 0 = fresh slots handed out by advancing next_index (excludes reused slots)
++    ///   kind 0 = fresh slots successfully handed out (monotonic; excludes reused slots AND
++    ///            failed allocations — a dedicated counter, never derived from next_index)
 +    ///   kind 1 = slots currently sitting on the free set
 +    ///   kind 2 = total slots ever released (monotonic)
 +    ///   kind 3 = total released slots ever reused by the allocator (monotonic)
++    ///   kind 4 = no-trace sentinel sweeps (monotonic; methods freed without any trace entry
++    ///            points — table-agnostic, queried via the trace table)
 +    /// The bridge returns -1 whenever slot reclamation is unavailable (non-browser runtime,
 +    /// threads-enabled build) or the opt-in flag is absent, so the surface is as dark by default
 +    /// as the feature itself — which the tests assert too.
 +    ///
 +    /// Determinism: the assertions deliberately avoid an exact next_index plateau. Trace entry
 +    /// points in default-ALC code (CoreLib, xunit) accumulate hit counts across cycles and can
-+    /// cross the compile threshold at unpredictable moments, so next_index may legitimately
-+    /// creep. Instead the tests assert the two facts that cannot be timing-dependent on the
-+    /// single-threaded runtime (where trace compilation is synchronous at the hit threshold):
++    /// cross the compile threshold at unpredictable moments, so fresh allocations may
++    /// legitimately creep by a bounded amount. Instead the tests assert facts that cannot be
++    /// timing-dependent on the single-threaded runtime (where trace compilation is synchronous
++    /// at the hit threshold):
 +    ///   * every forced-unload cycle of a context that provably compiled a trace increases the
-+    ///     monotonic total-freed counter (the release happened), and
-+    ///   * after slots have been released, a later allocation consumes one (the monotonic
-+    ///     total-reused counter moves), because the allocator always prefers the free set.
++    ///     monotonic total-freed counter (the release happened),
++    ///   * once slots have been released, every later cycle's allocations consume the free set
++    ///     first (the monotonic total-reused counter moves each measured cycle), and
++    ///   * across the whole measured window, NET table-capacity consumption
++    ///     (fresh + reused allocations, minus releases) stays below one slot per cycle. This
++    ///     identity is buffer-independent: an unload sweep that misses even one slot category
++    ///     consumes at least one net slot EVERY cycle no matter how large the free set is, while
++    ///     a correct sweep's net consumption is only the one-time default-ALC compilations that
++    ///     are live by design — drained by the warm-up cycles before the window opens.
 +    /// </summary>
 +    [Collection(nameof(DisableParallelization))]
 +    public class JiterpreterTableReclamationTests
@@ -206,6 +229,7 @@ index 0000000..e9abe36
 +        private const int StatFreeCount = 1;
 +        private const int StatTotalFreed = 2;
 +        private const int StatTotalReused = 3;
++        private const int StatNoTraceSweeps = 4;
 +
 +        // Outcome codes; MUST match AssemblyLoadContext.ForceNativeUnloadResult.
 +        private const int Completed = 0;
@@ -311,6 +335,7 @@ index 0000000..e9abe36
 +                Assert.Equal(-1, TraceStat(StatFreeCount));
 +                Assert.Equal(-1, TraceStat(StatTotalFreed));
 +                Assert.Equal(-1, TraceStat(StatTotalReused));
++                Assert.Equal(-1, TraceStat(StatNoTraceSweeps));
 +                return;
 +            }
 +
@@ -319,11 +344,13 @@ index 0000000..e9abe36
 +            int free = TraceStat(StatFreeCount);
 +            int totalFreed = TraceStat(StatTotalFreed);
 +            int totalReused = TraceStat(StatTotalReused);
++            int noTraceSweeps = TraceStat(StatNoTraceSweeps);
 +
 +            Assert.True(fresh >= 0, $"fresh allocation count must be available with the opt-in active (got {fresh})");
 +            Assert.True(free >= 0, $"free count must be available with the opt-in active (got {free})");
 +            Assert.True(totalFreed >= 0, $"total-freed must be available with the opt-in active (got {totalFreed})");
 +            Assert.True(totalReused >= 0, $"total-reused must be available with the opt-in active (got {totalReused})");
++            Assert.True(noTraceSweeps >= 0, $"no-trace sweep count must be available with the opt-in active (got {noTraceSweeps})");
 +
 +            // Only distinct previously-allocated slots can sit on the free set, and every reuse
 +            // consumed a prior release.
@@ -348,37 +375,73 @@ index 0000000..e9abe36
 +                return;
 +            }
 +
-+            const int Cycles = 3;
-+            int reusedAtStart = TraceStat(StatTotalReused);
-+            var refs = new WeakReference[Cycles];
++            // Warm-up cycles are not measured: they let the collectible workload seed the free
++            // set AND let the surrounding harness paths (xunit dispatch, reflection invoke) cross
++            // their one-time trace compile thresholds, so the measured window below sees only the
++            // steady state. Each warm-up unload must still release at least one slot — that is
++            // this feature's core promise and needs no steady state.
++            const int WarmupCycles = 2;
++            const int MeasuredCycles = 4;
++            var refs = new WeakReference[WarmupCycles + MeasuredCycles];
 +
-+            for (int i = 0; i < Cycles; i++)
++            for (int i = 0; i < WarmupCycles; i++)
 +            {
 +                int freedBefore = TraceStat(StatTotalFreed);
 +                refs[i] = LoadRunHotLoopUnloadAndForce();
-+                int freedAfter = TraceStat(StatTotalFreed);
-+
-+                // The hot loop provably crossed the trace compile threshold inside the
-+                // collectible assembly (compilation is synchronous on this runtime), so the
-+                // forced teardown must have released at least one trace-table slot. total-freed
-+                // is monotonic, so no concurrent allocation can mask the release.
-+                Assert.True(freedAfter > freedBefore,
-+                    $"cycle {i}: the forced unload must release at least one jiterpreter trace-table slot " +
-+                    $"(totalFreed before={freedBefore} after={freedAfter}, fresh={TraceStat(StatFreshAllocated)}, " +
++                Assert.True(TraceStat(StatTotalFreed) > freedBefore,
++                    $"warm-up cycle {i}: the forced unload must release at least one jiterpreter trace-table slot " +
++                    $"(totalFreed before={freedBefore} after={TraceStat(StatTotalFreed)}, fresh={TraceStat(StatFreshAllocated)}, " +
 +                    $"free={TraceStat(StatFreeCount)}, totalReused={TraceStat(StatTotalReused)}). " +
 +                    "If totalFreed did not move, either no trace was compiled for the hot loop (jiterpreter disabled in this host?) " +
 +                    "or the unload sweep failed to release the trace's slot.");
 +            }
 +
-+            // Reuse: after the first cycle released slot(s), the free set was non-empty, and the
-+            // allocator always prefers it — so the later cycles' guaranteed trace compilations
-+            // (or any interleaved allocation) must have consumed released slots. total-reused is
-+            // monotonic, making this deterministic without asserting an exact plateau.
-+            int reusedAtEnd = TraceStat(StatTotalReused);
-+            Assert.True(reusedAtEnd > reusedAtStart,
-+                $"released trace-table slots must be reused by later allocations before fresh capacity is consumed " +
-+                $"(totalReused start={reusedAtStart} end={reusedAtEnd}, fresh={TraceStat(StatFreshAllocated)}, " +
-+                $"free={TraceStat(StatFreeCount)}, totalFreed={TraceStat(StatTotalFreed)}).");
++            int freshAtStart = TraceStat(StatFreshAllocated);
++            int reusedAtStart = TraceStat(StatTotalReused);
++            int freedAtStart = TraceStat(StatTotalFreed);
++
++            for (int i = 0; i < MeasuredCycles; i++)
++            {
++                int freedBefore = TraceStat(StatTotalFreed);
++                int reusedBefore = TraceStat(StatTotalReused);
++                refs[WarmupCycles + i] = LoadRunHotLoopUnloadAndForce();
++
++                // The hot loop provably crossed the trace compile threshold inside the
++                // collectible assembly (compilation is synchronous on this runtime), so the
++                // forced teardown must have released at least one trace-table slot. total-freed
++                // is monotonic, so no concurrent allocation can mask the release.
++                Assert.True(TraceStat(StatTotalFreed) > freedBefore,
++                    $"cycle {i}: the forced unload must release at least one jiterpreter trace-table slot " +
++                    $"(totalFreed before={freedBefore} after={TraceStat(StatTotalFreed)}, fresh={TraceStat(StatFreshAllocated)}, " +
++                    $"free={TraceStat(StatFreeCount)}, totalReused={TraceStat(StatTotalReused)}).");
++
++                // The previous cycle's sweep left the free set non-empty and the allocator always
++                // prefers it, so this cycle's guaranteed trace compilation must have consumed a
++                // released slot — every measured cycle, not just once per run.
++                Assert.True(TraceStat(StatTotalReused) > reusedBefore,
++                    $"cycle {i}: released trace-table slots must be reused before fresh capacity is consumed " +
++                    $"(totalReused before={reusedBefore} after={TraceStat(StatTotalReused)}, fresh={TraceStat(StatFreshAllocated)}, " +
++                    $"free={TraceStat(StatFreeCount)}, totalFreed={TraceStat(StatTotalFreed)}).");
++            }
++
++            // Steady-state conservation: net table-capacity consumption of the measured window is
++            //   (fresh allocations + reuses) - releases,
++            // i.e. allocations the window performed minus slots its sweeps returned. This bound is
++            // what actually forbids the linear leak: the identity is independent of how large the
++            // free set happened to be, so a sweep that misses even one slot per cycle consumes at
++            // least one NET slot per cycle no matter the buffering, totaling >= MeasuredCycles.
++            // A correct sweep returns every collectible-owned slot, leaving only the bounded
++            // one-time default-ALC compilations (live by design, already drained by warm-up), so
++            // strictly-below-one-per-cycle is the tightest sound bound this allocator supports.
++            int freshDelta = TraceStat(StatFreshAllocated) - freshAtStart;
++            int reusedDelta = TraceStat(StatTotalReused) - reusedAtStart;
++            int freedDelta = TraceStat(StatTotalFreed) - freedAtStart;
++            int netConsumption = (freshDelta + reusedDelta) - freedDelta;
++            Assert.True(netConsumption < MeasuredCycles,
++                $"steady-state forced-unload cycles must not consume table capacity linearly: net consumption " +
++                $"(fresh {freshDelta} + reused {reusedDelta} - freed {freedDelta}) = {netConsumption} over " +
++                $"{MeasuredCycles} cycles (>= {MeasuredCycles} means at least one slot leaks every cycle; " +
++                $"free={TraceStat(StatFreeCount)}).");
 +
 +            // The reclamation must not have disturbed the ALC teardown itself: the forced-down
 +            // contexts stay reclaimable.
@@ -398,6 +461,7 @@ index 0000000..e9abe36
 +            Assert.Equal(-1, TraceStat(StatFreeCount));
 +            Assert.Equal(-1, TraceStat(StatTotalFreed));
 +            Assert.Equal(-1, TraceStat(StatTotalReused));
++            Assert.Equal(-1, TraceStat(StatNoTraceSweeps));
 +            GC.KeepAlive(context);
 +        }
 +
@@ -411,8 +475,12 @@ index 0000000..e9abe36
 +        /// trace-less method would have handed that live slot back to the allocator, after which the
 +        /// still-live call site would dispatch to whichever trace was installed next.
 +        /// <para>
-+        /// Unloading an ALC whose methods were never driven hot is exactly that case: every method
-+        /// takes the sentinel path and none owns a trace. Nothing may be released.
++        /// Unloading an ALC whose invoked method owns no trace is exactly that case: its
++        /// InterpMethod is swept via the sentinel path and nothing may be released. The test is
++        /// deliberately non-vacuous on both sides: the no-trace sweep counter (kind 4) must move,
++        /// proving an InterpMethod from the collectible memory manager really reached the sentinel
++        /// branch — merely loading the assembly (e.g. GetTypes) creates no InterpMethod and would
++        /// leave the sweep with nothing to do.
 +        /// </para>
 +        /// </summary>
 +        [Fact]
@@ -427,40 +495,60 @@ index 0000000..e9abe36
 +            {
 +                // Feature dark — the stats are unavailable and nothing is reclaimable anyway.
 +                Assert.Equal(-1, TraceStat(StatTotalFreed));
++                Assert.Equal(-1, TraceStat(StatNoTraceSweeps));
 +                return;
 +            }
 +
 +            int freedBefore = TraceStat(StatTotalFreed);
++            int sentinelSweepsBefore = TraceStat(StatNoTraceSweeps);
 +            Assert.True(freedBefore >= 0, $"total-freed must be available with the opt-in active (got {freedBefore})");
++            Assert.True(sentinelSweepsBefore >= 0, $"no-trace sweep count must be available with the opt-in active (got {sentinelSweepsBefore})");
 +
 +            // Asserts Completed internally, so reaching the next line proves the sweep really ran
 +            // over the unloaded ALC's methods rather than the force having been refused.
 +            LoadUnloadAndForceWithoutHotLoop();
 +
++            // Non-vacuity: at least one swept method (the invoked no-trace bait's InterpMethod at
++            // minimum) took the need_extra_free sentinel branch during the forced unload.
++            Assert.True(TraceStat(StatNoTraceSweeps) > sentinelSweepsBefore,
++                $"the forced unload must sweep the invoked trace-less method through the no-trace sentinel path " +
++                $"(noTraceSweeps before={sentinelSweepsBefore} after={TraceStat(StatNoTraceSweeps)}). " +
++                "If the counter did not move, the collectible InterpMethod never reached the sweep and this test proved nothing.");
++
++            // The regression itself: a sentinel sweep must not release anyone's slot — with the
++            // old 0 sentinel it would have released the live trace-0 slot of a default-ALC method.
 +            Assert.Equal(freedBefore, TraceStat(StatTotalFreed));
 +        }
 +
-+        // Loads the collectible assembly and unloads it WITHOUT driving the trace bait, so no trace
-+        // is ever compiled inside it and every swept method takes the no-trace sentinel path.
++        // Loads the collectible assembly and unloads it WITHOUT driving the trace bait hot, so no
++        // trace is ever compiled inside it and its swept InterpMethod takes the no-trace sentinel
++        // path.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void LoadUnloadAndForceWithoutHotLoop()
 +        {
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            TouchWithoutCompilingATrace(context);
++            InvokeWithoutCompilingATrace(context);
 +            context.Unload();
 +            Assert.Equal(Completed, ForceUntilCompleted(context, 10));
 +        }
 +
-+        // One cheap reflection touch so the assembly is really loaded and its methods really enter
-+        // the interp code hash — but far below the jiterpreter hit-count threshold, so no trace is
-+        // compiled and the sweep has only trace-less methods to free.
++        // Invokes the deliberately jiterpreter-ineligible bait exactly once. The invocation forces
++        // mono_interp_get_imethod to create an InterpMethod in the collectible memory manager's
++        // interp_code_hash — which is what the unload sweep iterates — while the method's
++        // straight-line body guarantees the transform emitted no trace entry points for it, so the
++        // sweep must take the no-trace sentinel branch for it. (Merely loading types via
++        // reflection creates no InterpMethod and would leave this test vacuous.)
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void TouchWithoutCompilingATrace(AssemblyLoadContext context)
++        private static void InvokeWithoutCompilingATrace(AssemblyLoadContext context)
 +        {
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
 +            Type type = asm.GetType(TestClassName, throwOnError: true);
 +            Assert.NotNull(type);
-+            Assert.NotEmpty(asm.GetTypes());
++            MethodInfo bait = type.GetMethod("JiterpreterNoTraceBait", BindingFlags.Public | BindingFlags.Static);
++            Assert.NotNull(bait);
++
++            object result = bait.Invoke(null, new object[] { 41 });
++            Assert.Equal(42, Assert.IsType<int>(result));
 +        }
 +
 +        private static WeakReference LoadRunHotLoopUnloadAndForce()
@@ -518,7 +606,7 @@ index 0000000..e9abe36
 +    }
 +}
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
-index 7d3bb5e..d8bc7f3 100644
+index 7d3bb5ebe..ede632a92 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 @@ -1,6 +1,7 @@
@@ -529,7 +617,7 @@ index 7d3bb5e..d8bc7f3 100644
  using System.Runtime.InteropServices;
  
  namespace System.Runtime.Loader.Tests
-@@ -35,6 +36,39 @@ namespace System.Runtime.Loader.Tests
+@@ -35,6 +36,51 @@ public static void TestDelegateMarshalling()
          public class COMClass
          {
          }
@@ -555,6 +643,18 @@ index 7d3bb5e..d8bc7f3 100644
 +            return acc;
 +        }
 +
++        // Deliberately jiterpreter-INELIGIBLE counterpart of JiterpreterHotLoop, for the
++        // no-trace sentinel-sweep regression test. Straight-line int arithmetic with no calls
++        // and no backward branches: its estimated trace value stays far below the
++        // jiterpreter-minimum-trace-value heuristic (default 18), so the interpreter transform
++        // emits NO trace entry points for it. Invoking it once therefore creates an
++        // InterpMethod in this collectible assembly's memory manager that owns no trace —
++        // exactly the shape whose unload sweep must take the no-trace sentinel path.
++        public static int JiterpreterNoTraceBait(int value)
++        {
++            return value + 1;
++        }
++
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        public static int JiterpreterHotBody(int a, int i)
 +        {
@@ -570,7 +670,7 @@ index 7d3bb5e..d8bc7f3 100644
  
      // Used to test LoaderAllocator used for a generic type instance allocation
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
-index bbdad35..09a06f1 100644
+index bbdad35cc..09a06f1b3 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Tests.csproj
 @@ -32,6 +32,7 @@
@@ -582,10 +682,10 @@ index bbdad35..09a06f1 100644
      <EmbeddedResource Include="MainStrings*.resx" />
    </ItemGroup>
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index cc30e0c..8682a15 100644
+index cc30e0cdb..bf45b0438 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -37,6 +37,7 @@ namespace System.Runtime.Loader
+@@ -37,6 +37,7 @@ internal IntPtr NativeALC
          [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
          [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
          [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
@@ -593,7 +693,7 @@ index cc30e0c..8682a15 100644
          private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
          {
              if (isCollectible)
-@@ -78,6 +79,21 @@ namespace System.Runtime.Loader
+@@ -78,6 +79,22 @@ private static void KeepLoaderAllocator()
          // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
          internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
  
@@ -602,9 +702,10 @@ index cc30e0c..8682a15 100644
 +
 +        // Diagnostic bridge for the jiterpreter function-table slot-reclamation lifecycle tests.
 +        // Mirrors mono_jiterp_get_table_stat (jiterpreter.c): `table` is a JITERPRETER_TABLE_*
-+        // value (0 = traces) and `kind` selects the statistic (0 = fresh slots allocated,
-+        // 1 = slots currently free, 2 = total slots ever released, 3 = total released slots ever
-+        // reused). Returns -1 whenever slot reclamation is unavailable (non-browser runtime,
++        // value (0 = traces) and `kind` selects the statistic (0 = fresh slots successfully
++        // handed out, 1 = slots currently free, 2 = total slots ever released, 3 = total released
++        // slots ever reused, 4 = no-trace sentinel sweeps — all monotonic except 1).
++        // Returns -1 whenever slot reclamation is unavailable (non-browser runtime,
 +        // threads-enabled build) or the MONO_WASM_ENABLE_ALC_UNLOAD opt-in is absent, so this
 +        // surface is as dark by default as the feature it observes.
 +        internal static int GetJiterpreterTableStat(int table, int kind)
@@ -616,7 +717,7 @@ index cc30e0c..8682a15 100644
          // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
          // in the native assembly-load-context.c.
 diff --git a/src/mono/browser/runtime/cwraps.ts b/src/mono/browser/runtime/cwraps.ts
-index e693c52..c02fbd7 100644
+index e693c5223..c02fbd777 100644
 --- a/src/mono/browser/runtime/cwraps.ts
 +++ b/src/mono/browser/runtime/cwraps.ts
 @@ -120,6 +120,7 @@ const fn_signatures: SigLine[] = [
@@ -637,7 +738,7 @@ index e693c52..c02fbd7 100644
      mono_jiterp_get_counter(counter: number): number;
      mono_jiterp_modify_counter(counter: number, delta: number): number;
 diff --git a/src/mono/browser/runtime/jiterpreter.ts b/src/mono/browser/runtime/jiterpreter.ts
-index 6ba17a3..09ba3a4 100644
+index 6ba17a3ab..09ba3a418 100644
 --- a/src/mono/browser/runtime/jiterpreter.ts
 +++ b/src/mono/browser/runtime/jiterpreter.ts
 @@ -1088,10 +1088,38 @@ export function mono_wasm_free_method_data (
@@ -684,7 +785,7 @@ index 6ba17a3..09ba3a4 100644
      mono_jiterp_free_method_data_interp_entry(imethod);
      mono_jiterp_free_method_data_jit_call(method);
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 382247f..206c1a6 100644
+index 382247fa9..206c1a653 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -617,6 +617,37 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
@@ -726,7 +827,7 @@ index 382247f..206c1a6 100644
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
 diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
-index 4e1a934..e4ca6f1 100644
+index 4e1a93423..e4ca6f1d6 100644
 --- a/src/mono/mono/metadata/icall-def.h
 +++ b/src/mono/mono/metadata/icall-def.h
 @@ -473,6 +473,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
@@ -738,7 +839,7 @@ index 4e1a934..e4ca6f1 100644
  HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
  HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
-index a47d812..4db8b85 100644
+index a47d81246..4db8b85bd 100644
 --- a/src/mono/mono/mini/interp/interp.c
 +++ b/src/mono/mono/mini/interp/interp.c
 @@ -3743,15 +3743,17 @@ free_imethod_jiterp_cb (gpointer value, gpointer user_data)
@@ -769,10 +870,30 @@ index a47d812..4db8b85 100644
  void
  mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
 diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
-index 887038c..86cbdc9 100644
+index 887038ca4..6e26e4499 100644
 --- a/src/mono/mono/mini/interp/jiterpreter.c
 +++ b/src/mono/mono/mini/interp/jiterpreter.c
-@@ -988,7 +988,10 @@ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
+@@ -946,6 +946,19 @@ mono_interp_tier_prepare_jiterpreter_fast (
+ 	}
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Monotonic count of no-trace sentinel sweeps: how many times the need_extra_free branch
++ * below passed -1 to mono_wasm_free_method_data because the method being freed contained
++ * no trace entry points. Exposed as kind 4 of mono_jiterp_get_table_stat so the lifecycle
++ * tests can prove the sentinel path actually executed for a swept method (an empty
++ * interp_code_hash would otherwise make the "no slot was released" assertion vacuous).
++ * Part of the DISABLE_THREADS-gated reclamation diagnostics; see the state block above
++ * mono_jiterp_free_table_entry further down.
++ */
++static gint32 jiterp_no_trace_sweep_count = 0;
++#endif
++
+ void
+ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
+ {
+@@ -988,7 +1001,13 @@ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
  	if (need_extra_free) {
  		// HACK: Perform a single free operation to clear out any stuff from the jit queues
  		// This will happen if we didn't encounter any jiterpreter traces in the method
@@ -780,11 +901,14 @@ index 887038c..86cbdc9 100644
 +		// Pass -1, NOT 0: trace indexes are allocated from zero (trace_count++), so 0 is a
 +		// real trace that very likely belongs to a live method in another (default) ALC.
 +		// The JS side treats a negative index as "no trace" and skips all per-trace work.
++#ifdef DISABLE_THREADS
++		jiterp_no_trace_sweep_count++;
++#endif
 +		mono_wasm_free_method_data (method, imethod, -1);
  	}
  }
  
-@@ -1476,6 +1479,46 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
+@@ -1476,6 +1495,55 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
  JiterpreterTableInfo tables[JITERPRETER_TABLE_LAST + 1] = { 0 };
  int mono_jiterp_first_trace_fn_ptr = 0;
  
@@ -810,6 +934,15 @@ index 887038c..86cbdc9 100644
 +static gint32 table_free_counts [JITERPRETER_TABLE_LAST + 1] = { 0 };
 +static gint32 table_total_freed [JITERPRETER_TABLE_LAST + 1] = { 0 };
 +static gint32 table_total_reused [JITERPRETER_TABLE_LAST + 1] = { 0 };
++/*
++ * Successful fresh allocations only. This is a dedicated counter rather than being derived
++ * from next_index because the allocator advances next_index BEFORE the bounds check, so
++ * (next_index - first_index) counts failed allocations too: the first exhaustion already
++ * reads capacity + 1, and because an accepted release re-enables trace generation, later
++ * refill/exhaustion episodes keep advancing next_index without handing out a slot. It also
++ * cannot go negative on a table that has first_index set but no allocations yet.
++ */
++static gint32 table_fresh_allocated [JITERPRETER_TABLE_LAST + 1] = { 0 };
 +
 +static gboolean
 +jiterp_table_reclamation_enabled (void) {
@@ -831,7 +964,7 @@ index 887038c..86cbdc9 100644
  static void
  atomically_set_value_once (gint32 *address, gint32 value) {
  #ifdef DISABLE_THREADS
-@@ -1530,6 +1573,17 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1530,6 +1598,17 @@ mono_jiterp_allocate_table_entry (int type) {
  #ifdef DISABLE_THREADS
  	if (table->next_index == 0)
  		table->next_index = table->first_index;
@@ -849,7 +982,15 @@ index 887038c..86cbdc9 100644
  	int index = table->next_index++;
  #else
  	gint32 expected = 0;
-@@ -1546,6 +1600,88 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1543,9 +1622,101 @@ mono_jiterp_allocate_table_entry (int type) {
+ 			g_printf ("MONO_WASM: Jiterpreter table %d is out of space (%d entries allocated)\n", type, index - table->first_index + 1);
+ 		return 0;
+ 	}
++#ifdef DISABLE_THREADS
++	// Count only slots actually handed out: next_index above advances even when the bounds
++	//  check then fails, so it cannot serve as a successful-allocation diagnostic.
++	table_fresh_allocated [type]++;
++#endif
  	return index;
  }
  
@@ -903,10 +1044,14 @@ index 887038c..86cbdc9 100644
 + * reclamation feature is unavailable (threads-enabled build) or not opted into, so the
 + * stats surface stays as dark as the feature itself. The kind values MUST stay in sync
 + * with the managed test consumer:
-+ *   0 = fresh slots handed out by advancing next_index (excludes reused slots)
++ *   0 = fresh slots successfully handed out (monotonic; a dedicated counter, NOT derived
++ *       from next_index, so failed allocations are excluded and it is never negative)
 + *   1 = slots currently sitting on the free set
 + *   2 = total slots ever released (monotonic)
 + *   3 = total released slots ever reused by the allocator (monotonic)
++ *   4 = no-trace sentinel sweeps (monotonic; how often mono_jiterp_free_method_data freed
++ *       a method with no trace entry points — table-agnostic, but still requires a valid
++ *       table so the invalid-argument probes stay uniform; query it via the trace table)
 + */
 +gint32
 +mono_jiterp_get_table_stat (int type, int kind) {
@@ -919,16 +1064,17 @@ index 887038c..86cbdc9 100644
 +		return -1;
 +	if ((type < 0) || (type > JITERPRETER_TABLE_LAST))
 +		return -1;
-+	JiterpreterTableInfo *table = &tables[type];
 +	switch (kind) {
 +		case 0:
-+			return (table->first_index > 0) ? (table->next_index - table->first_index) : 0;
++			return table_fresh_allocated [type];
 +		case 1:
 +			return table_free_counts [type];
 +		case 2:
 +			return table_total_freed [type];
 +		case 3:
 +			return table_total_reused [type];
++		case 4:
++			return jiterp_no_trace_sweep_count;
 +		default:
 +			return -1;
 +	}
@@ -938,3 +1084,6 @@ index 887038c..86cbdc9 100644
  int
  mono_jiterp_increment_counter (volatile int *counter) {
  #ifdef DISABLE_THREADS
+-- 
+2.53.0.vfs.0.0
+
