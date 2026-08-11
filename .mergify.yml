@@ -28,9 +28,42 @@ pull_request_rules:
       merge:
         method: merge
 
+  - name: automatic strict merge for stacked PRs (base dev/**) gated on runtime CI and commit format
+    conditions:
+      # Stacked pull-requests target an in-flight dev/** feature branch instead of main.
+      # runtime-ci.yml schedules the full validation for these PRs; this rule makes the
+      # results an actual gate for Mergify-performed merges. NOTE: Mergify cannot block a
+      # manual merge-button press — only a repository ruleset / branch protection on dev/**
+      # requiring the `ci_ok` check can do that (admin-side setting, tracked in PR #167).
+      - base~=^dev/
+
+      # The runtime CI aggregate gate and the commit-format check must both succeed:
+      - check-success=ci_ok
+      - check-success=Validate for conventional commits
+
+      # Freshness: the checks above are only meaningful against the CURRENT base. A base
+      # branch that advanced after the checks ran would let stale green results merge an
+      # untested result, so the head must be even with its base. (Retargeting is covered
+      # separately: the workflows trigger on the `edited` PR event, which resets the checks.)
+      - "#commits-behind=0"
+
+      # Same review and labeling bar as the main-branch rule:
+      - "#approved-reviews-by>=2"
+      - "#changes-requested-reviews-by=0"
+      - label=ready-to-merge
+      - label!=do-not-merge/breaking-change
+      - label!=do-not-merge/work-in-progress
+
+    actions:
+      merge:
+        method: merge
+
   - name: automatic merge for allcontributors pull requests
     conditions:
       - author=allcontributors[bot]
+      # Scoped to main so this rule can never bypass the dev/** stacked-PR gate above
+      # (allcontributors only ever touches the contributors table on the default branch).
+      - base=main
     actions:
       merge:
         method: merge

@@ -5,12 +5,33 @@ on:
     branches:
       - main
       - release/**
-      
+      # Post-merge validation for stacked work: a merge INTO a dev/** base produces a new
+      # commit that no pull_request run has ever tested (PR checks validate a speculative
+      # merge against the base as it was at trigger time). This also runs on pushes to
+      # dev/** PR source branches — an accepted duplication cost, since publish/sign jobs
+      # are hard-gated to main/release pushes and cannot fire from here.
+      - dev/**
+
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    # `edited` matters for merge-gating: retargeting a PR (changing its base) only emits an
+    # `edited` event. Without it, an already-green PR retargeted to dev/** keeps its old
+    # checks — computed against a different base — and nothing revalidates the new merge
+    # result. Title/body edits also re-trigger; that cost is accepted so a retarget can
+    # never reuse stale results.
+    types: [opened, synchronize, reopened, closed, edited]
     branches:
       - main
       - release/**
+      # Stacked PRs: run the full validation (incl. the test_loader_wasm gate) for PRs that
+      # target an in-flight feature branch instead of main, so stacked work is compile- and
+      # test-gated before the base PR merges.
+      #
+      # NOTE on enforcement: this trigger only SCHEDULES the checks. Mergify-performed merges
+      # of dev/** PRs are gated on ci_ok + the commit-format check (see .mergify.yml), but a
+      # manual merge-button press can only be blocked by a repository ruleset / branch
+      # protection on dev/** requiring the `ci_ok` check — that is an admin-side setting and
+      # cannot be expressed in this file.
+      - dev/**
 
 env:
   DOTNETRUNTIME_COMMIT: 742e2f077a0c7d79bf57d6dd01d571a06f3a4738
