@@ -14,6 +14,12 @@ on:
       # Stacked PRs: run the full validation (incl. the test_loader_wasm gate) for PRs that
       # target an in-flight feature branch instead of main, so stacked work is compile- and
       # test-gated before the base PR merges.
+      #
+      # NOTE on enforcement: this trigger only SCHEDULES the checks. Mergify-performed merges
+      # of dev/** PRs are gated on ci_ok + the commit-format check (see .mergify.yml), but a
+      # manual merge-button press can only be blocked by a repository ruleset / branch
+      # protection on dev/** requiring the `ci_ok` check — that is an admin-side setting and
+      # cannot be expressed in this file.
       - dev/**
 
 env:
