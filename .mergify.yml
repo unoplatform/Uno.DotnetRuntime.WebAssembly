@@ -41,6 +41,12 @@ pull_request_rules:
       - check-success=ci_ok
       - check-success=Validate for conventional commits
 
+      # Freshness: the checks above are only meaningful against the CURRENT base. A base
+      # branch that advanced after the checks ran would let stale green results merge an
+      # untested result, so the head must be even with its base. (Retargeting is covered
+      # separately: the workflows trigger on the `edited` PR event, which resets the checks.)
+      - "#commits-behind=0"
+
       # Same review and labeling bar as the main-branch rule:
       - "#approved-reviews-by>=2"
       - "#changes-requested-reviews-by=0"
@@ -55,6 +61,9 @@ pull_request_rules:
   - name: automatic merge for allcontributors pull requests
     conditions:
       - author=allcontributors[bot]
+      # Scoped to main so this rule can never bypass the dev/** stacked-PR gate above
+      # (allcontributors only ever touches the contributors table on the default branch).
+      - base=main
     actions:
       merge:
         method: merge

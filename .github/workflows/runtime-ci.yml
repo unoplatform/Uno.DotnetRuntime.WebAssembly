@@ -5,9 +5,20 @@ on:
     branches:
       - main
       - release/**
-      
+      # Post-merge validation for stacked work: a merge INTO a dev/** base produces a new
+      # commit that no pull_request run has ever tested (PR checks validate a speculative
+      # merge against the base as it was at trigger time). This also runs on pushes to
+      # dev/** PR source branches — an accepted duplication cost, since publish/sign jobs
+      # are hard-gated to main/release pushes and cannot fire from here.
+      - dev/**
+
   pull_request:
-    types: [opened, synchronize, reopened, closed]
+    # `edited` matters for merge-gating: retargeting a PR (changing its base) only emits an
+    # `edited` event. Without it, an already-green PR retargeted to dev/** keeps its old
+    # checks — computed against a different base — and nothing revalidates the new merge
+    # result. Title/body edits also re-trigger; that cost is accepted so a retarget can
+    # never reuse stale results.
+    types: [opened, synchronize, reopened, closed, edited]
     branches:
       - main
       - release/**

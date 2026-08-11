@@ -2,6 +2,9 @@ name: Conventional Commits
 
 on:
   pull_request:
+    # `edited` included so retargeting a PR (a base change only emits `edited`) re-runs the
+    # gate instead of leaving stale results attached — same reasoning as runtime-ci.yml.
+    types: [opened, synchronize, reopened, edited]
     branches:
       - main
       - release/*
