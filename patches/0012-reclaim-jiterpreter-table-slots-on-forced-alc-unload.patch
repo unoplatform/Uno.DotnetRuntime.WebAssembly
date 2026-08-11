@@ -44,9 +44,13 @@ upstream monotonic one.
     table slot back to the allocator, after which the still-live call
     site would dispatch to whichever trace was installed next. The
     sentinel is now -1, every traceInfo/slot operation is guarded on
-    traceIndex >= 0, and the sweep counts each sentinel pass in a
-    monotonic diagnostic so the lifecycle tests can prove the branch
-    executed.
+    traceIndex >= 0, and each sentinel pass is counted in a monotonic
+    diagnostic BY THE RECEIVING TS SIDE (mono_jiterp_record_no_trace_sweep
+    via cwraps, called only when the index that ARRIVED is negative) so
+    the lifecycle tests prove both that the branch executed and that
+    the negative sentinel actually crossed the ownership boundary -- a
+    caller-side count would keep incrementing even if the sentinel
+    value regressed to the aliasing 0.
   * New EMSCRIPTEN_KEEPALIVE mono_jiterp_free_table_entry(type, index)
     (jiterpreter.c, crossing the boundary via cwraps like the existing
     mono_jiterp_allocate_table_entry): validates that the index is a
@@ -83,7 +87,17 @@ upstream monotonic one.
     bounds check, so deriving the stat from it would count failed
     allocations and could read negative on an untouched table),
     current free count, monotonic total-freed, monotonic total-reused,
-    monotonic no-trace sentinel sweeps}. JiterpreterTableReclamationTests
+    monotonic boundary-observed no-trace sentinel sweeps}. A sibling
+    icall InternalRunJiterpreterTableSelfTest is the surface's one
+    deliberately MUTATING member: the kind-0 failed-allocation
+    exclusion is only observable at exhaustion, and the real trace
+    table is too large for a test to exhaust, so the self-test swaps a
+    private 3-slot window into the trace-table allocator state
+    (single-threaded, saved and restored exactly, verdict cached),
+    drives fill / failed over-capacity attempt / release / refused
+    double release / reuse through the REAL allocator entry points and
+    stats surface, and returns 0 or the first failed step.
+    JiterpreterTableReclamationTests
     drive repeated load / hot-loop / unload / force cycles against a
     trace-bait method added to the loader test assembly (pure int
     arithmetic, well above the 5000 hit-count threshold; trace
@@ -123,17 +137,17 @@ Fixes https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 Refs dotnet/runtime#89980.
 ---
  .../tests/ForcedNativeUnloadTests.cs          |  15 +-
- .../tests/JiterpreterTableReclamationTests.cs | 443 ++++++++++++++++++
- .../TestClass.cs                              |  55 +++
+ .../tests/JiterpreterTableReclamationTests.cs | 507 ++++++++++++++++++
+ .../TestClass.cs                              |  55 ++
  .../tests/System.Runtime.Loader.Tests.csproj  |   1 +
- .../Loader/AssemblyLoadContext.Mono.cs        |  17 +
- src/mono/browser/runtime/cwraps.ts            |   3 +
- src/mono/browser/runtime/jiterpreter.ts       |  36 +-
- .../mono/metadata/assembly-load-context.c     |  31 ++
- src/mono/mono/metadata/icall-def.h            |   1 +
+ .../Loader/AssemblyLoadContext.Mono.cs        |  36 ++
+ src/mono/browser/runtime/cwraps.ts            |   6 +
+ src/mono/browser/runtime/jiterpreter.ts       |  44 +-
+ .../mono/metadata/assembly-load-context.c     |  51 ++
+ src/mono/mono/metadata/icall-def.h            |   2 +
  src/mono/mono/mini/interp/interp.c            |  20 +-
- src/mono/mono/mini/interp/jiterpreter.c       | 173 ++++++-
- 11 files changed, 771 insertions(+), 24 deletions(-)
+ src/mono/mono/mini/interp/jiterpreter.c       | 293 +++++++++-
+ 11 files changed, 1006 insertions(+), 24 deletions(-)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
@@ -164,10 +178,10 @@ index a30a5a290..60708a1b5 100644
          {
 diff --git a/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 new file mode 100644
-index 000000000..ff6e02f70
+index 000000000..d50eecd26
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,507 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -195,11 +209,16 @@ index 000000000..ff6e02f70
 +    ///   kind 1 = slots currently sitting on the free set
 +    ///   kind 2 = total slots ever released (monotonic)
 +    ///   kind 3 = total released slots ever reused by the allocator (monotonic)
-+    ///   kind 4 = no-trace sentinel sweeps (monotonic; methods freed without any trace entry
-+    ///            points — table-agnostic, queried via the trace table)
++    ///   kind 4 = no-trace sentinel sweeps (monotonic; counted at the TypeScript ownership
++    ///            boundary when the sweep RECEIVES a negative trace index, so a regression of
++    ///            the sentinel value itself is observable — table-agnostic, queried via the
++    ///            trace table)
 +    /// The bridge returns -1 whenever slot reclamation is unavailable (non-browser runtime,
 +    /// threads-enabled build) or the opt-in flag is absent, so the surface is as dark by default
-+    /// as the feature itself — which the tests assert too.
++    /// as the feature itself — which the tests assert too. A second bridge member,
++    /// RunJiterpreterTableSelfTest, is the surface's one deliberately mutating hook: it drives a
++    /// private allocator window to exhaustion natively (see its docs) because the kind-0
++    /// failed-allocation-exclusion contract is only observable at exhaustion.
 +    ///
 +    /// Determinism: the assertions deliberately avoid an exact next_index plateau. Trace entry
 +    /// points in default-ALC code (CoreLib, xunit) accumulate hit counts across cycles and can
@@ -248,6 +267,9 @@ index 000000000..ff6e02f70
 +        private static readonly MethodInfo s_getJiterpreterTableStat = typeof(AssemblyLoadContext)
 +            .GetMethod("GetJiterpreterTableStat", BindingFlags.NonPublic | BindingFlags.Static);
 +
++        private static readonly MethodInfo s_runJiterpreterTableSelfTest = typeof(AssemblyLoadContext)
++            .GetMethod("RunJiterpreterTableSelfTest", BindingFlags.NonPublic | BindingFlags.Static);
++
 +        private static bool FlagEnabled
 +        {
 +            get
@@ -265,13 +287,13 @@ index 000000000..ff6e02f70
 +
 +        private static bool BridgeMissing()
 +        {
-+            if (s_forceNativeUnload != null && s_getJiterpreterTableStat != null)
++            if (s_forceNativeUnload != null && s_getJiterpreterTableStat != null && s_runJiterpreterTableSelfTest != null)
 +            {
 +                return false;
 +            }
 +
 +            Assert.False(RequireBridge,
-+                "AssemblyLoadContext.ForceNativeUnload / GetJiterpreterTableStat is missing: the bridge was trimmed away, or the patch is not applied (trim/rooting regression).");
++                "AssemblyLoadContext.ForceNativeUnload / GetJiterpreterTableStat / RunJiterpreterTableSelfTest is missing: the bridge was trimmed away, or the patch is not applied (trim/rooting regression).");
 +            return true;
 +        }
 +
@@ -288,6 +310,12 @@ index 000000000..ff6e02f70
 +        }
 +
 +        private static int TraceStat(int kind) => Stat(TraceTable, kind);
++
++        private static int RunAllocatorSelfTest()
++        {
++            object result = s_runJiterpreterTableSelfTest.Invoke(null, null);
++            return Convert.ToInt32(result);
++        }
 +
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void GcQuiesce()
@@ -359,6 +387,51 @@ index 000000000..ff6e02f70
 +            // consumed a prior release.
 +            Assert.True(free <= fresh, $"slots on the free set ({free}) cannot exceed distinct slots ever handed out fresh ({fresh})");
 +            Assert.True(totalReused <= totalFreed, $"reuses ({totalReused}) cannot exceed releases ({totalFreed})");
++        }
++
++        /// <summary>
++        /// Deterministic exhaustion regression for the StatFreshAllocated (kind 0) contract:
++        /// failed allocations must not count as fresh hand-outs. Before the first over-capacity
++        /// attempt a next_index-derived stat and the dedicated success counter agree, and the
++        /// real trace table (thousands of slots) can never be driven to exhaustion by a test
++        /// without wrecking the suite — so the native side swaps a private 3-slot window into
++        /// the allocator (single-threaded, state saved and restored exactly; see
++        /// mono_jiterp_run_table_self_test), fills it, attempts one extra fresh allocation, and
++        /// verifies through the REAL stats surface that only the successful hand-outs were
++        /// counted, plus the release / double-release-refusal / reuse-before-growth invariants.
++        /// </summary>
++        [Fact]
++        public void JiterpreterTableAllocator_ExhaustionSelfTest()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int verdict = RunAllocatorSelfTest();
++
++            if (!FlagEnabled || PlatformDetection.IsThreadingSupported)
++            {
++                // Feature dark: the self-test must refuse to touch anything and report
++                // unavailable, exactly like the read-only stats.
++                Assert.Equal(-1, verdict);
++                return;
++            }
++
++            Assert.True(verdict == 0,
++                $"jiterpreter table allocator exhaustion self-test failed at step {verdict}: " + verdict switch
++                {
++                    1 => "the live trace table was not initialized yet",
++                    2 => "filling to capacity did not hand out every slot exactly once",
++                    3 => "allocation beyond capacity did not fail",
++                    4 => "a FAILED allocation was counted as a fresh hand-out (StatFreshAllocated contract broken)",
++                    5 => "releasing an allocated slot was refused",
++                    6 => "a double release was accepted",
++                    7 => "the released slot was not reused before fresh growth",
++                    8 => "a reuse was counted as a fresh hand-out",
++                    9 => "release/reuse totals were not exactly one each",
++                    _ => "unknown step",
++                });
 +        }
 +
 +        [Fact]
@@ -512,11 +585,16 @@ index 000000000..ff6e02f70
 +            LoadUnloadAndForceWithoutHotLoop();
 +
 +            // Non-vacuity: at least one swept method (the invoked no-trace bait's InterpMethod at
-+            // minimum) took the need_extra_free sentinel branch during the forced unload.
++            // minimum) drove a NEGATIVE sentinel index all the way to the TypeScript ownership
++            // boundary during the forced unload. Kind 4 counts on the RECEIVING side of
++            // mono_wasm_free_method_data, so this assertion fails both when the collectible
++            // InterpMethod never reaches the sweep AND when the native sentinel regresses to the
++            // aliasing 0 (the TS side then takes the per-trace path and never counts).
 +            Assert.True(TraceStat(StatNoTraceSweeps) > sentinelSweepsBefore,
-+                $"the forced unload must sweep the invoked trace-less method through the no-trace sentinel path " +
++                $"the forced unload must deliver the negative no-trace sentinel to the TS free boundary " +
 +                $"(noTraceSweeps before={sentinelSweepsBefore} after={TraceStat(StatNoTraceSweeps)}). " +
-+                "If the counter did not move, the collectible InterpMethod never reached the sweep and this test proved nothing.");
++                "If the counter did not move, either the collectible InterpMethod never reached the sweep " +
++                "or the sentinel value regressed to a non-negative index.");
 +
 +            // The regression itself: a sentinel sweep must not release anyone's slot — with the
 +            // old 0 sentinel it would have released the live trace-0 slot of a default-ALC method.
@@ -697,18 +775,19 @@ index bbdad35cc..09a06f1b3 100644
      <EmbeddedResource Include="MainStrings*.resx" />
    </ItemGroup>
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index cc30e0cdb..bf45b0438 100644
+index cc30e0cdb..88ce94a0c 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -37,6 +37,7 @@ internal IntPtr NativeALC
+@@ -37,6 +37,8 @@ internal IntPtr NativeALC
          [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
          [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
          [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
 +        [DynamicDependency(nameof(GetJiterpreterTableStat))] // trim-root: lifecycle tests invoke this bridge via reflection
++        [DynamicDependency(nameof(RunJiterpreterTableSelfTest))] // trim-root: lifecycle tests invoke this bridge via reflection
          private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
          {
              if (isCollectible)
-@@ -78,6 +79,22 @@ private static void KeepLoaderAllocator()
+@@ -78,6 +80,40 @@ private static void KeepLoaderAllocator()
          // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
          internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
  
@@ -719,7 +798,8 @@ index cc30e0cdb..bf45b0438 100644
 +        // Mirrors mono_jiterp_get_table_stat (jiterpreter.c): `table` is a JITERPRETER_TABLE_*
 +        // value (0 = traces) and `kind` selects the statistic (0 = fresh slots successfully
 +        // handed out, 1 = slots currently free, 2 = total slots ever released, 3 = total released
-+        // slots ever reused, 4 = no-trace sentinel sweeps — all monotonic except 1).
++        // slots ever reused, 4 = no-trace sentinel sweeps as observed at the TypeScript ownership
++        // boundary — all monotonic except 1).
 +        // Returns -1 whenever slot reclamation is unavailable (non-browser runtime,
 +        // threads-enabled build) or the MONO_WASM_ENABLE_ALC_UNLOAD opt-in is absent, so this
 +        // surface is as dark by default as the feature it observes.
@@ -728,35 +808,55 @@ index cc30e0cdb..bf45b0438 100644
 +            return InternalGetJiterpreterTableStat(table, kind);
 +        }
 +
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalRunJiterpreterTableSelfTest();
++
++        // Deterministic exhaustion self-test for the reclamation allocator (see
++        // mono_jiterp_run_table_self_test in jiterpreter.c): swaps a private 3-slot window into
++        // the trace-table allocator, drives fill / failed over-capacity attempt / release /
++        // refused double release / reuse through the REAL allocator entry points, restores the
++        // live state exactly, and returns 0 when every invariant held, the failed step number
++        // otherwise, or -1 whenever the feature is unavailable or not opted in (same dark-by-
++        // default contract as GetJiterpreterTableStat). This is the only mutating member of the
++        // diagnostic bridge; the real table is too large for a test to reach exhaustion —
++        // where the kind-0 failed-allocation-exclusion contract becomes observable — any other way.
++        internal static int RunJiterpreterTableSelfTest()
++        {
++            return InternalRunJiterpreterTableSelfTest();
++        }
++
          // Outcome of a host-triggered native ALC teardown. The values MUST stay in sync with the
          // return codes of ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload
          // in the native assembly-load-context.c.
 diff --git a/src/mono/browser/runtime/cwraps.ts b/src/mono/browser/runtime/cwraps.ts
-index e693c5223..c02fbd777 100644
+index e693c5223..35680619a 100644
 --- a/src/mono/browser/runtime/cwraps.ts
 +++ b/src/mono/browser/runtime/cwraps.ts
-@@ -120,6 +120,7 @@ const fn_signatures: SigLine[] = [
+@@ -120,6 +120,8 @@ const fn_signatures: SigLine[] = [
      [true, "mono_jiterp_is_special_interface", "number", ["number"]],
      [true, "mono_jiterp_initialize_table", "void", ["number", "number", "number"]],
      [true, "mono_jiterp_allocate_table_entry", "number", ["number"]],
 +    [true, "mono_jiterp_free_table_entry", "number", ["number", "number"]],
++    [true, "mono_jiterp_record_no_trace_sweep", "void", []],
      [true, "mono_jiterp_get_interp_entry_func", "number", ["number"]],
      [true, "mono_jiterp_get_counter", "number", ["number"]],
      [true, "mono_jiterp_modify_counter", "number", ["number", "number"]],
-@@ -248,6 +249,8 @@ export interface t_Cwraps {
+@@ -248,6 +250,10 @@ export interface t_Cwraps {
      mono_jiterp_is_special_interface(klass: number): number;
      mono_jiterp_initialize_table(type: number, firstIndex: number, lastIndex: number): void;
      mono_jiterp_allocate_table_entry(type: number): number;
 +    // returns 1 when the slot was accepted for reuse (forced ALC unload reclamation), 0 when refused
 +    mono_jiterp_free_table_entry(type: number, index: number): number;
++    // diagnostic: the no-trace sentinel (a negative trace index) was observed at this boundary
++    mono_jiterp_record_no_trace_sweep(): void;
      mono_jiterp_get_interp_entry_func(type: number): number;
      mono_jiterp_get_counter(counter: number): number;
      mono_jiterp_modify_counter(counter: number, delta: number): number;
 diff --git a/src/mono/browser/runtime/jiterpreter.ts b/src/mono/browser/runtime/jiterpreter.ts
-index 6ba17a3ab..09ba3a418 100644
+index 6ba17a3ab..143cca64d 100644
 --- a/src/mono/browser/runtime/jiterpreter.ts
 +++ b/src/mono/browser/runtime/jiterpreter.ts
-@@ -1088,10 +1088,38 @@ export function mono_wasm_free_method_data (
+@@ -1088,10 +1088,46 @@ export function mono_wasm_free_method_data (
          mono_wasm_profiler_free_method(method);
      }
  
@@ -795,15 +895,23 @@ index 6ba17a3ab..09ba3a418 100644
 +        }
 +        // Release the trace info object, if present
 +        delete traceInfo[traceIndex];
++    } else {
++        // Diagnostic, counted HERE at the ownership boundary rather than by the native
++        //  caller: the lifecycle tests assert this counter moves when a trace-less method
++        //  is swept, proving a negative sentinel actually arrived. If the native sentinel
++        //  ever regressed to the aliasing 0 again, this branch would not be taken and the
++        //  counter would freeze — failing the test — whereas a caller-side count would
++        //  keep incrementing and mask the regression.
++        cwraps.mono_jiterp_record_no_trace_sweep();
 +    }
      // Remove any AOT data and queue entries associated with the method
      mono_jiterp_free_method_data_interp_entry(imethod);
      mono_jiterp_free_method_data_jit_call(method);
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 382247fa9..206c1a653 100644
+index 382247fa9..d8eac6e34 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -617,6 +617,37 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -617,6 +617,57 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  #endif
  }
  
@@ -816,6 +924,8 @@ index 382247fa9..206c1a653 100644
 + */
 +extern gint32
 +mono_jiterp_get_table_stat (int table, int kind);
++extern gint32
++mono_jiterp_run_table_self_test (void);
 +#endif
 +
 +int
@@ -838,14 +948,32 @@ index 382247fa9..206c1a653 100644
 +#endif
 +}
 +
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalRunJiterpreterTableSelfTest (MonoError *error)
++{
++	/*
++	 * Deterministic exhaustion self-test for the reclamation allocator (see
++	 * mono_jiterp_run_table_self_test in jiterpreter.c for the procedure, the
++	 * save/swap/restore safety argument, and the step-code meanings). The one
++	 * deliberately mutating member of this diagnostic surface — justified there —
++	 * and gated exactly like the rest: -1 on non-browser runtimes, threads-enabled
++	 * builds, or without the MONO_WASM_ENABLE_ALC_UNLOAD opt-in.
++	 */
++#if defined(HOST_BROWSER) && defined(DISABLE_THREADS)
++	return mono_jiterp_run_table_self_test ();
++#else
++	return -1;
++#endif
++}
++
  gpointer
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly (MonoReflectionAssemblyHandle assm_obj, MonoError *error)
  {
 diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
-index 4e1a93423..e4ca6f1d6 100644
+index 4e1a93423..340ea5384 100644
 --- a/src/mono/mono/metadata/icall-def.h
 +++ b/src/mono/mono/metadata/icall-def.h
-@@ -473,6 +473,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+@@ -473,11 +473,13 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
  ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
  HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
  HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, int, 1, (gpointer))
@@ -853,6 +981,12 @@ index 4e1a93423..e4ca6f1d6 100644
  HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
  HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
  HANDLES(ALC_2, "InternalInitializeNativeALC", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalInitializeNativeALC, gpointer, 4, (gpointer, const_char_ptr, MonoBoolean, MonoBoolean))
+ HANDLES(ALC_1, "InternalLoadFile", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile, MonoReflectionAssembly, 3, (gpointer, MonoString, MonoStackCrawlMark_ptr))
+ HANDLES(ALC_3, "InternalLoadFromStream", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream, MonoReflectionAssembly, 5, (gpointer, gpointer, gint32, gpointer, gint32))
++HANDLES(ALC_10, "InternalRunJiterpreterTableSelfTest", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalRunJiterpreterTableSelfTest, int, 0, ())
+ HANDLES(ALC_6, "PrepareForAssemblyLoadContextRelease", ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContextRelease, void, 2, (gpointer, gpointer))
+ 
+ ICALL_TYPE(RFH, "System.RuntimeFieldHandle", RFH_1)
 diff --git a/src/mono/mono/mini/interp/interp.c b/src/mono/mono/mini/interp/interp.c
 index a47d81246..4db8b85bd 100644
 --- a/src/mono/mono/mini/interp/interp.c
@@ -885,30 +1019,42 @@ index a47d81246..4db8b85bd 100644
  void
  mono_interp_free_mem_manager_jiterp (MonoJitMemoryManager *jit_mm)
 diff --git a/src/mono/mono/mini/interp/jiterpreter.c b/src/mono/mono/mini/interp/jiterpreter.c
-index 887038ca4..6e26e4499 100644
+index 887038ca4..f5ee263cd 100644
 --- a/src/mono/mono/mini/interp/jiterpreter.c
 +++ b/src/mono/mono/mini/interp/jiterpreter.c
-@@ -946,6 +946,19 @@ mono_interp_tier_prepare_jiterpreter_fast (
+@@ -946,6 +946,31 @@ mono_interp_tier_prepare_jiterpreter_fast (
  	}
  }
  
 +#ifdef DISABLE_THREADS
 +/*
-+ * Monotonic count of no-trace sentinel sweeps: how many times the need_extra_free branch
-+ * below passed -1 to mono_wasm_free_method_data because the method being freed contained
-+ * no trace entry points. Exposed as kind 4 of mono_jiterp_get_table_stat so the lifecycle
-+ * tests can prove the sentinel path actually executed for a swept method (an empty
-+ * interp_code_hash would otherwise make the "no slot was released" assertion vacuous).
-+ * Part of the DISABLE_THREADS-gated reclamation diagnostics; see the state block above
-+ * mono_jiterp_free_table_entry further down.
++ * Monotonic count of no-trace sentinel sweeps AS OBSERVED AT THE TYPESCRIPT OWNERSHIP
++ * BOUNDARY: the TS side of the per-method sweep (mono_wasm_free_method_data in
++ * jiterpreter.ts) calls mono_jiterp_record_no_trace_sweep below when — and only when —
++ * the trace index it RECEIVED is negative. Exposed as kind 4 of mono_jiterp_get_table_stat
++ * so the lifecycle tests can prove the sentinel path actually executed for a swept method
++ * (an empty interp_code_hash would otherwise make the "no slot was released" assertion
++ * vacuous). Counting on the receiving side of the boundary is deliberate: incrementing in
++ * the need_extra_free branch itself, before the call, would keep counting even if the
++ * sentinel value regressed from -1 back to the aliasing 0 — the exact production bug this
++ * counter's test guards — whereas here that regression freezes the counter and fails the
++ * named test. Part of the DISABLE_THREADS-gated reclamation diagnostics; see the state
++ * block above mono_jiterp_free_table_entry further down.
 + */
 +static gint32 jiterp_no_trace_sweep_count = 0;
 +#endif
 +
++EMSCRIPTEN_KEEPALIVE void
++mono_jiterp_record_no_trace_sweep (void) {
++#ifdef DISABLE_THREADS
++	jiterp_no_trace_sweep_count++;
++#endif
++}
++
  void
  mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
  {
-@@ -988,7 +1001,13 @@ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
+@@ -988,7 +1013,13 @@ mono_jiterp_free_method_data (MonoMethod *method, InterpMethod *imethod)
  	if (need_extra_free) {
  		// HACK: Perform a single free operation to clear out any stuff from the jit queues
  		// This will happen if we didn't encounter any jiterpreter traces in the method
@@ -916,14 +1062,14 @@ index 887038ca4..6e26e4499 100644
 +		// Pass -1, NOT 0: trace indexes are allocated from zero (trace_count++), so 0 is a
 +		// real trace that very likely belongs to a live method in another (default) ALC.
 +		// The JS side treats a negative index as "no trace" and skips all per-trace work.
-+#ifdef DISABLE_THREADS
-+		jiterp_no_trace_sweep_count++;
-+#endif
++		// (The sentinel-sweep diagnostic is counted by the RECEIVING side — see
++		// mono_jiterp_record_no_trace_sweep above — so a regression of this value is
++		// observable at the ownership boundary rather than masked by a caller-side count.)
 +		mono_wasm_free_method_data (method, imethod, -1);
  	}
  }
  
-@@ -1476,6 +1495,55 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
+@@ -1476,6 +1507,55 @@ mono_jiterp_is_imethod_var_address_taken (InterpMethod *imethod, int offset) {
  JiterpreterTableInfo tables[JITERPRETER_TABLE_LAST + 1] = { 0 };
  int mono_jiterp_first_trace_fn_ptr = 0;
  
@@ -979,7 +1125,7 @@ index 887038ca4..6e26e4499 100644
  static void
  atomically_set_value_once (gint32 *address, gint32 value) {
  #ifdef DISABLE_THREADS
-@@ -1530,6 +1598,17 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1530,6 +1610,17 @@ mono_jiterp_allocate_table_entry (int type) {
  #ifdef DISABLE_THREADS
  	if (table->next_index == 0)
  		table->next_index = table->first_index;
@@ -997,7 +1143,7 @@ index 887038ca4..6e26e4499 100644
  	int index = table->next_index++;
  #else
  	gint32 expected = 0;
-@@ -1543,9 +1622,101 @@ mono_jiterp_allocate_table_entry (int type) {
+@@ -1543,9 +1634,209 @@ mono_jiterp_allocate_table_entry (int type) {
  			g_printf ("MONO_WASM: Jiterpreter table %d is out of space (%d entries allocated)\n", type, index - table->first_index + 1);
  		return 0;
  	}
@@ -1064,9 +1210,11 @@ index 887038ca4..6e26e4499 100644
 + *   1 = slots currently sitting on the free set
 + *   2 = total slots ever released (monotonic)
 + *   3 = total released slots ever reused by the allocator (monotonic)
-+ *   4 = no-trace sentinel sweeps (monotonic; how often mono_jiterp_free_method_data freed
-+ *       a method with no trace entry points — table-agnostic, but still requires a valid
-+ *       table so the invalid-argument probes stay uniform; query it via the trace table)
++ *   4 = no-trace sentinel sweeps (monotonic; how often the TS side of the sweep RECEIVED a
++ *       negative trace index — counted at the ownership boundary via
++ *       mono_jiterp_record_no_trace_sweep, so a sentinel-value regression freezes it.
++ *       Table-agnostic, but still requires a valid table so the invalid-argument probes
++ *       stay uniform; query it via the trace table)
 + */
 +gint32
 +mono_jiterp_get_table_stat (int type, int kind) {
@@ -1093,6 +1241,112 @@ index 887038ca4..6e26e4499 100644
 +		default:
 +			return -1;
 +	}
++#endif
++}
++
++/*
++ * Deterministic exhaustion self-test for the reclamation allocator, reached through the
++ * InternalRunJiterpreterTableSelfTest icall. This is the one deliberately MUTATING member
++ * of the diagnostics surface (mono_jiterp_get_table_stat stays read-only): the real trace
++ * table holds thousands of slots, so no lifecycle test can drive it to exhaustion without
++ * wrecking the rest of the suite — yet the failed-allocation-exclusion contract of stat
++ * kind 0 only becomes observable AT exhaustion (before the first over-capacity attempt, a
++ * next_index-derived stat and the dedicated success counter agree). So this hook swaps a
++ * private 3-slot window into the trace table's allocator state, drives the REAL entry
++ * points (mono_jiterp_allocate_table_entry / mono_jiterp_free_table_entry /
++ * mono_jiterp_get_table_stat) through fill -> failed over-capacity attempt -> release ->
++ * refused double release -> reuse, and restores the saved state exactly before returning.
++ * Safe by the same hard gate as everything here: single-threaded build (nothing can
++ * interleave with the swap) plus the MONO_WASM_ENABLE_ALC_UNLOAD opt-in; without both it
++ * reports -1 and touches nothing. The verdict is cached so reruns cannot double-apply.
++ * (The over-capacity attempt logs one benign "Jiterpreter table 0 is out of space (4
++ * entries allocated)" line — that is the upstream allocator's own diagnostic firing on the
++ * private window.)
++ *
++ * Returns -1 when unavailable/not opted in, 0 when every invariant held, or the number of
++ * the first failed step:
++ *   1 = live trace table not initialized yet (cannot swap safely)
++ *   2 = filling to capacity did not hand out every slot exactly once
++ *   3 = allocation beyond capacity did not fail
++ *   4 = the failed attempt was counted as a fresh hand-out (stat kind 0 contract broken)
++ *   5 = releasing an allocated slot was refused
++ *   6 = a double release was accepted
++ *   7 = the released slot was not reused before fresh growth
++ *   8 = the reuse was counted as a fresh hand-out
++ *   9 = release/reuse totals are not exactly one each
++ */
++gint32
++mono_jiterp_run_table_self_test (void) {
++#ifndef DISABLE_THREADS
++	return -1;
++#else
++	if (!jiterp_table_reclamation_enabled ())
++		return -1;
++
++	static gint32 cached_verdict = -2;
++	if (cached_verdict != -2)
++		return cached_verdict;
++
++	const int type = JITERPRETER_TABLE_TRACE;
++	JiterpreterTableInfo *table = &tables [type];
++	if (table->first_index <= 0) {
++		cached_verdict = 1;
++		return cached_verdict;
++	}
++
++	// Save the complete live allocator state for the table.
++	JiterpreterTableInfo saved_table = *table;
++	MonoBitSet *saved_free_slots = table_free_slots [type];
++	gint32 saved_free_count = table_free_counts [type];
++	gint32 saved_total_freed = table_total_freed [type];
++	gint32 saved_total_reused = table_total_reused [type];
++	gint32 saved_fresh = table_fresh_allocated [type];
++
++	// Install a private 3-slot window. Indexes 2..4 look like real allocations (above the
++	// TRAINING/NOT_JITTED sentinel values 0/1) but are never installed into the WASM
++	// function table — the self-test only exercises allocator bookkeeping.
++	table->first_index = 2;
++	table->last_index = 4;
++	table->next_index = 2;
++	table_free_slots [type] = NULL;
++	table_free_counts [type] = 0;
++	table_total_freed [type] = 0;
++	table_total_reused [type] = 0;
++	table_fresh_allocated [type] = 0;
++
++	gint32 verdict = 0;
++	int a1 = mono_jiterp_allocate_table_entry (type);
++	int a2 = mono_jiterp_allocate_table_entry (type);
++	int a3 = mono_jiterp_allocate_table_entry (type);
++	if (a1 != 2 || a2 != 3 || a3 != 4)
++		verdict = 2;
++	if (!verdict && mono_jiterp_allocate_table_entry (type) != 0)
++		verdict = 3;
++	if (!verdict && mono_jiterp_get_table_stat (type, 0) != 3)
++		verdict = 4;
++	if (!verdict && mono_jiterp_free_table_entry (type, a2) != 1)
++		verdict = 5;
++	if (!verdict && mono_jiterp_free_table_entry (type, a2) != 0)
++		verdict = 6;
++	if (!verdict && mono_jiterp_allocate_table_entry (type) != a2)
++		verdict = 7;
++	if (!verdict && mono_jiterp_get_table_stat (type, 0) != 3)
++		verdict = 8;
++	if (!verdict && (mono_jiterp_get_table_stat (type, 2) != 1 || mono_jiterp_get_table_stat (type, 3) != 1))
++		verdict = 9;
++
++	// Tear down the window's bitset and restore the live state exactly.
++	if (table_free_slots [type])
++		mono_bitset_free (table_free_slots [type]);
++	*table = saved_table;
++	table_free_slots [type] = saved_free_slots;
++	table_free_counts [type] = saved_free_count;
++	table_total_freed [type] = saved_total_freed;
++	table_total_reused [type] = saved_total_reused;
++	table_fresh_allocated [type] = saved_fresh;
++
++	cached_verdict = verdict;
++	return cached_verdict;
 +#endif
 +}
 +
