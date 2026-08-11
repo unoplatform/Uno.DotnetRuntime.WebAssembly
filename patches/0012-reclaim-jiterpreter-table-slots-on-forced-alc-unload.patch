@@ -99,7 +99,10 @@ upstream monotonic one.
     no-trace sentinel sweep is exercised for real: it invokes a
     deliberately jiterpreter-ineligible collectible method once
     (creating an InterpMethod in the collectible memory manager
-    without any trace entry points), asserts the sentinel-sweep
+    without any trace entry points; the bait is NoInlining because
+    the interp transform inlines small callees without ever creating
+    an InterpMethod for them, which would leave the sweep nothing to
+    visit), asserts the sentinel-sweep
     counter moved during the forced unload, and asserts total-freed
     did not -- with the old 0 sentinel that sweep would have released
     the live trace-0 slot of a default-ALC method. With the flag off
@@ -120,8 +123,8 @@ Fixes https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/166
 Refs dotnet/runtime#89980.
 ---
  .../tests/ForcedNativeUnloadTests.cs          |  15 +-
- .../tests/JiterpreterTableReclamationTests.cs | 440 ++++++++++++++++++
- .../TestClass.cs                              |  46 ++
+ .../tests/JiterpreterTableReclamationTests.cs | 443 ++++++++++++++++++
+ .../TestClass.cs                              |  55 +++
  .../tests/System.Runtime.Loader.Tests.csproj  |   1 +
  .../Loader/AssemblyLoadContext.Mono.cs        |  17 +
  src/mono/browser/runtime/cwraps.ts            |   3 +
@@ -130,7 +133,7 @@ Refs dotnet/runtime#89980.
  src/mono/mono/metadata/icall-def.h            |   1 +
  src/mono/mono/mini/interp/interp.c            |  20 +-
  src/mono/mono/mini/interp/jiterpreter.c       | 173 ++++++-
- 11 files changed, 759 insertions(+), 24 deletions(-)
+ 11 files changed, 771 insertions(+), 24 deletions(-)
  create mode 100644 src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
@@ -161,10 +164,10 @@ index a30a5a290..60708a1b5 100644
          {
 diff --git a/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
 new file mode 100644
-index 000000000..62275c790
+index 000000000..ff6e02f70
 --- /dev/null
 +++ b/src/libraries/System.Runtime.Loader/tests/JiterpreterTableReclamationTests.cs
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,443 @@
 +// Licensed to the .NET Foundation under one or more agreements.
 +// The .NET Foundation licenses this file to you under the MIT license.
 +
@@ -536,8 +539,11 @@ index 000000000..62275c790
 +        // mono_interp_get_imethod to create an InterpMethod in the collectible memory manager's
 +        // interp_code_hash — which is what the unload sweep iterates — while the method's
 +        // straight-line body guarantees the transform emitted no trace entry points for it, so the
-+        // sweep must take the no-trace sentinel branch for it. (Merely loading types via
-+        // reflection creates no InterpMethod and would leave this test vacuous.)
++        // sweep must take the no-trace sentinel branch for it. Two ways this can silently go
++        // vacuous, both guarded by the sentinel-sweep counter assertion above: merely loading
++        // types via reflection creates no InterpMethod, and a bait small enough for the
++        // interpreter transform to INLINE into the invoke wrapper never gets an InterpMethod
++        // either (hence the bait's load-bearing NoInlining attribute).
 +        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static void InvokeWithoutCompilingATrace(AssemblyLoadContext context)
 +        {
@@ -606,7 +612,7 @@ index 000000000..62275c790
 +    }
 +}
 diff --git a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
-index 7d3bb5ebe..ede632a92 100644
+index 7d3bb5ebe..65d941c84 100644
 --- a/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/System.Runtime.Loader.Test.Assembly/TestClass.cs
 @@ -1,6 +1,7 @@
@@ -617,7 +623,7 @@ index 7d3bb5ebe..ede632a92 100644
  using System.Runtime.InteropServices;
  
  namespace System.Runtime.Loader.Tests
-@@ -35,6 +36,51 @@ public static void TestDelegateMarshalling()
+@@ -35,6 +36,60 @@ public static void TestDelegateMarshalling()
          public class COMClass
          {
          }
@@ -650,6 +656,15 @@ index 7d3bb5ebe..ede632a92 100644
 +        // emits NO trace entry points for it. Invoking it once therefore creates an
 +        // InterpMethod in this collectible assembly's memory manager that owns no trace —
 +        // exactly the shape whose unload sweep must take the no-trace sentinel path.
++        //
++        // NoInlining is LOAD-BEARING, not hygiene: the interpreter transform inlines small
++        // methods into their caller (interp_method_check_inlining), and an inlined callee
++        // never gets an InterpMethod at all — mono_interp_get_imethod only runs when a real
++        // MINT_CALL is emitted. Without the attribute this body is tiny enough to be inlined
++        // into the reflection-invoke wrapper, nothing lands in the collectible ALC's
++        // interp_code_hash, and the unload sweep has nothing to visit — the exact vacuity the
++        // regression test guards against (and how its CI guard first tripped).
++        [MethodImpl(MethodImplOptions.NoInlining)]
 +        public static int JiterpreterNoTraceBait(int value)
 +        {
 +            return value + 1;
