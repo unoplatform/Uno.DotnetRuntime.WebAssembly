@@ -1,0 +1,643 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Wed, 12 Aug 2026 00:00:00 +0000
+Subject: [PATCH] fix: GC-driven scout completion so a refused forced unload
+ cannot strand the ALC
+
+A downstream WASM host doing repeated collectible-ALC load/unload
+cycles observed one disposed AssemblyLoadContext stranded per cycle
+(monotonic growth until native OOM) with the MONO_WASM_ENABLE_ALC_UNLOAD
+opt-in active, while the identical host wiring collected normally with
+the flag off. The host calls ForceNativeUnload once at teardown, while
+the context is still transiently rooted (in-flight worker state), gets
+NotQuiescent, then drops every root and moves on without retrying.
+
+Root cause -- NOT a per-attempt acquisition: the forced attempt itself
+is side-effect-free on both early-out paths (the icall takes no handle,
+no registration and no allocation before its quiescence walk, and the
+managed claim CAS is released on NotQuiescent/Rejected). The strand is
+older than the attempt: PrepareForAssemblyLoadContextRelease (managed
+Unload) swaps the native ALC handle from weak to STRONG to keep the
+managed context alive for the unloading window, and the ONLY release of
+that handle is mono_alc_cleanup -- which, until now, only a Completed
+forced attempt ever ran. With the flag off the ALC is natively
+non-collectible, Prepare takes the early return that frees the strong
+handle immediately, and the managed context dies with its roots; with
+the flag on, a host that never re-attempts leaves the managed context
+(and everything the host's ALC subclass instance references -- stream
+resolvers, assembly bytes) strongly rooted forever. One stranded
+context per cycle, exactly as observed.
+
+The fix gives the strong handle a GC-driven release, mirroring the
+CoreCLR LoaderAllocatorScout design:
+
+  * LoaderAllocatorScout_Destroy (the scout finalizer icall, previously
+    terminal-registry-consult-only on this runtime) now completes the
+    teardown itself: when the finalizing scout's memory manager belongs
+    to a collectible, unloading, not-yet-torn-down ALC whose WHOLE
+    witness set is dead -- the same all-or-nothing quiescence gate the
+    forced attempt uses, factored into alc_is_managed_quiescent -- it
+    runs mono_alc_cleanup right there. The last witness's finalizer is
+    by definition the first moment this can succeed, and the finalizer
+    pump runs after exactly the collection that killed the roots, so
+    plain GC now reclaims the managed ALC with no host retry. If the
+    set is not yet fully dead the scout re-registers for finalization
+    (the pre-existing managed retry loop) and tries again next GC.
+  * Tombstone, not free: the scout-driven path keeps the tiny
+    MonoAssemblyLoadContext struct alive with a new native_tombstoned
+    flag (loader-internals.h) instead of g_free-ing it, because a host
+    may still hold the managed context and legitimately retry
+    ForceNativeUnload later -- that retry carries the raw native
+    pointer, so freeing the struct would be a use-after-free. The
+    forced icall answers a tombstoned ALC with an idempotent Completed
+    (before its own quiescence walk), after which the managed wrapper
+    latches its terminal claim and zeroes the pointer exactly as if it
+    had performed the teardown. Managed load APIs were already rejected
+    from the moment Unload() was initiated, so nothing else can carry
+    the stale pointer into native code. The residual is ~one hundred
+    bytes per context, only on the scout-completed path, and bounded by
+    it (a Completed forced attempt still frees the struct as before).
+  * Ordering safety is inherited from the existing retired-scout
+    registry: scouts whose manager was freed by any teardown (forced or
+    scout-driven -- mono_alc_cleanup registers every materialised
+    manager) consume their registry entry at the TOP of Destroy and
+    never dereference the freed manager; a not-registered pointer is
+    provably a live manager. The owner scan runs before the cleanup
+    because the cleanup frees the scanning scout's own manager. All of
+    it single-threaded by construction (finalizers and icalls share the
+    one thread) and dark by default (collectible is only ever TRUE
+    under the opt-in).
+  * Diagnostics: scout-stats kind 7 counts scout-driven completions
+    (monotonic), so the tests can prove the reclaim went through the
+    scout path rather than passing vacuously -- under the opt-in the
+    strong handle makes ALC death impossible any other way, and the
+    stat pins it explicitly.
+
+New lifecycle regressions (red on the previous runtime for the flag-on
+leg, exactly like the field failure; green flag-off/threads):
+
+  * ForcedUnload_SingleNotQuiescentAttempt_ThenDroppedRoots_DoesNotStrandAlc
+    -- the reported shape: one refused attempt on a genuinely rooted
+    context, roots dropped, no retry; plain GC must reclaim the context
+    and kind-7 must advance.
+  * Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible -- the
+    purest contract: no attempt at all; same reclaim, same kind-7
+    proof.
+  * ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual -- a
+    host that does retry must observe Completed whether its retry or
+    the scout completion performed the teardown (tombstone idempotence)
+    and the scout residual must drain to zero.
+
+Refs https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/169.
+---
+ .../tests/ForcedNativeUnloadTests.cs          | 224 +++++++++++++++++-
+ .../Loader/AssemblyLoadContext.Mono.cs        |  11 +-
+ .../mono/metadata/assembly-load-context.c     | 172 ++++++++++----
+ src/mono/mono/metadata/loader-internals.h     |   7 +
+ 4 files changed, 370 insertions(+), 44 deletions(-)
+
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+index 60708a1b5..ee90983aa 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -78,6 +78,10 @@ public class ForcedNativeUnloadTests
+         // manager's LoaderAllocator; mono_weak_hash_table_dead_lookup_count). Unconditional
+         // shared-runtime code, like kinds 2/3/5.
+         private const int WeakTableDeadLookupCount = 6;
++        // ALC teardowns completed by the GC-driven scout path (the finalizer of the last
++        // LoaderAllocator witness ran the quiescence-gated teardown itself; see
++        // LoaderAllocatorScout_Destroy). Behind the DISABLE_THREADS gate like kinds 0/1.
++        private const int ScoutCompletedTeardownCount = 7;
+ 
+         private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
+             .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
+@@ -269,6 +273,116 @@ public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
+             }
+         }
+ 
++        /// <summary>
++        /// Regression for a downstream-observed per-cycle strand: a downstream WASM host doing
++        /// repeated collectible-ALC load/unload cycles called ForceNativeUnload once per cycle
++        /// while the context was still (transiently) rooted, got NotQuiescent, then dropped
++        /// every root WITHOUT retrying — and one disposed ALC accumulated per cycle until the
++        /// heap overflowed. Root cause: PrepareForAssemblyLoadContextRelease installs a STRONG
++        /// native gchandle to the managed ALC and only mono_alc_cleanup releases it; before the
++        /// GC-driven scout completion existed, only a Completed forced attempt ever ran that
++        /// cleanup, so a never-retried ALC — and everything the host's ALC subclass instance
++        /// references — stayed reachable forever. The attempt itself was already side-effect
++        /// free; the strand came from the Prepare-time handle having no GC-driven release.
++        /// Now the finalizer of the last LoaderAllocator witness runs the same all-or-nothing
++        /// quiescence-gated teardown, so plain GC reclaims the ALC once the roots are gone —
++        /// no retry required. Kind-7 of the scout stats proves the scout path really performed
++        /// the teardown (non-vacuity: under the opt-in the strong handle makes ALC death
++        /// impossible any other way, and the stat pins it explicitly).
++        /// </summary>
++        [Fact]
++        public async Task ForcedUnload_SingleNotQuiescentAttempt_ThenDroppedRoots_DoesNotStrandAlc()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int scoutCompletionsBefore = ProtocolActive ? ScoutStats(ScoutCompletedTeardownCount) : 0;
++
++            WeakReference weakRef = RootedSingleAttemptThenDrop();
++
++            await CollectAndAssertDeadAsync(weakRef,
++                "an ALC whose single forced attempt reported NotQuiescent must become collectible by plain GC " +
++                "once the host drops its roots — a never-retried attempt must not strand the context.");
++
++            if (ProtocolActive)
++            {
++                Assert.True(ScoutStats(ScoutCompletedTeardownCount) > scoutCompletionsBefore,
++                    "the reclaim must have been performed by the GC-driven scout completion " +
++                    $"(kind-7 before={scoutCompletionsBefore} after={ScoutStats(ScoutCompletedTeardownCount)}).");
++            }
++        }
++
++        /// <summary>
++        /// The purest statement of the fixed contract: no forced attempt at all. Unload() a
++        /// collectible context, drop every root, and plain GC must reclaim it — under the
++        /// opt-in via the scout completion (asserted through kind-7), and with the opt-in off
++        /// (or threads enabled) via the non-collectible Prepare path that releases the strong
++        /// handle immediately. Runs with the same assertion on every leg.
++        /// </summary>
++        [Fact]
++        public async Task Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int scoutCompletionsBefore = ProtocolActive ? ScoutStats(ScoutCompletedTeardownCount) : 0;
++
++            WeakReference weakRef = LoadRootUnloadAndDrop();
++
++            await CollectAndAssertDeadAsync(weakRef,
++                "an unloaded collectible ALC must become collectible by plain GC once the host drops its roots, " +
++                "even if the host never calls ForceNativeUnload at all.");
++
++            if (ProtocolActive)
++            {
++                Assert.True(ScoutStats(ScoutCompletedTeardownCount) > scoutCompletionsBefore,
++                    "the reclaim must have been performed by the GC-driven scout completion " +
++                    $"(kind-7 before={scoutCompletionsBefore} after={ScoutStats(ScoutCompletedTeardownCount)}).");
++            }
++        }
++
++        /// <summary>
++        /// A host that DOES retry after dropping its roots must still observe Completed — either
++        /// because its retry performs the teardown, or because the scout completion beat it there
++        /// and the retry reports the already-completed state idempotently (the native struct is
++        /// kept as a tombstone precisely so this retry cannot dereference freed storage). The
++        /// scout residual must also fully drain.
++        /// </summary>
++        [Fact]
++        public async Task ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            FirstAttemptOnRootedContext(context);
++
++            if (ProtocolActive)
++            {
++                // Second attempt after the rooted state died: must reach Completed no matter
++                // whether this attempt or the scout completion performs the teardown.
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
++                // Idempotence holds across the tombstone path too.
++                Assert.Equal(Completed, Force(context));
++                await DrainRetiredScoutsAsync();
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(context));
++            }
++
++            context = null;
++            await CollectAndAssertDeadAsync(weakRef,
++                "a retried forced unload must leave the context reclaimable with zero residual.");
++        }
++
+         [Fact]
+         public async Task ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
+         {
+@@ -949,6 +1063,28 @@ private static async Task RunRejectedCycles(int cycles)
+         // loop (mono_main_thread_schedule_background_job). Finalizers therefore never run inside a
+         // synchronous test method — awaiting Task.Delay turns the event loop and runs the pump.
+         [MethodImpl(MethodImplOptions.NoInlining)]
++        // Waits for a WeakReference to die across collections, turning the JS event loop between
++        // attempts. The turns matter twice over: they re-dispatch the continuation on a nearly
++        // empty interpreter stack (see ForceUntilCompletedAsync), and they let the scheduled
++        // single-threaded finalizer pump run — the GC-driven scout completion (the teardown that
++        // releases the native strong handle to the managed ALC) happens inside a finalizer, and
++        // GC.WaitForPendingFinalizers alone is an immediate no-op on single-threaded wasm.
++        private static async Task CollectAndAssertDeadAsync(WeakReference weakRef, string reason)
++        {
++            for (int attempt = 0; attempt < 20; attempt++)
++            {
++                GcQuiesce();
++                if (!weakRef.IsAlive)
++                {
++                    return;
++                }
++
++                await Task.Delay(1);
++            }
++
++            Assert.False(weakRef.IsAlive, reason);
++        }
++
+         private static async Task DrainRetiredScoutsAsync()
+         {
+             for (int attempt = 0; attempt < 20; attempt++)
+@@ -966,6 +1102,91 @@ private static async Task DrainRetiredScoutsAsync()
+             Assert.Equal(0, ScoutStats(RetiredSetSize));
+         }
+ 
++        // One rooted-attempt-then-drop protocol, fully confined to this synchronous NoInlining
++        // frame so that when it returns, the context, the rooted instance and every loader
++        // temporary are structurally absent from the conservatively scanned live stack region —
++        // only the WeakReference escapes. The single forced attempt runs while the instance
++        // still roots the witness, reproducing the downstream host's teardown-time attempt.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference RootedSingleAttemptThenDrop()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            object root = LoadUnloadReturningRootedInstance(context);
++
++            GcQuiesce();
++            int outcome = Force(context);
++            if (ProtocolActive)
++            {
++                // The live instance roots the LoaderAllocator witness, so the attempt must be
++                // refused — and (the point of the regression) must acquire nothing that outlives
++                // the refusal.
++                Assert.Equal(NotQuiescent, outcome);
++            }
++            else
++            {
++                // Opt-in off (natively non-collectible) or threads-enabled runtime (hard gate).
++                Assert.Equal(Rejected, outcome);
++            }
++
++            // The refused attempt must leave the rooted instance fully usable.
++            Assert.NotNull(root.ToString());
++
++            GC.KeepAlive(root);
++            GC.KeepAlive(context);
++            return weakRef;
++        }
++
++        // Same confinement discipline, without any forced attempt anywhere.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static WeakReference LoadRootUnloadAndDrop()
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            object root = LoadUnloadReturningRootedInstance(context);
++
++            Assert.NotNull(root.ToString());
++
++            GC.KeepAlive(root);
++            GC.KeepAlive(context);
++            return weakRef;
++        }
++
++        // First (refused) attempt on a still-rooted context, with the root confined to this
++        // frame; the caller keeps only the context reference for its later retry.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static void FirstAttemptOnRootedContext(AssemblyLoadContext context)
++        {
++            object root = LoadUnloadReturningRootedInstance(context);
++
++            GcQuiesce();
++            int outcome = Force(context);
++            if (ProtocolActive)
++            {
++                Assert.Equal(NotQuiescent, outcome);
++            }
++            else
++            {
++                Assert.Equal(Rejected, outcome);
++            }
++
++            GC.KeepAlive(root);
++        }
++
++        // Loads the collectible test assembly, instantiates a type from it (the managed root
++        // that keeps the LoaderAllocator witness alive), and initiates Unload — returning the
++        // instance as the caller-held root.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static object LoadUnloadReturningRootedInstance(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            object instance = Activator.CreateInstance(type);
++            Assert.NotNull(instance);
++            context.Unload();
++            return instance;
++        }
++
+         [MethodImpl(MethodImplOptions.NoInlining)]
+         private static async Task<WeakReference> LoadExerciseUnloadAndForce()
+         {
+@@ -1554,7 +1775,8 @@ private static void Churn(int rounds)
+         // Holding asm/type/list in THIS frame across the force would keep the primary and
+         // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
+         // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
+-        // it until a Completed force regardless (see LoadExerciseUnloadAndForce).
++        // it until the teardown completes — by a Completed force or the GC-driven scout
++        // completion — regardless (see LoadExerciseUnloadAndForce).
+         [MethodImpl(MethodImplOptions.NoInlining)]
+         private static async Task ReflectionHashInitUnderPressureCycle(int seed)
+         {
+diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+index 88ce94a0c..019acbad9 100644
+--- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
++++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+@@ -78,6 +78,12 @@ private static void KeepLoaderAllocator()
+         // cycles rather than growing by three per reflection-using memory manager. Unlike kinds
+         // 0/1 these are available on every build, because the ownership fix they observe is
+         // unconditional (not part of the DISABLE_THREADS-gated forced teardown).
++        //
++        // Kind 7 counts ALC teardowns completed by the GC-driven scout path (the finalizer of
++        // the last LoaderAllocator witness ran the teardown because the whole set was already
++        // quiescent — see LoaderAllocatorScout_Destroy in assembly-load-context.c). Gated like
++        // kinds 0/1. Lifecycle tests use it to prove an ALC reclaimed after its host dropped
++        // every root really went through the scout path rather than a forced attempt.
+         internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
+ 
+         [MethodImplAttribute(MethodImplOptions.InternalCall)]
+@@ -119,7 +125,10 @@ internal static int RunJiterpreterTableSelfTest()
+         // in the native assembly-load-context.c.
+         internal enum ForceNativeUnloadResult
+         {
+-            // The native teardown ran to completion and the ALC was freed.
++            // The native teardown ran to completion and the ALC was freed — either by this call,
++            // or earlier by the GC-driven scout completion (the finalizer of the last
++            // LoaderAllocator witness runs the same quiescence-gated teardown once the host's
++            // roots are gone; this call then reports the already-completed state idempotently).
+             Completed = 0,
+             // The managed LoaderAllocator is still rooted (its weak handle target is non-NULL), so
+             // freeing now would reclaim live memory. Nothing was freed; the caller should retry
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index d8eac6e34..3a550546d 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -80,6 +80,10 @@ alcs_unlock (void)
+ static GPtrArray *retired_scout_targets;
+ /* Monotonic count of scouts given a terminal (TRUE) Destroy outcome; diagnostics only. */
+ static gint32 retired_scout_terminal_count;
++/* Monotonic count of ALC teardowns completed by the GC-driven scout path (the finalizer of
++ * the last LoaderAllocator witness ran mono_alc_cleanup because the whole set was already
++ * quiescent); diagnostics only, exposed as kind 7 of InternalGetScoutRetirementStats. */
++static gint32 scout_completed_teardown_count;
+ 
+ static void
+ retired_scout_targets_add (MonoMemoryManager *memory_manager)
+@@ -320,16 +324,18 @@ mono_alc_cleanup (MonoAssemblyLoadContext *alc)
+ 	 * whole feature is hard-gated at compile time to the single-threaded browser build
+ 	 * (DISABLE_THREADS): on a threads-enabled runtime InternalForceNativeUnload rejects
+ 	 * up front and mono_alc_init never honours the collectible opt-in, so this function
+-	 * is unreachable there (its only caller is mono_alc_free from the gated icall) and
++	 * is unreachable there (its callers are mono_alc_free from the gated icall and the
++	 * DISABLE_THREADS-gated scout completion in LoaderAllocatorScout_Destroy) and
+ 	 * no preparation (mono_mem_manager_start_unload) has mutated the shared managers.
+ 	 * Within the gate the loader lock brackets the whole sequence (matching the scout
+ 	 * protocol) and is correctly ordered above the per-owner memory_managers_lock
+ 	 * (loader-internals.h locking hierarchy).
+ 	 *
+-	 * Quiescence: the caller (InternalForceNativeUnload) has already verified — before
+-	 * anything was freed — that EVERY manager deleted here (the primary above and each
+-	 * shared generic manager in this loop) has a dead LoaderAllocator liveness witness,
+-	 * so nothing reclaimed below can still be referenced from managed code.
++	 * Quiescence: the caller (InternalForceNativeUnload or the scout completion, both via
++	 * alc_is_managed_quiescent) has already verified — before anything was freed — that
++	 * EVERY manager deleted here (the primary above and each shared generic manager in
++	 * this loop) has a dead LoaderAllocator liveness witness, so nothing reclaimed below
++	 * can still be referenced from managed code.
+ 	 */
+ #ifdef DISABLE_THREADS
+ 	mono_loader_lock ();
+@@ -464,6 +470,56 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	mono_alc_memory_managers_unlock (alc);
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Quiescence gate — ALL-OR-NOTHING over the exact set of managers a teardown would free.
++ * alc->unloading only means the managed Unload() was requested — it is NOT proof that the
++ * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
++ * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
++ * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
++ * LoaderAllocator is now held only by managed references; while a manager's weak-handle
++ * target is non-NULL, managed roots remain and freeing would reclaim live memory. This is
++ * exactly the criterion the LoaderAllocatorScout uses.
++ *
++ * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
++ * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
++ * {default, this} manager) keeps that shared witness alive even after the primary witness
++ * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
++ * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
++ * anything is freed. If ANY witness is live, nothing may be freed. A NULL weak handle
++ * means no LoaderAllocator bookkeeping was ever materialised for that manager (no
++ * vtable/object of it ever existed), which is safe to free.
++ *
++ * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
++ * below (which reports NotQuiescent so the host can retry) and the GC-driven scout
++ * completion in LoaderAllocatorScout_Destroy (which simply waits for a later finalization
++ * round).
++ */
++static gboolean
++alc_is_managed_quiescent (MonoAssemblyLoadContext *alc)
++{
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++	if (primary_mm && primary_mm->loader_allocator_weak_handle &&
++			mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
++		return FALSE;
++
++	gboolean witness_live = FALSE;
++	mono_alc_memory_managers_lock (alc);
++	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
++		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
++		if (mm == primary_mm)
++			continue;
++		if (mm->loader_allocator_weak_handle &&
++				mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL) {
++			witness_live = TRUE;
++			break;
++		}
++	}
++	mono_alc_memory_managers_unlock (alc);
++	return !witness_live;
++}
++#endif /* DISABLE_THREADS */
++
+ int
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
+ {
+@@ -505,45 +561,19 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+ 		return FORCE_UNLOAD_REJECTED;
+ 
+ 	/*
+-	 * Quiescence gate — ALL-OR-NOTHING over the exact set of managers the teardown will
+-	 * free. alc->unloading only means the managed Unload() was requested — it is NOT proof
+-	 * that the collectible LoaderAllocators have been collected. Stack frames,
+-	 * shared-generic type arguments, delegates and runtime handles can still root them
+-	 * (dotnet/runtime#40394, #34072). mono_mem_manager_start_unload already dropped the
+-	 * strong handles, so each LoaderAllocator is now held only by managed references; while
+-	 * a manager's weak-handle target is non-NULL, managed roots remain and freeing would
+-	 * reclaim live memory. This is exactly the criterion the (disabled)
+-	 * LoaderAllocatorScout uses.
+-	 *
+-	 * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
+-	 * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
+-	 * {default, this} manager) keeps that shared witness alive even after the primary
+-	 * witness has cleared. mono_alc_cleanup deletes the primary manager AND every shared
+-	 * generic manager on alc->generic_memory_managers, so each of those witnesses must be
+-	 * dead before anything is freed. If ANY witness is live, free nothing and report
+-	 * NotQuiescent so the host retries after another GC rather than losing its single
+-	 * chance. A NULL weak handle means no LoaderAllocator bookkeeping was ever materialised
+-	 * for that manager (no vtable/object of it ever existed), which is safe to free.
++	 * Idempotent completion: the GC-driven scout path (LoaderAllocatorScout_Destroy below)
++	 * may have already torn this ALC down after the host's roots died — a downstream WASM
++	 * host doing repeated collectible-ALC load/unload cycles is not required to keep
++	 * retrying a NotQuiescent attempt for the reclamation to happen. Everything material
++	 * was freed by mono_alc_cleanup then; only this struct remains (see native_tombstoned
++	 * in loader-internals.h), so report Completed without dereferencing anything further.
++	 * The managed wrapper latches its terminal claim and zeroes its pointer on Completed,
++	 * exactly as if this call had performed the teardown itself.
+ 	 */
+-	MonoMemoryManager *primary_mm = alc->memory_manager;
+-	if (primary_mm && primary_mm->loader_allocator_weak_handle &&
+-			mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
+-		return FORCE_UNLOAD_NOT_QUIESCENT;
++	if (alc->native_tombstoned)
++		return FORCE_UNLOAD_COMPLETED;
+ 
+-	gboolean witness_live = FALSE;
+-	mono_alc_memory_managers_lock (alc);
+-	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
+-		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
+-		if (mm == primary_mm)
+-			continue;
+-		if (mm->loader_allocator_weak_handle &&
+-				mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL) {
+-			witness_live = TRUE;
+-			break;
+-		}
+-	}
+-	mono_alc_memory_managers_unlock (alc);
+-	if (witness_live)
++	if (!alc_is_managed_quiescent (alc))
+ 		return FORCE_UNLOAD_NOT_QUIESCENT;
+ 
+ 	mono_alc_free (alc);
+@@ -593,6 +623,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 	 * mono_weak_hash_table_dead_lookup_count). Unconditional like kinds 2/3/5. A lifecycle test
+ 	 * uses it to prove the global assembly enumeration really took the terminal dead-cache path
+ 	 * for a condemned assembly (skipping it) instead of passing vacuously.
++	 *
++	 * Kind 7 — monotonic count of ALC teardowns completed by the GC-driven scout path (see
++	 * scout_completed_teardown_count and LoaderAllocatorScout_Destroy). Behind the
++	 * DISABLE_THREADS gate like kinds 0/1. Lifecycle tests use it to prove an ALC whose host
++	 * dropped every root without retrying a NotQuiescent forced attempt was really reclaimed
++	 * by the scout finalizer rather than by a forced attempt.
+ 	 */
+ 	if (kind == 2 || kind == 3)
+ 		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
+@@ -611,6 +647,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 		return retired_scout_terminal_count;
+ 	case 4:
+ 		return mono_mem_manager_alc_unload_test_gc_hook_count ();
++	case 7:
++		return scout_completed_teardown_count;
+ 	default:
+ 		return -1;
+ 	}
+@@ -1109,6 +1147,56 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+ 		retired_scout_terminal_count++;
+ 		return TRUE;
+ 	}
++
++	/*
++	 * GC-driven completion for the opt-in forced-unload flow. `native` was not in the
++	 * retired registry, so it is a LIVE memory manager (only the forced teardown frees
++	 * managers, and it registers every one it frees) and may be dereferenced. This scout
++	 * finalizing means ITS LoaderAllocator witness is dead; if the manager is owned by a
++	 * collectible, unloading ALC whose WHOLE witness set is dead, complete the teardown
++	 * here — a downstream WASM host doing repeated collectible-ALC load/unload cycles
++	 * whose single ForceNativeUnload attempt reported NotQuiescent (and which then dropped
++	 * every root without retrying) would otherwise strand the managed ALC forever: the
++	 * strong alc->gchandle installed by PrepareForAssemblyLoadContextRelease is released
++	 * only by mono_alc_cleanup, and before this path existed only a Completed forced
++	 * attempt ever ran it. Now the last witness's finalizer runs the SAME all-or-nothing
++	 * quiescence gate and the SAME cleanup; the struct itself is kept as a tiny tombstone
++	 * (native_tombstoned) so a host that still holds the managed ALC and retries later
++	 * gets an idempotent Completed instead of a use-after-free (see
++	 * InternalForceNativeUnload above).
++	 *
++	 * Single-threaded by construction (finalizers and icalls share the one thread), so
++	 * this cannot interleave with a managed forced attempt; collectible is only ever TRUE
++	 * under the MONO_WASM_ENABLE_ALC_UNLOAD opt-in (mono_alc_init), so default consumers
++	 * never take this branch. The owner scan runs BEFORE mono_alc_cleanup because the
++	 * cleanup frees this manager (mm->alcs lives in its mempool).
++	 */
++	MonoMemoryManager *mm = (MonoMemoryManager *)native;
++	MonoAssemblyLoadContext *condemned = NULL;
++	for (int i = 0; i < mm->n_alcs; ++i) {
++		MonoAssemblyLoadContext *owner = mm->alcs [i];
++		if (!owner || !owner->collectible || !owner->unloading || owner->native_tombstoned)
++			continue;
++		if (!alc_is_managed_quiescent (owner))
++			continue;
++		condemned = owner;
++		break;
++	}
++	if (condemned) {
++		mono_alc_cleanup (condemned);
++		condemned->native_tombstoned = TRUE;
++		scout_completed_teardown_count++;
++		/*
++		 * The cleanup freed this scout's own manager and registered it (with every other
++		 * materialised manager of the ALC) in the retired registry, so consume the entry
++		 * now for the terminal outcome instead of waiting for a pointless extra
++		 * finalization round.
++		 */
++		if (retired_scout_targets_consume (native)) {
++			retired_scout_terminal_count++;
++			return TRUE;
++		}
++	}
+ #endif
+ 
+ 	/* Not enabled yet */
+diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
+index 4275a39d2..b8f5e1f14 100644
+--- a/src/mono/mono/metadata/loader-internals.h
++++ b/src/mono/mono/metadata/loader-internals.h
+@@ -107,6 +107,13 @@ struct _MonoAssemblyLoadContext {
+ 	gboolean collectible;
+ 	// Set to TRUE when the unloading process has begun
+ 	gboolean unloading;
++	// Set to TRUE when the GC-driven scout completion (LoaderAllocatorScout_Destroy) has
++	// already run mono_alc_cleanup for this ALC. Everything material is freed; only this
++	// struct remains, kept as a tiny tombstone so a host that still holds the managed ALC
++	// and calls ForceNativeUnload afterwards gets an idempotent Completed instead of
++	// dereferencing freed storage. Only meaningful for collectible ALCs under the
++	// MONO_WASM_ENABLE_ALC_UNLOAD opt-in on the single-threaded browser build.
++	gboolean native_tombstoned;
+ 	// Used in native-library.c for the hash table below; do not access anywhere else
+ 	MonoCoopMutex pinvoke_lock;
+ 	// Maps malloc-ed char* pinvoke scope -> MonoDl*
+-- 
+2.53.0.vfs.0.0
+
