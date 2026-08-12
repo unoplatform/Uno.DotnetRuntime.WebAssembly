@@ -59,9 +59,16 @@ CoreCLR LoaderAllocatorScout design:
     is answered Completed by the claim CAS before reaching native, and
     the by-name/path/stream load icalls only ever receive the pointer
     through that getter. Mechanics are plain scalar stores (an IntPtr
-    and an int32; no reference writes, no barrier concerns;
-    mono_class_get_field_from_name_full walks the parent chain to the
-    declaring class for host subclasses); no reader can hold a
+    and an int32; no reference writes, no barrier concerns) resolved
+    from the DECLARING System.Runtime.Loader.AssemblyLoadContext class
+    (mono_class_get_assembly_load_context_class) rather than the
+    wrapper's dynamic class: field lookup searches the supplied class
+    before walking to its parent, so a legal host subclass shadowing
+    the field names would otherwise be latched in the wrong storage --
+    leaving the freed pointer reachable through the real base field --
+    and would poison the cached field descriptors for every later
+    wrapper; type and declaring-class asserts pin the resolution. No
+    reader can hold a
     pre-latch pointer across the scout run because finalizers on the
     single-threaded browser runtime execute as scheduled event-loop
     jobs -- never mid-icall, never between a NativeALC read and the
@@ -154,16 +161,25 @@ New lifecycle tests:
     kept scout-completed structs as host-retry-freed tombstones, which
     a never-retrying host leaked one per cycle, unbounded and
     invisible to kind 8.
+  * ScoutCompletion_LatchesBaseFields_WhenSubclassHidesThem -- the
+    field-shadowing regression: a legal subclass hiding both latch
+    field names is driven through the scout completion FIRST, then a
+    normal subclass in the same test (so the shared field cache cannot
+    mask a wrong-class resolution through process ordering); both must
+    reject ordinary loads via the terminal latch and answer retries
+    from the managed claim -- with a dynamic-class lookup the hiding
+    context's load would be a native use-after-free and its retry
+    would re-enter the native teardown with a freed pointer.
 
 Refs https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/169.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 323 +++++++++++++++++-
+ .../tests/ForcedNativeUnloadTests.cs          | 417 +++++++++++++++++-
  .../Loader/AssemblyLoadContext.Mono.cs        |  24 +-
- .../mono/metadata/assembly-load-context.c     | 296 +++++++++++++---
- 3 files changed, 593 insertions(+), 50 deletions(-)
+ .../mono/metadata/assembly-load-context.c     | 312 +++++++++++--
+ 3 files changed, 703 insertions(+), 50 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 60708a1b5..9e52b8a6c 100644
+index 60708a1b5..0781e05f9 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -78,6 +78,17 @@ public class ForcedNativeUnloadTests
@@ -184,7 +200,7 @@ index 60708a1b5..9e52b8a6c 100644
  
          private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
              .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
-@@ -269,6 +280,207 @@ public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
+@@ -269,6 +280,301 @@ public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
              }
          }
  
@@ -323,6 +339,100 @@ index 60708a1b5..9e52b8a6c 100644
 +                "a retried forced unload must leave the context reclaimable with zero residual.");
 +        }
 +
++        // A LEGAL host subclass that hides both latch field names. The native scout latch must
++        // resolve the REAL fields on System.Runtime.Loader.AssemblyLoadContext itself — a
++        // lookup started from the wrapper's dynamic class finds these shadows first, latches
++        // the wrong storage, leaves the freed native pointer reachable through the real base
++        // field (use-after-free on the next ordinary load), and poisons the process-wide field
++        // cache for every later wrapper.
++        private sealed class FieldHidingAssemblyLoadContext : ResourceAssemblyLoadContext
++        {
++#pragma warning disable CS0169, CS0414, IDE0051 // deliberate name shadows, never read
++            private IntPtr _nativeAssemblyLoadContext;
++            private int _nativeUnloadForced;
++#pragma warning restore CS0169, CS0414, IDE0051
++
++            public FieldHidingAssemblyLoadContext()
++                : base(isCollectible: true)
++            {
++                LoadBy = LoadBy.Stream;
++            }
++        }
++
++        /// <summary>
++        /// Field-shadowing regression for the scout latch: the latch must write the DECLARING
++        /// class's fields, not whatever a subclass put in front of them by name. Runs the
++        /// hiding subclass FIRST and a normal subclass SECOND in the same test, so the shared
++        /// MonoClassField cache cannot mask a wrong-class resolution through lucky process
++        /// ordering: if the hiding subclass had poisoned the cache, the normal context's latch
++        /// would break too — and if the lookup started from the dynamic class, the hiding
++        /// context's post-completion load would be a native use-after-free rather than the
++        /// asserted managed rejection, and its retry would re-enter the native teardown with a
++        /// freed pointer instead of being answered by the managed claim latch.
++        /// </summary>
++        [Fact]
++        public async Task ScoutCompletion_LatchesBaseFields_WhenSubclassHidesThem()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int structsBefore = ScoutStats(NativeStructsGauge);
++
++            int scoutBeforeHiding = ProtocolActive ? ScoutStats(ScoutCompletedTeardownCount) : 0;
++            var hiding = new FieldHidingAssemblyLoadContext();
++            var weakHiding = new WeakReference(hiding);
++            FirstAttemptOnRootedContext(hiding);
++
++            if (ProtocolActive)
++            {
++                await PumpUntilScoutCompletionAsync(scoutBeforeHiding);
++
++                // (a) The REAL base fields were latched: ordinary loads reject in managed code
++                // via the terminal latch, never reading the freed pointer.
++                Assert.Throws<ObjectDisposedException>(
++                    () => hiding.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++                // (b) Retries are answered by the managed claim latch, idempotently, without
++                // re-entering the native teardown.
++                Assert.Equal(Completed, Force(hiding));
++                Assert.Equal(Completed, Force(hiding));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(hiding));
++            }
++
++            // Normal subclass second: proves the field cache the hiding subclass populated
++            // first still latches every later wrapper correctly.
++            int scoutBeforeNormal = ProtocolActive ? ScoutStats(ScoutCompletedTeardownCount) : 0;
++            var normal = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakNormal = new WeakReference(normal);
++            FirstAttemptOnRootedContext(normal);
++
++            if (ProtocolActive)
++            {
++                await PumpUntilScoutCompletionAsync(scoutBeforeNormal);
++                Assert.Throws<ObjectDisposedException>(
++                    () => normal.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++                Assert.Equal(Completed, Force(normal));
++                await DrainRetiredScoutsAsync();
++                Assert.Equal(0, ScoutStats(PendingUnloadsGauge));
++                Assert.Equal(structsBefore, ScoutStats(NativeStructsGauge));
++            }
++            else
++            {
++                Assert.Equal(Rejected, Force(normal));
++            }
++
++            hiding = null;
++            normal = null;
++            await CollectAndAssertDeadAsync(weakHiding,
++                "a field-hiding subclass context must be reclaimable after the scout completion latched the base fields.");
++            await CollectAndAssertDeadAsync(weakNormal,
++                "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
++        }
++
 +        /// <summary>
 +        /// The no-retry residue regression: a host that never calls ForceNativeUnload at all —
 +        /// N load/unload/drop cycles — must leave NO native residue. An earlier revision kept
@@ -392,7 +502,7 @@ index 60708a1b5..9e52b8a6c 100644
          [Fact]
          public async Task ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
          {
-@@ -936,6 +1148,29 @@ private static async Task RunRejectedCycles(int cycles)
+@@ -936,6 +1242,29 @@ private static async Task RunRejectedCycles(int cycles)
              }
          }
  
@@ -422,7 +532,7 @@ index 60708a1b5..9e52b8a6c 100644
          // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
          // each pass collects (queueing/re-queueing any scouts whose LoaderAllocator is dead,
          // including ones that re-registered with FALSE on an earlier pass) and then lets finalizers
-@@ -966,6 +1201,91 @@ private static async Task DrainRetiredScoutsAsync()
+@@ -966,6 +1295,91 @@ private static async Task DrainRetiredScoutsAsync()
              Assert.Equal(0, ScoutStats(RetiredSetSize));
          }
  
@@ -514,7 +624,7 @@ index 60708a1b5..9e52b8a6c 100644
          [MethodImpl(MethodImplOptions.NoInlining)]
          private static async Task<WeakReference> LoadExerciseUnloadAndForce()
          {
-@@ -1554,7 +1874,8 @@ private static void Churn(int rounds)
+@@ -1554,7 +1968,8 @@ private static void Churn(int rounds)
          // Holding asm/type/list in THIS frame across the force would keep the primary and
          // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
          // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
@@ -567,7 +677,7 @@ index 88ce94a0c..7bbf6a7d1 100644
              // The managed LoaderAllocator is still rooted (its weak handle target is non-NULL), so
              // freeing now would reclaim live memory. Nothing was freed; the caller should retry
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index d8eac6e34..a47a5ef03 100644
+index d8eac6e34..67cb51a0c 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -9,6 +9,7 @@
@@ -810,7 +920,7 @@ index d8eac6e34..a47a5ef03 100644
  	default:
  		return -1;
  	}
-@@ -1092,13 +1166,68 @@ mono_alc_get_all (void)
+@@ -1092,13 +1166,84 @@ mono_alc_get_all (void)
  	return all_alcs;
  }
  
@@ -833,8 +943,16 @@ index d8eac6e34..a47a5ef03 100644
 + *     what mono_alc_cleanup is about to release, so the target is still rooted.
 + *   - Both fields are unmanaged scalars (an IntPtr and an int32) — no reference writes,
 + *     so no write-barrier concerns; mono_field_set_value_internal on instance scalar
-+ *     fields is a plain store. The wrapper may be a host subclass;
-+ *     mono_class_get_field_from_name_full walks the parent chain to the declaring class.
++ *     fields is a plain store. The wrapper may be a host subclass, and a LEGAL subclass
++ *     may declare private fields with the SAME NAMES — mono_class_get_field_from_name_full
++ *     searches the supplied class before walking to the parent, so the lookup MUST start
++ *     from the declaring System.Runtime.Loader.AssemblyLoadContext class itself
++ *     (mono_class_get_assembly_load_context_class), never from the wrapper's dynamic
++ *     class: resolving from the subclass would latch the shadowing subclass storage,
++ *     leave the real base fields unlatched (freed pointer still reachable, claim still
++ *     idle), and — because the resolved MonoClassField descriptors are cached — poison
++ *     the latch for every later wrapper in the process. The type and declaring-class
++ *     asserts below pin the resolution.
 + *   - No reader can hold a pre-latch pointer across this run: on the single-threaded
 + *     browser runtime, finalizers execute as scheduled event-loop jobs — never mid-icall
 + *     and never between a NativeALC read and the icall it feeds within one synchronous
@@ -851,14 +969,22 @@ index d8eac6e34..a47a5ef03 100644
 +	g_assert (wrapper); /* strong handle — released only by the cleanup that follows */
 +
 +	if (!pointer_field || !claim_field) {
-+		/* Cache on the declaring class: field lookup walks parents, and the resolved
-+		 * MonoClassField of System.Runtime.Loader.AssemblyLoadContext is the same for
-+		 * every subclass instance. */
-+		MonoClass *klass = mono_object_class (wrapper);
-+		pointer_field = mono_class_get_field_from_name_full (klass, "_nativeAssemblyLoadContext", NULL);
-+		claim_field = mono_class_get_field_from_name_full (klass, "_nativeUnloadForced", NULL);
++		/* Resolve from the DECLARING class, not the wrapper's dynamic class: a subclass
++		 * field with the same name would otherwise shadow the real one (lookup searches
++		 * the supplied class first) and the cached descriptors would poison every later
++		 * wrapper. The declaring class is the same for every subclass instance, so the
++		 * cache is order-independent. */
++		MonoClass *alc_class = mono_class_get_assembly_load_context_class ();
++		g_assert (alc_class);
++		pointer_field = mono_class_get_field_from_name_full (alc_class, "_nativeAssemblyLoadContext", NULL);
++		claim_field = mono_class_get_field_from_name_full (alc_class, "_nativeUnloadForced", NULL);
 +		g_assert (pointer_field);
 +		g_assert (claim_field);
++		/* Pin the resolution: exact declaring class and exact unmanaged scalar types. */
++		g_assert (m_field_get_parent (pointer_field) == alc_class);
++		g_assert (m_field_get_parent (claim_field) == alc_class);
++		g_assert (pointer_field->type->type == MONO_TYPE_I);
++		g_assert (claim_field->type->type == MONO_TYPE_I4);
 +	}
 +
 +	gpointer zero = NULL;
@@ -881,7 +1007,7 @@ index d8eac6e34..a47a5ef03 100644
  	 * The consult is a pure pointer-value comparison — the freed manager is NEVER
  	 * dereferenced — and consuming the entry retires exactly one scout: it returns TRUE,
  	 * so the finalizer does not GC.ReRegisterForFinalize and the scout population stays
-@@ -1109,6 +1238,77 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+@@ -1109,6 +1254,77 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  		retired_scout_terminal_count++;
  		return TRUE;
  	}
