@@ -91,10 +91,10 @@ leg, exactly like the field failure; green flag-off/threads):
 Refs https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/169.
 ---
  .../tests/ForcedNativeUnloadTests.cs          | 224 +++++++++++++++++-
- .../Loader/AssemblyLoadContext.Mono.cs        |  11 +-
- .../mono/metadata/assembly-load-context.c     | 172 ++++++++++----
+ .../Loader/AssemblyLoadContext.Mono.cs        |  14 +-
+ .../mono/metadata/assembly-load-context.c     | 185 +++++++++++----
  src/mono/mono/metadata/loader-internals.h     |   7 +
- 4 files changed, 370 insertions(+), 44 deletions(-)
+ 4 files changed, 383 insertions(+), 47 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 index 60708a1b5..ee90983aa 100644
@@ -360,7 +360,7 @@ index 60708a1b5..ee90983aa 100644
          private static async Task ReflectionHashInitUnderPressureCycle(int seed)
          {
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index 88ce94a0c..019acbad9 100644
+index 88ce94a0c..25ff655e0 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 @@ -78,6 +78,12 @@ private static void KeepLoaderAllocator()
@@ -376,20 +376,23 @@ index 88ce94a0c..019acbad9 100644
          internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
  
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
-@@ -119,7 +125,10 @@ internal static int RunJiterpreterTableSelfTest()
+@@ -119,7 +125,13 @@ internal static int RunJiterpreterTableSelfTest()
          // in the native assembly-load-context.c.
          internal enum ForceNativeUnloadResult
          {
 -            // The native teardown ran to completion and the ALC was freed.
-+            // The native teardown ran to completion and the ALC was freed — either by this call,
-+            // or earlier by the GC-driven scout completion (the finalizer of the last
-+            // LoaderAllocator witness runs the same quiescence-gated teardown once the host's
-+            // roots are gone; this call then reports the already-completed state idempotently).
++            // The native teardown ran to completion: every memory manager, loaded image and
++            // GC handle of the context was released, and the context is terminally disposed.
++            // Performed either by this call (which also frees the native ALC struct) or earlier
++            // by the GC-driven scout completion (the finalizer of the last LoaderAllocator
++            // witness runs the same quiescence-gated teardown once the host's roots are gone,
++            // keeping the tiny struct as a tombstone so this call can report the
++            // already-completed state idempotently instead of dereferencing freed storage).
              Completed = 0,
              // The managed LoaderAllocator is still rooted (its weak handle target is non-NULL), so
              // freeing now would reclaim live memory. Nothing was freed; the caller should retry
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index d8eac6e34..3a550546d 100644
+index d8eac6e34..0590552c9 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -80,6 +80,10 @@ alcs_unlock (void)
@@ -427,7 +430,7 @@ index d8eac6e34..3a550546d 100644
  	 */
  #ifdef DISABLE_THREADS
  	mono_loader_lock ();
-@@ -464,6 +470,56 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -464,13 +470,67 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -484,7 +487,19 @@ index d8eac6e34..3a550546d 100644
  int
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
  {
-@@ -505,45 +561,19 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+ 	/*
+ 	 * Host-triggered native teardown of a collectible ALC. Returns an outcome the managed
+ 	 * bridge maps to AssemblyLoadContext.ForceNativeUnloadResult:
+-	 *   0 = Completed     — the ALC was torn down and freed.
++	 *   0 = Completed     — the teardown ran to completion: every memory manager, loaded
++	 *                       image and GC handle was released. When this call performs the
++	 *                       teardown it also frees the ALC struct; when the GC-driven scout
++	 *                       completion performed it earlier, the struct was kept as a
++	 *                       tombstone and this call reports the state idempotently.
+ 	 *   1 = NotQuiescent  — managed roots to the ALC still exist; nothing freed, retry later.
+ 	 *   2 = Rejected      — feature unavailable (threads-enabled build), or null / default /
+ 	 *                       non-collectible / not-yet-unloading ALC.
+@@ -505,45 +565,19 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  		return FORCE_UNLOAD_REJECTED;
  
  	/*
@@ -541,7 +556,7 @@ index d8eac6e34..3a550546d 100644
  		return FORCE_UNLOAD_NOT_QUIESCENT;
  
  	mono_alc_free (alc);
-@@ -593,6 +623,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -593,6 +627,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * mono_weak_hash_table_dead_lookup_count). Unconditional like kinds 2/3/5. A lifecycle test
  	 * uses it to prove the global assembly enumeration really took the terminal dead-cache path
  	 * for a condemned assembly (skipping it) instead of passing vacuously.
@@ -554,7 +569,7 @@ index d8eac6e34..3a550546d 100644
  	 */
  	if (kind == 2 || kind == 3)
  		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
-@@ -611,6 +647,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -611,6 +651,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return retired_scout_terminal_count;
  	case 4:
  		return mono_mem_manager_alc_unload_test_gc_hook_count ();
@@ -563,15 +578,29 @@ index d8eac6e34..3a550546d 100644
  	default:
  		return -1;
  	}
-@@ -1109,6 +1147,56 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+@@ -1097,8 +1139,9 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+ {
+ #ifdef DISABLE_THREADS
+ 	/*
+-	 * Terminal outcome for scouts whose memory manager was already freed by the forced
+-	 * native teardown (see the retired_scout_targets registry at the top of this file).
++	 * Terminal outcome for scouts whose memory manager was already freed by a completed
++	 * teardown — a forced attempt or an earlier scout completion, both run
++	 * mono_alc_cleanup (see the retired_scout_targets registry at the top of this file).
+ 	 * The consult is a pure pointer-value comparison — the freed manager is NEVER
+ 	 * dereferenced — and consuming the entry retires exactly one scout: it returns TRUE,
+ 	 * so the finalizer does not GC.ReRegisterForFinalize and the scout population stays
+@@ -1109,6 +1152,58 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  		retired_scout_terminal_count++;
  		return TRUE;
  	}
 +
 +	/*
 +	 * GC-driven completion for the opt-in forced-unload flow. `native` was not in the
-+	 * retired registry, so it is a LIVE memory manager (only the forced teardown frees
-+	 * managers, and it registers every one it frees) and may be dereferenced. This scout
++	 * retired registry, so it is a LIVE memory manager and may be dereferenced: managers
++	 * are only ever freed by the two teardown initiators — a Completed forced attempt and
++	 * this scout completion, both via mono_alc_cleanup — and the cleanup registers every
++	 * manager it frees before any scout can observe it. This scout
 +	 * finalizing means ITS LoaderAllocator witness is dead; if the manager is owned by a
 +	 * collectible, unloading ALC whose WHOLE witness set is dead, complete the teardown
 +	 * here — a downstream WASM host doing repeated collectible-ALC load/unload cycles
