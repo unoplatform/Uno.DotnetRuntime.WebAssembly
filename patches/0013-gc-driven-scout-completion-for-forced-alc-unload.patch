@@ -63,6 +63,27 @@ CoreCLR LoaderAllocatorScout design:
     -- the documented, bounded residual of the scout-completed path (a
     Completed forced attempt still frees everything at once, as
     before).
+  * Torn-down guard at the icall boundary: between the scout
+    completion and a host retry, the surviving managed wrapper still
+    carries the raw native pointer with an idle claim, and the BY-NAME
+    load path (LoadFromAssemblyName ->
+    Assembly/RuntimeAssembly.InternalLoad) reaches the native ALC
+    without any managed VerifyIsAlive gate -- an ordinary load in that
+    window would walk into state mono_alc_cleanup already destroyed
+    (assemblies_lock, loaded_images): a use-after-destroy, not an
+    exception. Every icall that receives the raw pointer (InternalLoad
+    by-name, InternalLoadFile, InternalLoadFromStream) now rejects a
+    native_tombstoned context up front with InvalidOperationException
+    (mono_alc_reject_if_torn_down); reading the flag is safe because
+    the struct is freed only by the claim-gated retry, and the managed
+    NativeALC getter blocks every consumer once that claim is latched.
+    Loads into an unloading-but-not-yet-torn-down context
+    intentionally keep working: the native side is fully functional
+    there, and upstream also services cached by-name resolves during
+    the unloading window (the path/stream entry points
+    VerifyIsAlive-reject there, upstream and here alike), so a blanket
+    managed unloading guard on the by-name path would change
+    contractual behavior default consumers rely on.
   * No zero-witness hole: every opted-in collectible ALC eagerly
     materialises its primary LoaderAllocator -- and therefore a scout
     and a weak witness -- at creation (mono_alc_init calls
@@ -125,21 +146,25 @@ New lifecycle tests:
   * ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual --
     NOT a strand red (it also passes pre-fix): it deterministically
     covers the tombstone-retry branch (the UAF guard) by pumping GC
-    until kind-7 advances BEFORE retrying, then asserts the retry
-    Completes, that a further call is answered by the managed
-    terminal-claim latch, and that the scout registry and the
-    pending-unloads gauge drain to zero.
+    until kind-7 advances BEFORE retrying, asserts an ordinary by-name
+    load in the tombstone window rejects in managed code (on unguarded
+    code that call is a native use-after-destroy, so this leg is red
+    without the icall guard), then asserts the retry Completes, that a
+    further call is answered by the managed terminal-claim latch, and
+    that the scout registry and the pending-unloads gauge drain to
+    zero.
 
 Refs https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/169.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 262 +++++++++++++++++-
+ .../tests/ForcedNativeUnloadTests.cs          | 271 +++++++++++++++++-
  .../Loader/AssemblyLoadContext.Mono.cs        |  18 +-
- .../mono/metadata/assembly-load-context.c     | 218 ++++++++++++---
- src/mono/mono/metadata/loader-internals.h     |   7 +
- 4 files changed, 459 insertions(+), 46 deletions(-)
+ src/mono/mono/metadata/appdomain.c            |   7 +
+ .../mono/metadata/assembly-load-context.c     | 251 +++++++++++++---
+ src/mono/mono/metadata/loader-internals.h     |  13 +
+ 5 files changed, 514 insertions(+), 46 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 60708a1b5..c79d99543 100644
+index 60708a1b5..4bc5107b3 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -78,6 +78,13 @@ public class ForcedNativeUnloadTests
@@ -156,7 +181,7 @@ index 60708a1b5..c79d99543 100644
  
          private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
              .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
-@@ -269,6 +276,150 @@ public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
+@@ -269,6 +276,159 @@ public async Task ForcedUnload_OnlyCompletesOnceQuiescent()
              }
          }
  
@@ -267,6 +292,15 @@ index 60708a1b5..c79d99543 100644
 +                // teardown, so the retry below provably lands on native_tombstoned.
 +                await PumpUntilScoutCompletionAsync(scoutCompletionsBefore);
 +
++                // The tombstone window: the wrapper still carries the raw native pointer and
++                // its claim is idle, so an ordinary load API must reject BEFORE any native
++                // dereference of the destroyed state (assemblies_lock, loaded_images). The
++                // by-name path has no managed VerifyIsAlive gate, so the reject comes from the
++                // native torn-down guard at the icall entry — on unguarded code this call is a
++                // native use-after-destroy (crash), not an exception.
++                Assert.Throws<InvalidOperationException>(
++                    () => context.LoadFromAssemblyName(new AssemblyName(TestAssembly)));
++
 +                // The retry hits the tombstone branch: idempotent Completed, struct reclaimed.
 +                Assert.Equal(Completed, Force(context));
 +                // A further call never reaches native: the managed terminal-claim latch
@@ -307,7 +341,7 @@ index 60708a1b5..c79d99543 100644
          [Fact]
          public async Task ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
          {
-@@ -936,6 +1087,29 @@ private static async Task RunRejectedCycles(int cycles)
+@@ -936,6 +1096,29 @@ private static async Task RunRejectedCycles(int cycles)
              }
          }
  
@@ -337,7 +371,7 @@ index 60708a1b5..c79d99543 100644
          // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
          // each pass collects (queueing/re-queueing any scouts whose LoaderAllocator is dead,
          // including ones that re-registered with FALSE on an earlier pass) and then lets finalizers
-@@ -966,6 +1140,91 @@ private static async Task DrainRetiredScoutsAsync()
+@@ -966,6 +1149,91 @@ private static async Task DrainRetiredScoutsAsync()
              Assert.Equal(0, ScoutStats(RetiredSetSize));
          }
  
@@ -429,7 +463,7 @@ index 60708a1b5..c79d99543 100644
          [MethodImpl(MethodImplOptions.NoInlining)]
          private static async Task<WeakReference> LoadExerciseUnloadAndForce()
          {
-@@ -1554,7 +1813,8 @@ private static void Churn(int rounds)
+@@ -1554,7 +1822,8 @@ private static void Churn(int rounds)
          // Holding asm/type/list in THIS frame across the force would keep the primary and
          // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
          // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
@@ -475,8 +509,26 @@ index 88ce94a0c..707d2ec1f 100644
              Completed = 0,
              // The managed LoaderAllocator is still rooted (its weak handle target is non-NULL), so
              // freeing now would reclaim live memory. Nothing was freed; the caller should retry
+diff --git a/src/mono/mono/metadata/appdomain.c b/src/mono/mono/metadata/appdomain.c
+index f0a778910..29a5abbbe 100644
+--- a/src/mono/mono/metadata/appdomain.c
++++ b/src/mono/mono/metadata/appdomain.c
+@@ -781,6 +781,13 @@ ves_icall_System_Reflection_Assembly_InternalLoad (MonoStringHandle name_handle,
+ 		g_assert_not_reached ();
+ 
+ 	g_assert (alc);
++
++	/* By-name loads reach the native ALC without any managed VerifyIsAlive gate (unlike the
++	 * path/stream entry points), so reject a torn-down context here before the request
++	 * touches state mono_alc_cleanup already destroyed. See mono_alc_reject_if_torn_down. */
++	if (mono_alc_reject_if_torn_down (alc, error))
++		goto fail;
++
+ 	mono_assembly_request_prepare_byname (&req, alc);
+ 	req.basedir = NULL;
+ 	/* Everything currently goes through this function, and the postload hook (aka the AppDomain.AssemblyResolve event)
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index d8eac6e34..43f1121db 100644
+index d8eac6e34..aae388735 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -80,6 +80,10 @@ alcs_unlock (void)
@@ -687,7 +739,60 @@ index d8eac6e34..43f1121db 100644
  	default:
  		return -1;
  	}
-@@ -1097,8 +1165,9 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+@@ -768,12 +836,43 @@ leave:
+ 	HANDLE_FUNCTION_RETURN_VAL (ass);
+ }
+ 
++/*
++ * Guard for icalls that receive a raw native ALC pointer from the managed wrapper. After
++ * the GC-driven scout completion tore an ALC down (native_tombstoned), the surviving
++ * managed wrapper still carries the raw pointer and its terminal claim is only latched by
++ * a later ForceNativeUnload retry — so an ordinary load API called in that window would
++ * otherwise walk straight into state mono_alc_cleanup already destroyed (assemblies_lock,
++ * loaded_images, ...): a use-after-destroy, not an exception. Reading the flag here is
++ * safe by construction: the tombstoned struct is freed only by the claim-gated retry, and
++ * once that claim is latched the managed NativeALC getter rejects every consumer before
++ * the pointer can reach an icall again.
++ *
++ * The reject surfaces as InvalidOperationException with the unloading-contract semantics
++ * of the managed entry points (LoadFromAssemblyPath/LoadFromStream VerifyIsAlive-throw the
++ * same for ANY unloading state upstream and here). Loads into an unloading-but-not-yet-
++ * torn-down context intentionally keep working: the native side is fully functional
++ * there, and upstream also services cached by-name resolves during the unloading window —
++ * a blanket managed unloading guard on the by-name path would break exactly that.
++ */
++gboolean
++mono_alc_reject_if_torn_down (MonoAssemblyLoadContext *alc, MonoError *error)
++{
++	if (alc && alc->native_tombstoned) {
++		mono_error_set_invalid_operation (error, "Cannot use a collectible AssemblyLoadContext whose unload has already completed.");
++		return TRUE;
++	}
++	return FALSE;
++}
++
+ MonoReflectionAssemblyHandle
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFile (gpointer alc_ptr, MonoStringHandle fname, MonoStackCrawlMark *stack_mark, MonoError *error)
+ {
+ 	MonoReflectionAssemblyHandle result = MONO_HANDLE_CAST (MonoReflectionAssembly, NULL_HANDLE);
+ 	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)alc_ptr;
+ 
++	if (mono_alc_reject_if_torn_down (alc, error))
++		goto leave;
++
+ 	MonoAssembly *executing_assembly;
+ 	executing_assembly = mono_runtime_get_caller_from_stack_mark (stack_mark);
+ 	MonoAssembly *ass = mono_alc_load_file (alc, fname, executing_assembly, !mono_alc_is_default (alc), error);
+@@ -823,6 +922,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalLoadFromStream (gpoi
+ 	MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)native_alc;
+ 	MonoReflectionAssemblyHandle result = MONO_HANDLE_CAST (MonoReflectionAssembly, NULL_HANDLE);
+ 	MonoAssembly *assm = NULL;
++	if (mono_alc_reject_if_torn_down (alc, error))
++		goto leave;
+ 	assm = mono_alc_load_raw_bytes (alc, (guint8 *)raw_assembly_ptr, raw_assembly_len, (guint8 *)raw_symbols_ptr, raw_symbols_len, error);
+ 	goto_if_nok (error, leave);
+ 
+@@ -1097,8 +1198,9 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  {
  #ifdef DISABLE_THREADS
  	/*
@@ -699,7 +804,7 @@ index d8eac6e34..43f1121db 100644
  	 * The consult is a pure pointer-value comparison — the freed manager is NEVER
  	 * dereferenced — and consuming the entry retires exactly one scout: it returns TRUE,
  	 * so the finalizer does not GC.ReRegisterForFinalize and the scout population stays
-@@ -1109,6 +1178,67 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
+@@ -1109,6 +1211,67 @@ ves_icall_System_Reflection_LoaderAllocatorScout_Destroy (gpointer native)
  		retired_scout_terminal_count++;
  		return TRUE;
  	}
@@ -768,7 +873,7 @@ index d8eac6e34..43f1121db 100644
  
  	/* Not enabled yet */
 diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
-index 4275a39d2..b8f5e1f14 100644
+index 4275a39d2..aef5e44ae 100644
 --- a/src/mono/mono/metadata/loader-internals.h
 +++ b/src/mono/mono/metadata/loader-internals.h
 @@ -107,6 +107,13 @@ struct _MonoAssemblyLoadContext {
@@ -785,6 +890,19 @@ index 4275a39d2..b8f5e1f14 100644
  	// Used in native-library.c for the hash table below; do not access anywhere else
  	MonoCoopMutex pinvoke_lock;
  	// Maps malloc-ed char* pinvoke scope -> MonoDl*
+@@ -236,6 +243,12 @@ mono_alc_memory_managers_unlock (MonoAssemblyLoadContext *alc);
+ gboolean
+ mono_alc_is_default (MonoAssemblyLoadContext *alc);
+ 
++/* Sets InvalidOperationException on `error` and returns TRUE when the ALC was already torn
++ * down by the GC-driven scout completion (native_tombstoned): icalls receiving a raw native
++ * ALC pointer must reject before dereferencing state mono_alc_cleanup destroyed. */
++gboolean
++mono_alc_reject_if_torn_down (MonoAssemblyLoadContext *alc, MonoError *error);
++
+ MonoAssembly*
+ mono_alc_invoke_resolve_using_load_nofail (MonoAssemblyLoadContext *alc, MonoAssemblyName *aname);
+ 
 -- 
 2.53.0.vfs.0.0
 
