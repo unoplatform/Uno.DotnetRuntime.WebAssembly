@@ -71,6 +71,7 @@ JiterpreterTableAllocator_ExhaustionSelfTest
 ForcedUnload_SingleNotQuiescentAttempt_ThenDroppedRoots_DoesNotStrandAlc
 Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible
 ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual
+RepeatedUnloadWithoutRetry_NativeStructPopulationReturnsToBaseline
 "
 if [ "$mode" = "mt" ]; then
   # The threads-enabled rejection test is [ConditionalFact(IsThreadingSupported)]: it self-skips
