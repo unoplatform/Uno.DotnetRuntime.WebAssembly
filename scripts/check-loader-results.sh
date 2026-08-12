@@ -68,6 +68,11 @@ JiterpreterTableStat_SurfaceMatchesOptIn
 ForcedUnload_ReclaimsJiterpreterTraceTableSlots
 ForcedUnload_WithoutAnyCompiledTrace_ReleasesNoSlots
 JiterpreterTableAllocator_ExhaustionSelfTest
+ForcedUnload_SingleNotQuiescentAttempt_ThenDroppedRoots_DoesNotStrandAlc
+Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible
+ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual
+RepeatedUnloadWithoutRetry_NativeStructPopulationReturnsToBaseline
+ScoutCompletion_LatchesBaseFields_WhenSubclassHidesThem
 "
 if [ "$mode" = "mt" ]; then
   # The threads-enabled rejection test is [ConditionalFact(IsThreadingSupported)]: it self-skips
