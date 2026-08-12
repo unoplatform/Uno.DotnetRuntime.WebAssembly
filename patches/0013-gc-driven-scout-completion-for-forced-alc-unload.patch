@@ -90,14 +90,14 @@ leg, exactly like the field failure; green flag-off/threads):
 
 Refs https://github.com/unoplatform/Uno.DotnetRuntime.WebAssembly/issues/169.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 224 +++++++++++++++++-
+ .../tests/ForcedNativeUnloadTests.cs          | 225 +++++++++++++++++-
  .../Loader/AssemblyLoadContext.Mono.cs        |  14 +-
- .../mono/metadata/assembly-load-context.c     | 185 +++++++++++----
+ .../mono/metadata/assembly-load-context.c     | 185 ++++++++++----
  src/mono/mono/metadata/loader-internals.h     |   7 +
- 4 files changed, 383 insertions(+), 47 deletions(-)
+ 4 files changed, 384 insertions(+), 47 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 60708a1b5..ee90983aa 100644
+index 60708a1b5..c1063c8e3 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -78,6 +78,10 @@ public class ForcedNativeUnloadTests
@@ -228,16 +228,17 @@ index 60708a1b5..ee90983aa 100644
          [Fact]
          public async Task ForcedUnload_RootedCrossContextGeneric_BlocksNativeFree()
          {
-@@ -949,6 +1063,28 @@ private static async Task RunRejectedCycles(int cycles)
-         // loop (mono_main_thread_schedule_background_job). Finalizers therefore never run inside a
-         // synchronous test method — awaiting Task.Delay turns the event loop and runs the pump.
-         [MethodImpl(MethodImplOptions.NoInlining)]
+@@ -936,6 +1050,29 @@ private static async Task RunRejectedCycles(int cycles)
+             }
+         }
+ 
 +        // Waits for a WeakReference to die across collections, turning the JS event loop between
 +        // attempts. The turns matter twice over: they re-dispatch the continuation on a nearly
 +        // empty interpreter stack (see ForceUntilCompletedAsync), and they let the scheduled
 +        // single-threaded finalizer pump run — the GC-driven scout completion (the teardown that
 +        // releases the native strong handle to the managed ALC) happens inside a finalizer, and
 +        // GC.WaitForPendingFinalizers alone is an immediate no-op on single-threaded wasm.
++        [MethodImpl(MethodImplOptions.NoInlining)]
 +        private static async Task CollectAndAssertDeadAsync(WeakReference weakRef, string reason)
 +        {
 +            for (int attempt = 0; attempt < 20; attempt++)
@@ -254,10 +255,10 @@ index 60708a1b5..ee90983aa 100644
 +            Assert.False(weakRef.IsAlive, reason);
 +        }
 +
-         private static async Task DrainRetiredScoutsAsync()
-         {
-             for (int attempt = 0; attempt < 20; attempt++)
-@@ -966,6 +1102,91 @@ private static async Task DrainRetiredScoutsAsync()
+         // Drive GC + finalization until the retired-scout set drains. Counter-based and bounded:
+         // each pass collects (queueing/re-queueing any scouts whose LoaderAllocator is dead,
+         // including ones that re-registered with FALSE on an earlier pass) and then lets finalizers
+@@ -966,6 +1103,91 @@ private static async Task DrainRetiredScoutsAsync()
              Assert.Equal(0, ScoutStats(RetiredSetSize));
          }
  
@@ -349,7 +350,7 @@ index 60708a1b5..ee90983aa 100644
          [MethodImpl(MethodImplOptions.NoInlining)]
          private static async Task<WeakReference> LoadExerciseUnloadAndForce()
          {
-@@ -1554,7 +1775,8 @@ private static void Churn(int rounds)
+@@ -1554,7 +1776,8 @@ private static void Churn(int rounds)
          // Holding asm/type/list in THIS frame across the force would keep the primary and
          // shared-generic LoaderAllocator witnesses alive and pin the force at NotQuiescent. Only
          // the ALC object itself lives here, which is safe: the runtime holds a strong handle to
