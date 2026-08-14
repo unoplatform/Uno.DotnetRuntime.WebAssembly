@@ -47,10 +47,10 @@ to every existing consumer):
       kind 17 -- take a fresh snapshot; returns its GENERATION TOKEN
       kind 18 -- 1 if the handle walk hit its RAW-slot budget, so kinds
                  11-14/19 are lower bounds
-      kind 19 -- handles of ANY type whose target IS a condemned
-                 context's own managed wrapper or LoaderAllocator
-                 witness (IDENTITY-attributed). Counts HANDLES, not
-                 distinct objects
+      kind 19 -- handles of ANY OF THE FOUR SCANNED TYPES whose target
+                 IS a condemned context's own managed wrapper or
+                 LoaderAllocator witness (IDENTITY-attributed). Counts
+                 HANDLES, not distinct objects
       kind 20 -- the latched snapshot's generation token, recomputing
                  NOTHING: the read TOKEN (see ATOMICITY below)
       kind 21 -- raw handle slots the latched walk loaded
@@ -87,7 +87,9 @@ and the managed wrapper is corelib-classed, so class attribution is
 blind to the runtime's OWN most important root. Identity attribution
 catches it (and each manager's LoaderAllocator witness) and counts it
 separately, so the runtime's expected roots stay distinguishable from a
-third party's.
+third party's. Kind 19 is class-blind but NOT table-blind: like kinds
+11-14 it sees only handles of the four scanned types, so its scope is
+"any of those four", never "any handle in the runtime".
 
 Consistency, cost and safety:
 
@@ -239,13 +241,13 @@ must honestly report an EMPTY condemned set (0), with the tiny self-test
 cap unable to manufacture truncation out of a walk that never ran.
 ---
  .../tests/ForcedNativeUnloadTests.cs          | 832 ++++++++++++++++++
- .../Loader/AssemblyLoadContext.Mono.cs        |  64 ++
- .../mono/metadata/assembly-load-context.c     | 571 ++++++++++--
- src/mono/mono/metadata/gc-internals.h         |  58 ++
+ .../Loader/AssemblyLoadContext.Mono.cs        |  66 ++
+ .../mono/metadata/assembly-load-context.c     | 573 ++++++++++--
+ src/mono/mono/metadata/gc-internals.h         |  61 ++
  src/mono/mono/metadata/sgen-mono.c            | 165 ++++
  src/mono/mono/sgen/sgen-gc.h                  |  31 +
  src/mono/mono/sgen/sgen-gchandles.c           |  70 ++
- 7 files changed, 1739 insertions(+), 52 deletions(-)
+ 7 files changed, 1746 insertions(+), 52 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 index a338595e1..8db6fe780 100644
@@ -1105,10 +1107,10 @@ index a338595e1..8db6fe780 100644
          /// The no-retry residue regression: a host that never calls ForceNativeUnload at all —
          /// N load/unload/drop cycles — must leave NO native residue. An orphaned struct is
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index ca1b6ff47..1fb9e41ba 100644
+index ca1b6ff47..4be053340 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -97,6 +97,70 @@ private static void KeepLoaderAllocator()
+@@ -97,6 +97,72 @@ private static void KeepLoaderAllocator()
          // Kind 10 counts scout-completion DEFERRALS (monotonic): the scout finalizer ran,
          // completed nothing, and re-registered. Distinguishes "ran and refused" from "never
          // ran" — a never-dying witness climbs this while kind 7 stays flat.
@@ -1124,9 +1126,10 @@ index ca1b6ff47..1fb9e41ba 100644
 +        //        contexts rather than managers)
 +        //   16 — condemned managers whose LoaderAllocator witness is still alive
 +        //   18 — 1 if the handle walk hit its RAW-slot budget, so 11-14/19 are LOWER BOUNDS
-+        //   19 — handles of ANY type whose target IS a condemned context's own managed wrapper
-+        //        or LoaderAllocator witness (corelib-classed, hence invisible to 11-14; the
-+        //        runtime installs one such strong handle per in-flight unload itself)
++        //   19 — handles of ANY of the four scanned types (11-14's types) whose target IS a
++        //        condemned context's own managed wrapper or LoaderAllocator witness
++        //        (corelib-classed, hence invisible to 11-14; the runtime installs one such
++        //        strong handle per in-flight unload itself)
 +        //   20 — the latched snapshot's generation token, recomputing NOTHING (0 = none yet)
 +        //   21 — RAW handle slots the latched walk loaded (empty/metadata slots included),
 +        //        counted in the loop rather than restated from the budget
@@ -1163,9 +1166,10 @@ index ca1b6ff47..1fb9e41ba 100644
 +        //     already-registered wrapper is +1.
 +        //   * Weak kinds (13/14) root nothing and can never be the holder; they only show that
 +        //     something still observes the set.
-+        //   * SCOPE is the four handle types 11-14. sgen's fifth handle table (weak-FIELD
-+        //     registrations, not user GCHandles) is not walked and contributes to nothing here,
-+        //     kind 22 included.
++        //   * SCOPE is the four handle types 11-14 — for EVERY count here, kind 19 included.
++        //     Kind 19 is class-blind, not table-blind: "any type" there means any of those four.
++        //     sgen's fifth handle table (weak-FIELD registrations, not user GCHandles) is not
++        //     walked and contributes to nothing here, kinds 19 and 22 included.
 +        //   * Attribution is ONE HOP. A non-zero bucket means a handle DIRECTLY targets an
 +        //     attributable object — necessary, not sufficient, for "a GC handle is the holder".
 +        //     All-zero buckets do NOT prove no GC handle is involved: a handle on a container,
@@ -1180,7 +1184,7 @@ index ca1b6ff47..1fb9e41ba 100644
  
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 065b4a4ac..d3f8ffc20 100644
+index 065b4a4ac..64c0d51b4 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -6,6 +6,7 @@
@@ -1191,7 +1195,7 @@ index 065b4a4ac..d3f8ffc20 100644
  #include "mono/metadata/icall-decl.h"
  #include "mono/metadata/loader-internals.h"
  #include "mono/metadata/loaded-images-internals.h"
-@@ -100,6 +101,462 @@ static gint32 collectible_alc_native_structs;
+@@ -100,6 +101,463 @@ static gint32 collectible_alc_native_structs;
   * of InternalGetScoutRetirementStats; diagnostics only. */
  static gint32 scout_completion_deferral_count;
  
@@ -1214,7 +1218,8 @@ index 065b4a4ac..d3f8ffc20 100644
 + *   CLASS attribution (kinds 11-14, bucketed by handle type): the TARGET's class belongs to
 + *   one of the condemned memory managers.
 + *
-+ *   IDENTITY attribution (kind 19, class-blind): the TARGET *is* one of the condemned
++ *   IDENTITY attribution (kind 19, class-blind but NOT table-blind — it too sees only handles
++ *   of those same four scanned types): the TARGET *is* one of the condemned
 + *   contexts' own runtime objects — the managed AssemblyLoadContext wrapper (which
 + *   PrepareForAssemblyLoadContextRelease deliberately promotes to a STRONG handle while an
 + *   unload is in flight) or a manager's LoaderAllocator witness. Those objects are
@@ -1654,7 +1659,7 @@ index 065b4a4ac..d3f8ffc20 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -493,56 +950,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -493,56 +951,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -1711,7 +1716,7 @@ index 065b4a4ac..d3f8ffc20 100644
  int
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
  {
-@@ -666,6 +1073,48 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -666,6 +1074,49 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * re-registered. Behind the DISABLE_THREADS gate like kinds 0/1. Distinguishes "the
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
@@ -1731,10 +1736,11 @@ index 065b4a4ac..d3f8ffc20 100644
 +	 *   17 — take a fresh snapshot; returns its GENERATION TOKEN. Read this FIRST: the gauge
 +	 *        kinds report the latched snapshot, so they are mutually consistent
 +	 *   18 — 1 if the handle walk hit its RAW-slot budget (kinds 11-14/19 are then lower bounds)
-+	 *   19 — handles of ANY type whose target IS a condemned context's own managed wrapper or
-+	 *        LoaderAllocator witness. Those are corelib-classed, so kinds 11-14 are blind to
-+	 *        them; the runtime installs one such strong handle per in-flight unload itself.
-+	 *        Counts HANDLES, not distinct objects: a second handle onto the same wrapper is +1
++	 *   19 — handles of ANY of the four scanned types (11-14's types) whose target IS a condemned
++	 *        context's own managed wrapper or LoaderAllocator witness. Those are corelib-classed,
++	 *        so kinds 11-14 are blind to them; the runtime installs one such strong handle per
++	 *        in-flight unload itself. Counts HANDLES, not distinct objects: a second handle onto
++	 *        the same wrapper is +1
 +	 *   20 — the latched snapshot's generation token, recomputing NOTHING (0 = none taken yet).
 +	 *        This is the read TOKEN: take kind 17, read the gauges, then read this and RETRY if it
 +	 *        is NOT EQUAL to kind 17's, because a second logical caller's kind 17 in between would
@@ -1760,7 +1766,7 @@ index 065b4a4ac..d3f8ffc20 100644
  	 */
  	if (kind == 2 || kind == 3)
  		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
-@@ -690,8 +1139,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -690,8 +1141,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		int pending = 0;
  		alcs_lock ();
  		for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
@@ -1772,7 +1778,7 @@ index 065b4a4ac..d3f8ffc20 100644
  				pending++;
  		}
  		alcs_unlock ();
-@@ -701,6 +1151,23 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -701,6 +1153,23 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
@@ -1797,10 +1803,10 @@ index 065b4a4ac..d3f8ffc20 100644
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index f0141675b..67507550e 100644
+index f0141675b..4f3459230 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -431,4 +431,62 @@ extern gchar **mono_do_not_finalize_class_names;
+@@ -431,4 +431,65 @@ extern gchar **mono_do_not_finalize_class_names;
  MONO_COMPONENT_API void mono_stop_world (MonoThreadInfoFlags flags);
  MONO_COMPONENT_API void mono_restart_world (MonoThreadInfoFlags flags);
  
@@ -1846,7 +1852,10 @@ index f0141675b..67507550e 100644
 +	 * (objects registered by sgen_register_obj_with_weak_fields, not user GCHandles), is NOT
 +	 * walked and contributes to no count below, including slots_eligible. */
 +	gint32 class_hits [MONO_SGEN_CONDEMNED_HANDLE_BUCKETS];
-+	/* OUT: handles of ANY type whose target IS a member of condemned_objects. */
++	/* OUT: handles of ANY of the four scanned types (see class_hits) whose target IS a member of
++	 * condemned_objects. "Any type" only ever means those four: this counter is class-blind, not
++	 * table-blind, so HANDLE_WEAK_FIELDS registrations are outside its scope exactly as they are
++	 * outside class_hits' and slots_eligible's. */
 +	gint32 identity_hits;
 +	/* OUT: RAW slots visited, empty and metadata slots INCLUDED — they cost the same pointer
 +	 * load as an occupied one, and that load is what slot_budget exists to bound. */
