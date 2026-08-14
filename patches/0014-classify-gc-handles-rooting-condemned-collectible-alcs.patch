@@ -187,7 +187,14 @@ CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark
 builds the shape the bound exists for -- several hundred simultaneously
 live strong handles, all then freed, leaving a table whose persistent
 high-water mark is far above the cap while nearly every slot is a hole
--- and requires kind 21 to stop at the cap rather than at kind 22.
+-- and requires kind 21 to stop at the cap rather than at kind 22. Its
+scope is stated in the test rather than overclaimed: kind 21 is the
+runtime's own report and the only channel through which the bound is
+observable, so the test pins the REPORTED bound and catches the shape
+this replaced (a budget that gated only per-slot classification while
+the swept range stayed at the high-water mark). The sweep itself rests
+on the loop's range expression, which is a review matter, not a test
+one.
 
 All four assert both dark configurations off PlatformDetection, never
 off another kind of the icall under test: deriving the expectation from
@@ -198,17 +205,17 @@ single-threaded build with the opt-in off keeps the surface live and
 must honestly report an EMPTY condemned set (0), with the tiny self-test
 cap unable to manufacture truncation out of a walk that never ran.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 711 ++++++++++++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 713 ++++++++++++++++++
  .../Loader/AssemblyLoadContext.Mono.cs        |  52 ++
- .../mono/metadata/assembly-load-context.c     | 514 +++++++++++--
+ .../mono/metadata/assembly-load-context.c     | 516 +++++++++++--
  src/mono/mono/metadata/gc-internals.h         |  58 ++
  src/mono/mono/metadata/sgen-mono.c            | 165 ++++
- src/mono/mono/sgen/sgen-gc.h                  |  30 +
- src/mono/mono/sgen/sgen-gchandles.c           |  64 ++
- 7 files changed, 1542 insertions(+), 52 deletions(-)
+ src/mono/mono/sgen/sgen-gc.h                  |  31 +
+ src/mono/mono/sgen/sgen-gchandles.c           |  70 ++
+ 7 files changed, 1553 insertions(+), 52 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index a338595e1..a807dee8e 100644
+index a338595e1..2d097b1f7 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -6,6 +6,7 @@
@@ -271,7 +278,7 @@ index a338595e1..a807dee8e 100644
  
          private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
              .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
-@@ -511,6 +557,671 @@ await CollectAndAssertDeadAsync(weakNormal,
+@@ -511,6 +557,673 @@ await CollectAndAssertDeadAsync(weakNormal,
                  "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
          }
  
@@ -536,9 +543,13 @@ index a338595e1..a807dee8e 100644
 +        /// every one of those handles to leave it holey, and require the walk to stop AT the cap
 +        /// rather than at the mark.
 +        ///
-+        /// This is a statement about work actually done, not about intent: kind 21 is incremented
-+        /// once per slot LOAD inside the loop, so an implementation that walks the whole table and
-+        /// only skips out-of-range classification reports the full mark and fails here.
++        /// SCOPE OF THIS PROOF, stated plainly rather than overclaimed. Kind 21 is the runtime's
++        /// own report of how many slots it loaded, and it is the only channel there is — so this
++        /// test pins the REPORTED bound, not the sweep. A probe that walked the whole table while
++        /// still reporting the cap passed this suite unchanged; the sweep itself is guaranteed by
++        /// the loop's range expression in sgen_gchandle_foreach_slot_bounded, which is a matter for
++        /// review. What this test does catch is the shape it replaced, where the budget gated only
++        /// per-slot classification and left the reported range at the table's high-water mark.
 +        /// </summary>
 +        [Fact]
 +        public async Task CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark()
@@ -582,11 +593,9 @@ index a338595e1..a807dee8e 100644
 +                    $"the eligible range must exceed the self-test cap for this to be a bound " +
 +                    $"(visited={full[CondemnedSlotsVisited]}, cap={CondemnedSelfTestSlotBudget}).");
 +
-+                // THE PROPERTY UNDER TEST: the budgeted walk stopped at the RAW slot cap, far
-+                // short of the mark it was eligible to cover. This bites only because kind 21 is
-+                // incremented once per slot LOAD inside the loop: were it merely the precomputed
-+                // bound, an implementation that swept the whole table and skipped out-of-range
-+                // classification would report the same number and pass.
++                // THE PROPERTY UNDER TEST: the walk reports having stopped at the RAW slot cap,
++                // far short of the mark it was eligible to cover. See the SCOPE note above for
++                // what this does and does not establish.
 +                Assert.True(selfTest[CondemnedSlotsVisited] > 0,
 +                    "the budgeted walk must still have loaded slots — a walk that ran not at all " +
 +                    "would satisfy the cap vacuously.");
@@ -1007,7 +1016,7 @@ index ca1b6ff47..5f7b8f12c 100644
  
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 065b4a4ac..3b2d6871e 100644
+index 065b4a4ac..b5f5b9258 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -6,6 +6,7 @@
@@ -1018,7 +1027,7 @@ index 065b4a4ac..3b2d6871e 100644
  #include "mono/metadata/icall-decl.h"
  #include "mono/metadata/loader-internals.h"
  #include "mono/metadata/loaded-images-internals.h"
-@@ -100,6 +101,410 @@ static gint32 collectible_alc_native_structs;
+@@ -100,6 +101,412 @@ static gint32 collectible_alc_native_structs;
   * of InternalGetScoutRetirementStats; diagnostics only. */
  static gint32 scout_completion_deferral_count;
  
@@ -1108,11 +1117,13 @@ index 065b4a4ac..3b2d6871e 100644
 + * exactly what an earlier revision of this code did. ALC_CONDEMNED_HANDLE_SLOT_BUDGET is
 + * instead spent across the four passes as a cap on slot LOADS, and kinds 21/22 publish what the
 + * walk actually visited versus what it was eligible to visit, so the bound is observable rather
-+ * than merely asserted. Kind 21 is counted INSIDE the loop, one increment per slot load: a
-+ * figure restated from the budget would be satisfied just as well by a sweep that covered the
-+ * whole table and only skipped out-of-range work, which is the very thing being ruled out.
-+ * Truncation sets kind 18 and makes every count a lower bound — and because the budget is spent
-+ * in a fixed table order, it is the LATER buckets that go dark, never kind 11.
++ * than merely asserted — with one honest caveat. Kind 21 is counted INSIDE the loop, one
++ * increment per slot load, so the published figure cannot drift from the loop that produced it;
++ * but it is also the ONLY channel through which the bound is observable, so a regression can pin
++ * the reported bound and not the sweep itself. What enforces the sweep is the loop's range
++ * expression in sgen_gchandle_foreach_slot_bounded, reviewed rather than tested. Truncation sets
++ * kind 18 and makes every count a lower bound — and because the budget is spent in a fixed table
++ * order, it is the LATER buckets that go dark, never kind 11.
 + *
 + * PURITY. Reading never mutates runtime state: the snapshot is built from the global ALC list
 + * plus each context's own manager arrays, the handle walk writes no slot at all (its callback
@@ -1429,7 +1440,7 @@ index 065b4a4ac..3b2d6871e 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -493,56 +898,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -493,56 +900,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -1486,7 +1497,7 @@ index 065b4a4ac..3b2d6871e 100644
  int
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
  {
-@@ -666,6 +1021,44 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -666,6 +1023,44 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * re-registered. Behind the DISABLE_THREADS gate like kinds 0/1. Distinguishes "the
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
@@ -1531,7 +1542,7 @@ index 065b4a4ac..3b2d6871e 100644
  	 */
  	if (kind == 2 || kind == 3)
  		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
-@@ -690,8 +1083,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -690,8 +1085,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		int pending = 0;
  		alcs_lock ();
  		for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
@@ -1543,7 +1554,7 @@ index 065b4a4ac..3b2d6871e 100644
  				pending++;
  		}
  		alcs_unlock ();
-@@ -701,6 +1095,22 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -701,6 +1097,22 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
@@ -1810,10 +1821,10 @@ index e7611b1b9..91358a84a 100644
   * Threads
   */
 diff --git a/src/mono/mono/sgen/sgen-gc.h b/src/mono/mono/sgen/sgen-gc.h
-index 3e4d2086b..a20434fae 100644
+index 3e4d2086b..936e4ffc5 100644
 --- a/src/mono/mono/sgen/sgen-gc.h
 +++ b/src/mono/mono/sgen/sgen-gc.h
-@@ -1081,6 +1081,36 @@ guint32 sgen_gchandle_new (GCObject *obj, gboolean pinned);
+@@ -1081,6 +1081,37 @@ guint32 sgen_gchandle_new (GCObject *obj, gboolean pinned);
  guint32 sgen_gchandle_new_weakref (GCObject *obj, gboolean track_resurrection);
  void sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandleIterateCallback callback, gpointer user)
  	MONO_PERMIT (need (sgen_world_stopped));
@@ -1838,9 +1849,10 @@ index 3e4d2086b..a20434fae 100644
 + *
 + * Returns the number of raw slots visited, COUNTED IN THE LOOP rather than restated from the
 + * bound — empty and metadata slots included, since they cost the same pointer load as an
-+ * occupied one and bounding that load is the entire point. Counting it for real is what lets a
-+ * regression distinguish a genuinely bounded sweep from one that walks the whole table and
-+ * merely skips out-of-range work.
++ * occupied one and bounding that load is the entire point. Counting it in the loop keeps the
++ * published figure from drifting away from the loop that produced it; it does NOT make a
++ * miscounting implementation detectable from outside, because this return value is the only
++ * channel through which the bound is observable at all. See the note at the definition.
 + */
 +typedef void (*SgenGCHandleReadOnlyCallback) (gpointer hidden, GCHandleType handle_type, gpointer user);
 +
@@ -1851,10 +1863,10 @@ index 3e4d2086b..a20434fae 100644
  void sgen_mark_normal_gc_handles (void *addr, SgenUserMarkFunc mark_func, void *gc_data)
  	MONO_PERMIT (need (sgen_world_stopped));
 diff --git a/src/mono/mono/sgen/sgen-gchandles.c b/src/mono/mono/sgen/sgen-gchandles.c
-index f869775cb..4fb61887b 100644
+index f869775cb..da18de6b3 100644
 --- a/src/mono/mono/sgen/sgen-gchandles.c
 +++ b/src/mono/mono/sgen/sgen-gchandles.c
-@@ -239,6 +239,70 @@ sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandl
+@@ -239,6 +239,76 @@ sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandl
  	} SGEN_ARRAY_LIST_END_FOREACH_SLOT;
  }
  
@@ -1902,11 +1914,17 @@ index f869775cb..4fb61887b 100644
 +		end = max_slots;
 +
 +	/*
-+	 * COUNTED IN THE LOOP, deliberately, rather than returned as the precomputed `end`. This
-+	 * return value is the diagnostic's only evidence that the sweep was actually bounded; if it
-+	 * merely restated the bound, an implementation that walked the whole table and only skipped
-+	 * out-of-range classification would report the same number and no regression could tell the
-+	 * two apart. One increment per slot LOAD is what makes the count an observation.
++	 * COUNTED IN THE LOOP, deliberately, rather than returned as the precomputed `end`, so the
++	 * figure the caller publishes cannot silently disagree with the loop that produced it.
++	 *
++	 * Be clear about what that does NOT buy, because it is tempting to overclaim: this counter is
++	 * the ONLY channel through which the bound is observable from managed code, so no regression
++	 * test can tell a correctly bounded sweep from one that walks further and reports the bound
++	 * anyway. (Verified, not assumed: a probe that did exactly that passed the whole suite.) What
++	 * actually enforces the bound is the range of the loop below — `end`, a single reviewable
++	 * expression — and the fact that the same loop both walks and counts. The regression pins the
++	 * REPORTED bound, which is what catches the shape this replaced, where the budget did not
++	 * clamp the range at all.
 +	 */
 +	guint32 visited = 0;
 +	volatile gpointer *slot;
