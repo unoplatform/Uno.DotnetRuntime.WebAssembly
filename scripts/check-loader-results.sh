@@ -73,6 +73,7 @@ Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible
 ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual
 RepeatedUnloadWithoutRetry_NativeStructPopulationReturnsToBaseline
 ScoutCompletion_LatchesBaseFields_WhenSubclassHidesThem
+CondemnedHandleClassification_ReportsHoldingHandleByType
 "
 if [ "$mode" = "mt" ]; then
   # The threads-enabled rejection test is [ConditionalFact(IsThreadingSupported)]: it self-skips
