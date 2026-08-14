@@ -18,72 +18,142 @@ the runtime, extending the existing InternalGetScoutRetirementStats
 surface (unknown kinds keep returning -1, so the addition is invisible
 to every existing consumer):
 
-  * mono_gc_count_handles_into_managers (sgen-mono.c) walks the sgen
-    handle tables with sgen_gchandle_iterate and, for every handle whose
-    TARGET object's class belongs to one of the supplied memory
-    managers, bumps a per-handle-type bucket. The walk is read-only by
-    construction: the iteration callback always returns the slot value
-    it was handed, so no handle is freed, moved or re-tagged.
+  * sgen_scan_handles_into_managers (sgen-mono.c) walks the sgen handle
+    tables with sgen_gchandle_iterate and reports, per handle, whether
+    its TARGET is attributable to the condemned set. The walk is
+    read-only: the callback returns the slot value it was handed, so the
+    write-back sgen_gchandle_iterate performs is a self-store -- no
+    handle is freed, moved or re-tagged.
   * assembly-load-context.c builds the condemned set (every collectible
     + unloading context's primary manager plus each shared generic
-    manager it owns) and exposes:
-      kind 11 -- strong (Normal) handles into the condemned set
-      kind 12 -- pinned handles
-      kind 13 -- weak (short) handles
-      kind 14 -- weak-track-resurrection handles
+    manager it owns) and exposes nine kinds:
+      kind 11 -- strong (Normal) handles, CLASS-attributed   [rooting]
+      kind 12 -- pinned handles, class-attributed            [rooting]
+      kind 13 -- weak (short) handles                  [informational]
+      kind 14 -- weak-track-resurrection handles       [informational]
       kind 15 -- condemned memory managers in scope (the denominator;
                  >= kind 8, which counts contexts rather than managers)
       kind 16 -- condemned managers whose LoaderAllocator witness is
                  still alive
-    Read together these answer the question the managed tracer cannot: a
-    non-zero bucket NAMES the handle class holding a witness, while
-    all-zero buckets with kind 16 > 0 prove the holder is not a GC handle
-    at all -- a thread stack/register or native structure -- which is the
-    elimination needed before instrumenting deeper.
+      kind 17 -- take a fresh snapshot; returns its monotonic sequence
+      kind 18 -- 1 if the handle walk hit its slot budget, so kinds
+                 11-14/19 are lower bounds
+      kind 19 -- handles of ANY type whose target IS a condemned
+                 context's own managed wrapper or LoaderAllocator
+                 witness (IDENTITY-attributed)
 
-Gating and safety are unchanged from the rest of the feature: the whole
-block is DISABLE_THREADS-only and reports -1 otherwise, and the handle
-walk is additionally compiled only for the sgen collector.
-sgen_gchandle_iterate documents that the world must be stopped; on the
-single-threaded browser runtime no other thread can exist and no
-collection can be in progress underneath an icall, so the precondition
-holds trivially rather than by taking the world down. Dereferencing a
-target's vtable is safe for the same reason the forced teardown is: a
-manager is only freed once its whole witness set is dead, so no object
-can outlive its own class's memory manager. The gauges are recomputed
-per read and are invoked a handful of times per unload cycle by
-lifecycle tests and host telemetry, never on a hot path.
+WHAT THIS PROVES, AND WHAT IT DOES NOT. Attribution is PER HANDLE and
+ONE HOP. A non-zero bucket establishes that a GC handle DIRECTLY TARGETS
+an object attributable to the condemned set -- a NECESSARY, not
+sufficient, condition for "a GC handle is the holder". All-zero buckets
+do NOT establish that no GC handle is involved, because rooting is
+transitive: a handle whose immediate target is corelib-classed while its
+object graph reaches a condemned instance lands in no bucket. The miss
+classes are enumerated in the contract comment (containers such as
+object[]/List<object>/Dictionary, the RuntimeType/RuntimeAssembly/
+MethodInfo reflection-cache family, delegates, pinned interop buffers,
+and anything reached only through native structures or thread
+stacks/registers). The sibling regression
+ForcedUnload_RootedPointerFreeObjects_BlockNativeFree already
+demonstrates that BCL-typed roots block the free, i.e. exactly the shape
+class attribution cannot see. These kinds are a triage funnel, never a
+proof of absence.
 
-SCOPE: thread-stack/register roots are addressed by ELIMINATION here
-(all buckets zero while witnesses live), not by direct attribution.
-Attributing a pinning stack slot needs collection-time instrumentation
-of sgen's pin path, which is only worth its cost once the handle buckets
-have been observed empty -- deliberately left to a follow-up.
+Kind 19 exists because of that limit: this very patch series promotes
+the native->managed ALC handle to STRONG while an unload is in flight,
+and the managed wrapper is corelib-classed, so class attribution is
+blind to the runtime's OWN most important root. Identity attribution
+catches it (and each manager's LoaderAllocator witness) and counts it
+separately, so the runtime's expected roots stay distinguishable from a
+third party's.
+
+Consistency, cost and safety:
+
+  * ATOMICITY -- all nine values are fields of ONE snapshot. Kind 17
+    recomputes it (single set build + a single 4-bucket handle walk +
+    the witness count); kinds 11-16/18/19 read the latched result. Six
+    independent reads would be mutually inconsistent: a context
+    reclaimed between two of them yields "every bucket 0 while
+    witnesses are live", manufacturing precisely the false signal this
+    surface exists to rule out.
+  * ONE definition of the condemned set. alc_is_condemned and
+    alc_foreach_teardown_manager are now the single source of "the
+    managers a teardown would free", consumed by the quiescence gate,
+    the kind 8 context gauge and the kinds 11-19 snapshot alike -- so
+    kind 16 cannot drift from the quantity the gate actually refuses on.
+    The shared walk is also NULL-safe on both manager arrays, which the
+    hand-copied loops were not: the forced teardown NULLs them, so a
+    read-only gauge racing a tombstoned context could abort the runtime.
+  * COST -- O(handles + managers). Membership is a pointer-keyed set,
+    so the walk does not degrade quadratically as contexts strand (the
+    state it exists to explain); it short-circuits entirely on an empty
+    condemned set, and carries a slot budget with a saturation flag so
+    it can never run unbounded on the single browser thread.
+  * GATING -- the whole region is DISABLE_THREADS-only, and the sgen
+    entry point's declaration AND definition are now gated on
+    DISABLE_THREADS as well as HAVE_SGEN_GC, so the walk cannot be
+    reached on a build where the single-threaded precondition does not
+    hold. sgen_gchandle_iterate is annotated
+    MONO_PERMIT (need (sgen_world_stopped)); its other callers get
+    exclusive access to the handle tables from a collection pause, and
+    this one gets it from the absence of other threads. What remained
+    unproven is now ASSERTED rather than argued in prose: the walk
+    g_asserts that no collection is in progress and that it is not
+    re-entered.
+  * PURITY -- m_class_get_mem_manager is a pure lookup (generic-instance
+    owner, array element-class recursion, or the class's image ALC with
+    the default ALC's manager as the dynamic-assembly fallback), so it
+    cannot lazily allocate a manager mid-walk; that is what makes
+    "read-only" true of the whole operation and not merely of the slots.
+    Dereferencing a target's vtable is safe for the same reason the
+    forced teardown is: a manager is only freed once its whole witness
+    set is dead, so no live object can outlive its own class's manager.
+
+SCOPE: thread-stack/register and native-structure roots are NOT
+attributed here, and are not eliminated by empty buckets either (see
+above). Attributing a pinning stack slot needs collection-time
+instrumentation of sgen's pin path, deliberately left to a follow-up.
 
 New lifecycle regression CondemnedHandleClassification_ReportsHoldingHandleByType
-drives the classification end to end: a strong and a weak GCHandle onto
-instances of a collectible assembly's type must be counted in their
-OWN buckets (proving the buckets are distinguished by handle type), the
-strong handle must by itself hold the witness and pin the forced unload
-at NotQuiescent, and freeing the handles must drain the buckets, let the
-teardown complete, and return the whole surface to its baseline. Every
-assertion is a delta against a captured baseline, so the test never
-depends on what an earlier test in the collection left pending. The two
-dark configurations are asserted distinctly, matching the rest of this
-stats block: a threads-enabled runtime has the machinery compiled out
-and reports -1 for every kind, while the single-threaded build with the
-opt-in off keeps the surface live and honestly reports an EMPTY
-condemned set (0), because nothing is natively collectible there.
+drives the classification end to end with EXACT deltas rather than "more
+than baseline":
+
+  * each of the four buckets moves by exactly +1 for its own handle type
+    and exactly +0 for the others, measured across intervals whose only
+    content is the GCHandle.Alloc calls under test -- so the buckets are
+    proven separated by handle type, not merely non-zero. Kinds 12 and
+    14 are exercised with real Pinned / WeakTrackResurrection handles on
+    a pointer-free instance, not asserted to stay at zero;
+  * NEGATIVE CONTROLS: a handle on a plain corelib object moves nothing,
+    and -- documenting the blind spot in an assertion -- neither does a
+    handle on an object[] that HOLDS a collectible instance;
+  * the STRONG handle alone holds the witness: after every other handle
+    is freed it still pins the teardown at NotQuiescent, and freeing it
+    drains the bucket by exactly one and lets the teardown complete. The
+    previous shape could not establish this, because a static kept the
+    weak target alive and was therefore a second strong root; the pinned
+    handle now serves that purpose instead, and every handle is released
+    in a finally so a failure cannot strand a context for later tests;
+  * set-wide gauges are compared with <=, not equality: the GC-driven
+    scout completion can retire a stray an earlier test left pending,
+    which would make an exact equality order-dependent;
+  * the two dark configurations are keyed off PlatformDetection, never
+    off another kind of the icall under test -- deriving the expectation
+    from the same call would be self-confirming, since a regression to
+    -1 everywhere would satisfy both dark legs vacuously. A
+    threads-enabled runtime has the machinery compiled out and must
+    report -1; the single-threaded build with the opt-in off keeps the
+    surface live and must honestly report an EMPTY condemned set (0).
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 133 +++++++++++++++++
- .../Loader/AssemblyLoadContext.Mono.cs        |   8 +
- .../mono/metadata/assembly-load-context.c     | 137 ++++++++++++++++++
- src/mono/mono/metadata/gc-internals.h         |  12 ++
- src/mono/mono/metadata/sgen-mono.c            |  80 ++++++++++
- 5 files changed, 370 insertions(+)
+ .../tests/ForcedNativeUnloadTests.cs          | 284 ++++++++++++
+ .../Loader/AssemblyLoadContext.Mono.cs        |  31 ++
+ .../mono/metadata/assembly-load-context.c     | 414 +++++++++++++++---
+ src/mono/mono/metadata/gc-internals.h         |  44 ++
+ src/mono/mono/metadata/sgen-mono.c            | 141 ++++++
+ 5 files changed, 862 insertions(+), 52 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index a338595e1..06ccf30ae 100644
+index a338595e1..def57135b 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -6,6 +6,7 @@
@@ -94,35 +164,63 @@ index a338595e1..06ccf30ae 100644
  using System.Threading.Tasks;
  using Xunit;
  
-@@ -92,6 +93,14 @@ public class ForcedNativeUnloadTests
+@@ -92,6 +93,32 @@ public class ForcedNativeUnloadTests
          // Monotonic: scout finalizer ran but completed nothing and re-registered. Distinguishes
          // "ran and refused" from "never ran" (a never-dying witness climbs this, kind 7 flat).
          private const int ScoutCompletionDeferralCount = 10;
-+        // Root classification for the condemned set (collectible + unloading contexts). GAUGES:
-+        // handle buckets by type, the manager denominator, and the live-witness count.
++        // Root classification for the condemned set (collectible + unloading contexts). All
++        // GAUGES, and all fields of ONE snapshot: take CondemnedSnapshot (kind 17) first, then
++        // read the others — they report the latched snapshot, so they are mutually consistent.
++        // Attribution is ONE HOP: a bucket counts handles whose TARGET's class belongs to the
++        // set, so it is blind to handles on containers/reflection objects/delegates that merely
++        // REACH a condemned instance (CondemnedIdentityHandles covers the runtime's own
++        // corelib-classed roots). See AssemblyLoadContext.GetScoutRetirementStats for the
++        // contract, including why all-zero buckets prove nothing about absence.
 +        private const int CondemnedStrongHandles = 11;
 +        private const int CondemnedPinnedHandles = 12;
 +        private const int CondemnedWeakHandles = 13;
 +        private const int CondemnedWeakTrackHandles = 14;
 +        private const int CondemnedManagers = 15;
 +        private const int CondemnedLiveWitnesses = 16;
++        private const int CondemnedSnapshot = 17;
++        private const int CondemnedWalkSaturated = 18;
++        private const int CondemnedIdentityHandles = 19;
++
++        // Every classification gauge except the snapshot trigger (kind 17), which returns a
++        // sequence number rather than a count and is therefore asserted separately.
++        private static readonly int[] s_condemnedGaugeKinds =
++        {
++            CondemnedStrongHandles, CondemnedPinnedHandles, CondemnedWeakHandles,
++            CondemnedWeakTrackHandles, CondemnedManagers, CondemnedLiveWitnesses,
++            CondemnedWalkSaturated, CondemnedIdentityHandles,
++        };
  
          private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
              .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
-@@ -511,6 +520,130 @@ await CollectAndAssertDeadAsync(weakNormal,
+@@ -511,6 +538,263 @@ await CollectAndAssertDeadAsync(weakNormal,
                  "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
          }
  
 +        /// <summary>
-+        /// Root-classification regression (stats kinds 11-16). A downstream WASM host whose
++        /// Root-classification regression (stats kinds 11-19). A downstream WASM host whose
 +        /// teardown reports NotQuiescent forever needs to know WHICH class of root holds the
 +        /// condemned context's LoaderAllocator witness — managed reflection cannot enumerate raw
-+        /// GCHandles, so the runtime classifies them here. This test drives the classification
-+        /// end to end: a strong handle to an object of the collectible assembly must be counted
-+        /// in the strong bucket (and must, by itself, keep the forced unload at NotQuiescent);
-+        /// freeing it must drop the bucket back to baseline and let the teardown complete.
-+        /// A weak-handle leg proves the buckets are distinguished by handle type rather than
-+        /// lumped together.
++        /// GCHandles, so the runtime classifies them.
++        ///
++        /// What this test establishes, and deliberately no more:
++        ///   * EXACT attribution. Each of the four handle buckets moves by exactly +1 for its
++        ///     own handle type and by exactly +0 for the others, measured across intervals whose
++        ///     only content is the GCHandle.Alloc calls themselves — so the buckets are proven
++        ///     separated by handle type, not merely non-zero.
++        ///   * NEGATIVE CONTROLS. A handle on a plain corelib object moves nothing, and — the
++        ///     documented LIMIT of this diagnostic — neither does a handle on an object[] that
++        ///     HOLDS a collectible instance: attribution is one hop, so a container root is
++        ///     invisible to kinds 11-14. That zero is asserted, not just described.
++        ///   * The STRONG handle alone holds the witness: after every other handle is freed it
++        ///     still pins the teardown at NotQuiescent, and freeing it drains the bucket and
++        ///     lets the teardown complete.
++        ///   * Kinds 12 and 14 are exercised LIVE (real Pinned / WeakTrackResurrection handles),
++        ///     not merely asserted to stay at zero.
 +        /// </summary>
 +        [Fact]
 +        public async Task CondemnedHandleClassification_ReportsHoldingHandleByType()
@@ -134,133 +232,279 @@ index a338595e1..06ccf30ae 100644
 +
 +            if (!ProtocolActive)
 +            {
-+                // Two distinct dark cases, exactly like the rest of this stats block (compare
-+                // the registry kinds, which detect the compiled-out build the same way):
-+                //  * threads-enabled runtime — the forced-unload machinery, and this surface
-+                //    with it, is compiled out by the DISABLE_THREADS hard gate: every kind
-+                //    reports unavailable (-1);
-+                //  * single-threaded with the opt-in off — the surface is live, but nothing is
-+                //    natively collectible, so the condemned set is genuinely EMPTY and every
-+                //    gauge honestly reads 0.
-+                int expected = ScoutStats(RetiredSetSize) < 0 ? -1 : 0;
-+                Assert.Equal(expected, ScoutStats(CondemnedStrongHandles));
-+                Assert.Equal(expected, ScoutStats(CondemnedPinnedHandles));
-+                Assert.Equal(expected, ScoutStats(CondemnedWeakHandles));
-+                Assert.Equal(expected, ScoutStats(CondemnedWeakTrackHandles));
-+                Assert.Equal(expected, ScoutStats(CondemnedManagers));
-+                Assert.Equal(expected, ScoutStats(CondemnedLiveWitnesses));
++                AssertClassificationDarkSurface();
 +                return;
 +            }
 +
-+            // Baselines rather than absolute zeroes: the assertions below are deltas, so this
-+            // test never depends on what an earlier test in the collection left pending.
-+            int managersBefore = ScoutStats(CondemnedManagers);
-+            int strongBefore = ScoutStats(CondemnedStrongHandles);
-+            int weakBefore = ScoutStats(CondemnedWeakHandles);
-+            int witnessesBefore = ScoutStats(CondemnedLiveWitnesses);
-+
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakRef = new WeakReference(context);
-+            GCHandle strongHandle = default;
-+            GCHandle weakHandle = default;
-+            HandleCollectibleInstanceThenUnload(context, ref strongHandle, ref weakHandle);
++            var handles = new GCHandle[HandleSlotCount];
 +
-+            GcQuiesce();
++            try
++            {
++                int[] baseline = RootCollectibleInstancesWithClassifiedHandles(context, handles);
 +
-+            // The context is condemned (collectible + unloading) and its managers are in scope.
-+            Assert.True(ScoutStats(CondemnedManagers) > managersBefore,
-+                $"the unloading context's managers must enter scope (before={managersBefore}, " +
-+                $"after={ScoutStats(CondemnedManagers)}).");
++                // The strong handle is a real root: the witness stays alive across collections
++                // and the teardown refuses.
++                GcQuiesce();
++                int[] rooted = CondemnedSnapshotByKind();
++                Assert.Equal(baseline[CondemnedStrongHandles] + 1, rooted[CondemnedStrongHandles]);
++                Assert.True(rooted[CondemnedLiveWitnesses] > 0,
++                    $"a strong GCHandle into the condemned set must keep a LoaderAllocator witness alive " +
++                    $"(managers={rooted[CondemnedManagers]}, witnesses={rooted[CondemnedLiveWitnesses]}).");
++                Assert.Equal(NotQuiescent, Force(context));
 +
-+            // The handles are classified by TYPE, not lumped: one strong and one weak handle
-+            // target objects whose class lives in the collectible context.
-+            Assert.True(ScoutStats(CondemnedStrongHandles) > strongBefore,
-+                $"a strong GCHandle into the condemned set must be counted in the strong bucket " +
-+                $"(before={strongBefore}, after={ScoutStats(CondemnedStrongHandles)}; " +
-+                $"weak={ScoutStats(CondemnedWeakHandles)}, managers={ScoutStats(CondemnedManagers)}).");
-+            Assert.True(ScoutStats(CondemnedWeakHandles) > weakBefore,
-+                $"a weak GCHandle into the condemned set must be counted in the weak bucket " +
-+                $"(before={weakBefore}, after={ScoutStats(CondemnedWeakHandles)}).");
++                // Drop the negative controls and every NON-rooting handle. Only the strong
++                // handle is left — no static keeps anything else alive — so this is where "the
++                // strong handle ALONE holds the witness" is actually established.
++                handles[HandleNegativePlain].Free();
++                handles[HandleNegativeContainer].Free();
++                handles[HandlePinned].Free();
++                handles[HandleWeak].Free();
++                handles[HandleWeakTrack].Free();
++                GcQuiesce();
 +
-+            // The strong handle is a real root: the witness stays alive and the teardown refuses.
-+            Assert.True(ScoutStats(CondemnedLiveWitnesses) > witnessesBefore,
-+                $"the strong handle must keep the condemned context's LoaderAllocator witness alive " +
-+                $"(before={witnessesBefore}, after={ScoutStats(CondemnedLiveWitnesses)}).");
-+            Assert.Equal(NotQuiescent, Force(context));
++                int[] strongOnly = CondemnedSnapshotByKind();
++                Assert.Equal(rooted[CondemnedStrongHandles], strongOnly[CondemnedStrongHandles]);
++                Assert.Equal(rooted[CondemnedPinnedHandles] - 1, strongOnly[CondemnedPinnedHandles]);
++                Assert.Equal(rooted[CondemnedWeakHandles] - 1, strongOnly[CondemnedWeakHandles]);
++                Assert.Equal(rooted[CondemnedWeakTrackHandles] - 1, strongOnly[CondemnedWeakTrackHandles]);
++                Assert.True(strongOnly[CondemnedLiveWitnesses] > 0,
++                    "the strong handle alone must still hold a witness after every other handle is freed.");
++                Assert.Equal(NotQuiescent, Force(context));
 +
-+            // Release every root: the buckets must drain and the teardown must now complete —
-+            // proving the classification tracked the actual holder rather than a static shape.
-+            strongHandle.Free();
-+            weakHandle.Free();
-+            s_weakHandleKeepAlive = null;
-+            GcQuiesce();
++                // Release the last root: the bucket drains by exactly one and the teardown
++                // completes — the classification tracked the ACTUAL holder, not a static shape.
++                handles[HandleStrong].Free();
++                GcQuiesce();
++                Assert.Equal(strongOnly[CondemnedStrongHandles] - 1,
++                    CondemnedSnapshotByKind()[CondemnedStrongHandles]);
 +
-+            Assert.Equal(strongBefore, ScoutStats(CondemnedStrongHandles));
-+            Assert.Equal(weakBefore, ScoutStats(CondemnedWeakHandles));
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +
-+            Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
++                // The context has left the condemned set, so the set-wide gauges must not have
++                // GROWN. Deliberately not an exact equality: the GC-driven scout completion can
++                // retire a stray an earlier test left pending, which would push these BELOW the
++                // baseline and make an equality order-dependent.
++                int[] drained = CondemnedSnapshotByKind();
++                Assert.True(drained[CondemnedManagers] <= baseline[CondemnedManagers],
++                    $"the condemned manager set must not grow after a completed teardown " +
++                    $"(baseline={baseline[CondemnedManagers]}, after={drained[CondemnedManagers]}).");
++                Assert.True(drained[CondemnedLiveWitnesses] <= baseline[CondemnedLiveWitnesses],
++                    $"live witnesses must not grow after a completed teardown " +
++                    $"(baseline={baseline[CondemnedLiveWitnesses]}, after={drained[CondemnedLiveWitnesses]}).");
++                Assert.Equal(0, drained[CondemnedWalkSaturated]);
 +
-+            // The context is gone from the condemned set, so the surface returns to baseline.
-+            Assert.Equal(managersBefore, ScoutStats(CondemnedManagers));
-+            Assert.Equal(witnessesBefore, ScoutStats(CondemnedLiveWitnesses));
-+
-+            context = null;
-+            await CollectAndAssertDeadAsync(weakRef,
-+                "the context must be reclaimable once the classified handles are freed.");
++                context = null;
++                await CollectAndAssertDeadAsync(weakRef,
++                    "the context must be reclaimable once the classified handles are freed.");
++            }
++            finally
++            {
++                // Any handle still allocated here would root a collectible context for the rest
++                // of the run and corrupt every later test's gauges, so release them on EVERY
++                // exit path, not just the successful one.
++                for (int i = 0; i < handles.Length; i++)
++                {
++                    if (handles[i].IsAllocated)
++                    {
++                        handles[i].Free();
++                    }
++                }
++            }
 +        }
 +
-+        // Creates one instance of a type from the collectible assembly, roots it with a STRONG
-+        // and a WEAK GCHandle (the classification targets), and initiates Unload. Every managed
-+        // local is confined to this frame so the handles are the only roots the buckets can see.
++        // Slots of the handle array driven by CondemnedHandleClassification_ReportsHoldingHandleByType.
++        private const int HandleStrong = 0;
++        private const int HandlePinned = 1;
++        private const int HandleWeak = 2;
++        private const int HandleWeakTrack = 3;
++        private const int HandleNegativePlain = 4;
++        private const int HandleNegativeContainer = 5;
++        private const int HandleSlotCount = 6;
++
++        // Latches ONE condemned-set snapshot (kind 17) and reads every gauge out of it, indexed
++        // BY STAT KIND so the assertions read like the documented contract. Reading the gauges
++        // individually without the snapshot would make them mutually inconsistent: a context
++        // reclaimed between two reads yields "all buckets zero while witnesses are live", which
++        // is exactly the false signal this surface exists to rule out.
++        private static int[] CondemnedSnapshotByKind()
++        {
++            Assert.True(ScoutStats(CondemnedSnapshot) > 0,
++                "the condemned-set snapshot must latch and return a monotonic sequence number.");
++
++            int[] byKind = new int[CondemnedIdentityHandles + 1];
++            foreach (int kind in s_condemnedGaugeKinds)
++            {
++                byKind[kind] = ScoutStats(kind);
++            }
++
++            return byKind;
++        }
++
++        // Both dark configurations, keyed off the PLATFORM rather than off the icall under test:
++        // deriving the expectation from another kind of the same call would be self-confirming —
++        // a regression that made the whole surface report -1 would satisfy both dark legs
++        // vacuously.
++        private static void AssertClassificationDarkSurface()
++        {
++            if (PlatformDetection.IsThreadingSupported)
++            {
++                // The forced-unload machinery, and this surface with it, is compiled out by the
++                // DISABLE_THREADS hard gate: every kind must report UNAVAILABLE, never 0.
++                Assert.Equal(-1, ScoutStats(CondemnedSnapshot));
++                foreach (int kind in s_condemnedGaugeKinds)
++                {
++                    Assert.Equal(-1, ScoutStats(kind));
++                }
++
++                return;
++            }
++
++            // Single-threaded with the opt-in off: the surface is LIVE — the snapshot latches
++            // and returns a sequence number — but nothing is natively collectible, so the
++            // condemned set is genuinely EMPTY and every gauge honestly reads 0.
++            Assert.True(ScoutStats(CondemnedSnapshot) > 0,
++                "the single-threaded build must latch a snapshot even with the opt-in off.");
++            foreach (int kind in s_condemnedGaugeKinds)
++            {
++                Assert.Equal(0, ScoutStats(kind));
++            }
++        }
++
++        // Loads the collectible assembly, creates the two probe instances, unloads, and then
++        // allocates the classified handles in three tight phases — asserting EXACT bucket deltas
++        // across each. Everything managed stays confined to this frame so the GCHandles are the
++        // only roots the buckets can attribute, and each measurement interval contains nothing
++        // but the GCHandle.Alloc calls under test, which is what makes the deltas exact rather
++        // than merely monotone. Returns the baseline snapshot for the caller's later phases.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static void HandleCollectibleInstanceThenUnload(
-+            AssemblyLoadContext context, ref GCHandle strongHandle, ref GCHandle weakHandle)
++        private static int[] RootCollectibleInstancesWithClassifiedHandles(
++            AssemblyLoadContext context, GCHandle[] handles)
 +        {
 +            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
 +            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Type pointerFreeType = asm.GetType(PointerFreeClassName, throwOnError: true);
 +            object strongTarget = Activator.CreateInstance(type);
-+            object weakTarget = Activator.CreateInstance(type);
-+            Assert.NotNull(strongTarget);
-+            Assert.NotNull(weakTarget);
 +
-+            strongHandle = GCHandle.Alloc(strongTarget, GCHandleType.Normal);
-+            weakHandle = GCHandle.Alloc(weakTarget, GCHandleType.Weak);
-+            // A weak handle does not root its target, so the weak bucket could otherwise read 0
-+            // simply because the target died before the assertions run. This static keeps it
-+            // alive until the buckets have been observed; the test clears it before asserting
-+            // the teardown completes (it is itself exactly the kind of static root under study).
-+            s_weakHandleKeepAlive = weakTarget;
++            // PointerFreeTestClass has no reference fields, so an instance of it is PINNABLE —
++            // which is what lets kinds 12 and 14 be exercised with real handles instead of being
++            // asserted to stay at zero.
++            object pinnedTarget = Activator.CreateInstance(pointerFreeType);
++            Assert.NotNull(strongTarget);
++            Assert.NotNull(pinnedTarget);
 +
 +            context.Unload();
++
++            // BASELINE: the context is already condemned (collectible + unloading) and its
++            // managers are in scope, but none of this test's handles exist yet.
++            int[] before = CondemnedSnapshotByKind();
++            Assert.True(before[CondemnedManagers] > 0,
++                $"the unloading context's memory managers must enter the condemned set " +
++                $"(managers={before[CondemnedManagers]}).");
++            Assert.True(before[CondemnedLiveWitnesses] > 0,
++                $"an unloading context with live instances must still have a live LoaderAllocator " +
++                $"witness (witnesses={before[CondemnedLiveWitnesses]}).");
++            Assert.Equal(0, before[CondemnedWalkSaturated]);
++
++            // The runtime's OWN roots are already attributable — but only by IDENTITY: the
++            // managed wrapper (which PrepareForAssemblyLoadContextRelease promoted to a STRONG
++            // handle when Unload was requested) and the LoaderAllocator witness are both
++            // corelib-classed, so kinds 11-14 are blind to them by construction. Asserting this
++            // documents why the type buckets alone would under-report the real root set.
++            Assert.True(before[CondemnedIdentityHandles] >= 2,
++                $"the runtime's own wrapper and witness handles must be identity-attributed " +
++                $"(identity={before[CondemnedIdentityHandles]}, strong={before[CondemnedStrongHandles]}).");
++
++            // PHASE A — strong and weak only. The +0 on the untouched buckets is the load-bearing
++            // half: it proves the buckets are separated by handle TYPE rather than lumped.
++            handles[HandleStrong] = GCHandle.Alloc(strongTarget, GCHandleType.Normal);
++            handles[HandleWeak] = GCHandle.Alloc(pinnedTarget, GCHandleType.Weak);
++            AssertBucketDeltas(before, CondemnedSnapshotByKind(), 1, 0, 1, 0);
++
++            // PHASE B — add the pinned and weak-track handles. Both target the pointer-free
++            // instance, which the pinned handle also keeps observable for the weak buckets: the
++            // previous shape used a static for that, and a static is a second STRONG root, so it
++            // made "the strong handle alone holds the witness" unprovable.
++            handles[HandlePinned] = GCHandle.Alloc(pinnedTarget, GCHandleType.Pinned);
++            handles[HandleWeakTrack] = GCHandle.Alloc(pinnedTarget, GCHandleType.WeakTrackResurrection);
++            int[] afterB = CondemnedSnapshotByKind();
++            AssertBucketDeltas(before, afterB, 1, 1, 1, 1);
++
++            // NEGATIVE CONTROLS. (1) A handle on a plain corelib object must move nothing — the
++            // walk is not counting handles indiscriminately. (2) A handle on an object[] HOLDING
++            // the collectible instance must ALSO move nothing: the array is corelib-classed, so
++            // one-hop class attribution cannot see the condemned instance it roots. That second
++            // zero is the documented blind spot of this diagnostic, asserted rather than assumed.
++            handles[HandleNegativePlain] = GCHandle.Alloc(new object(), GCHandleType.Normal);
++            handles[HandleNegativeContainer] = GCHandle.Alloc(new object[] { strongTarget }, GCHandleType.Normal);
++            int[] afterControls = CondemnedSnapshotByKind();
++            AssertBucketDeltas(before, afterControls, 1, 1, 1, 1);
++            Assert.Equal(afterB[CondemnedManagers], afterControls[CondemnedManagers]);
++
++            GC.KeepAlive(strongTarget);
++            GC.KeepAlive(pinnedTarget);
++            return before;
 +        }
 +
-+        // See HandleCollectibleInstanceThenUnload: keeps the weak-handle target observable.
-+        private static object s_weakHandleKeepAlive;
++        // Exact per-bucket deltas between two snapshots of the classification surface.
++        private static void AssertBucketDeltas(
++            int[] before, int[] after, int strong, int pinned, int weak, int weakTrack)
++        {
++            Assert.Equal(before[CondemnedStrongHandles] + strong, after[CondemnedStrongHandles]);
++            Assert.Equal(before[CondemnedPinnedHandles] + pinned, after[CondemnedPinnedHandles]);
++            Assert.Equal(before[CondemnedWeakHandles] + weak, after[CondemnedWeakHandles]);
++            Assert.Equal(before[CondemnedWeakTrackHandles] + weakTrack, after[CondemnedWeakTrackHandles]);
++            Assert.Equal(0, after[CondemnedWalkSaturated]);
++        }
 +
          /// <summary>
          /// The no-retry residue regression: a host that never calls ForceNativeUnload at all —
          /// N load/unload/drop cycles — must leave NO native residue. An orphaned struct is
 diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-index ca1b6ff47..797ea5171 100644
+index ca1b6ff47..bc534ff04 100644
 --- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
 +++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
-@@ -97,6 +97,14 @@ private static void KeepLoaderAllocator()
+@@ -97,6 +97,37 @@ private static void KeepLoaderAllocator()
          // Kind 10 counts scout-completion DEFERRALS (monotonic): the scout finalizer ran,
          // completed nothing, and re-registered. Distinguishes "ran and refused" from "never
          // ran" — a never-dying witness climbs this while kind 7 stays flat.
 +        //
-+        // Kinds 11-16 are root-classification GAUGES for the condemned set (collectible +
-+        // unloading contexts): 11 = strong (Normal) GC handles whose target lives in the set,
-+        // 12 = pinned, 13 = weak, 14 = weak-track-resurrection, 15 = condemned memory managers
-+        // in scope, 16 = managers whose LoaderAllocator witness is still alive. A non-zero
-+        // bucket names the handle class holding a witness; all-zero buckets with kind 16 > 0
-+        // prove the holder is not a GC handle at all (thread stack/register or native
-+        // structure) — the elimination a managed root tracer cannot make.
++        // Kinds 11-19 are root-classification GAUGES for the condemned set (collectible +
++        // unloading contexts). They are FIELDS OF ONE SNAPSHOT:
++        //   17 — take a fresh snapshot; returns its monotonic sequence number. Read this FIRST.
++        //   11 — strong (Normal) GC handles whose TARGET's class belongs to the set  [ROOTING]
++        //   12 — pinned handles, same attribution                                   [ROOTING]
++        //   13 — weak (short) handles, same attribution                       [INFORMATIONAL]
++        //   14 — weak-track-resurrection handles, same attribution            [INFORMATIONAL]
++        //   15 — condemned memory managers in scope (the denominator; >= kind 8, which counts
++        //        contexts rather than managers)
++        //   16 — condemned managers whose LoaderAllocator witness is still alive
++        //   18 — 1 if the handle walk hit its slot budget, so 11-14/19 are LOWER BOUNDS
++        //   19 — handles of ANY type whose target IS a condemned context's own managed wrapper
++        //        or LoaderAllocator witness (corelib-classed, hence invisible to 11-14; the
++        //        runtime installs one such strong handle per in-flight unload itself)
++        //
++        // CONTRACT.
++        //   * -1 means UNAVAILABLE, never "zero": the whole surface is -1 on a threads-enabled
++        //     build (compiled out by the DISABLE_THREADS hard gate), and kinds 11-14/18/19 are
++        //     additionally -1 on a non-sgen collector. 0 means the surface is LIVE and the
++        //     condemned set is genuinely empty.
++        //   * Counts are INSTANTANEOUS and PER HANDLE, not per object: two handles onto the
++        //     same instance count twice.
++        //   * Weak kinds (13/14) root nothing and can never be the holder; they only show that
++        //     something still observes the set.
++        //   * Attribution is ONE HOP. A non-zero bucket means a handle DIRECTLY targets an
++        //     attributable object — necessary, not sufficient, for "a GC handle is the holder".
++        //     All-zero buckets do NOT prove no GC handle is involved: a handle on a container,
++        //     a reflection object, a delegate or an interop buffer whose graph reaches a
++        //     condemned instance lands in no bucket. See the "Root classification for condemned
++        //     collectible contexts" block in assembly-load-context.c for the full miss list.
          internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
  
          [MethodImplAttribute(MethodImplOptions.InternalCall)]
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 065b4a4ac..3e4714837 100644
+index 065b4a4ac..90b2c06c0 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -6,6 +6,7 @@
@@ -271,231 +515,600 @@ index 065b4a4ac..3e4714837 100644
  #include "mono/metadata/icall-decl.h"
  #include "mono/metadata/loader-internals.h"
  #include "mono/metadata/loaded-images-internals.h"
-@@ -100,6 +101,94 @@ static gint32 collectible_alc_native_structs;
+@@ -100,6 +101,327 @@ static gint32 collectible_alc_native_structs;
   * of InternalGetScoutRetirementStats; diagnostics only. */
  static gint32 scout_completion_deferral_count;
  
 +/*
-+ * Condemned-set snapshot for the root-classification diagnostics (stats kinds 11-16).
++ * ===========================================================================================
++ * Root classification for condemned collectible contexts (stats kinds 11-19)
++ * ===========================================================================================
 + *
-+ * A downstream WASM host doing repeated collectible-ALC load/unload cycles observes the
++ * WHY. A downstream WASM host doing repeated collectible-ALC load/unload cycles observes the
 + * teardown reporting NotQuiescent forever: some root keeps the LoaderAllocator witnesses
 + * alive, and an exhaustive managed-side root trace found nothing — which leaves the roots
 + * managed reflection CANNOT enumerate (raw GCHandles, thread stacks/registers, native
-+ * structures). These kinds narrow that down without a debugger: they classify every live GC
-+ * handle whose target object belongs to a condemned context (collectible + unloading),
-+ * bucketed by handle type, alongside the live-witness count for the same set.
++ * structures). These kinds narrow that down without a debugger or a heap dump.
 + *
-+ * Reading is pure: the snapshot is built from the global ALC list plus each context's own
-+ * manager arrays, and the handle walk never mutates a slot (see
-+ * mono_gc_count_handles_into_managers). Gated exactly like the rest of the feature —
-+ * unknown/unavailable kinds keep returning -1.
++ * WHAT IS MEASURED — and what it does NOT prove. For every live GC handle, the target object
++ * is attributed to the condemned set (collectible + unloading contexts) in one of two ways:
++ *
++ *   CLASS attribution (kinds 11-14, bucketed by handle type): the TARGET's class belongs to
++ *   one of the condemned memory managers.
++ *
++ *   IDENTITY attribution (kind 19, class-blind): the TARGET *is* one of the condemned
++ *   contexts' own runtime objects — the managed AssemblyLoadContext wrapper (which
++ *   PrepareForAssemblyLoadContextRelease deliberately promotes to a STRONG handle while an
++ *   unload is in flight) or a manager's LoaderAllocator witness. Those objects are
++ *   corelib-classed, so class attribution is blind to them by construction; counting them
++ *   separately keeps the runtime's own expected roots distinguishable from third-party ones.
++ *
++ * Attribution is PER HANDLE and NON-TRANSITIVE. A non-zero bucket therefore establishes
++ * "a GC handle DIRECTLY TARGETS an object attributable to the condemned set" — a NECESSARY,
++ * not sufficient, condition for "a GC handle is the holder". All-zero buckets do NOT establish
++ * that no GC handle is involved: rooting is transitive, and a handle whose immediate target is
++ * corelib-classed while its object graph reaches a condemned instance lands in NO bucket. The
++ * miss classes, enumerated so nobody has to rediscover them:
++ *
++ *   - containers: object[] / List<object> / Dictionary<,> / boxes holding app instances;
++ *   - the reflection-cache family: RuntimeType, RuntimeAssembly, MethodInfo/FieldInfo — all
++ *     corelib-classed even when they DESCRIBE collectible metadata (this is where a real
++ *     residual root was already found downstream);
++ *   - delegates: Action/Func are corelib types; the target instance and method are not;
++ *   - pinned byte[]/T[] buffers held for interop (element class corelib);
++ *   - a strong handle placed directly on a LoaderAllocator that kind 16 counts as live, unless
++ *     it happens to be one of the identity objects kind 19 covers;
++ *   - anything reached only through native structures or thread stacks/registers.
++ *
++ * The sibling lifecycle test ForcedUnload_RootedPointerFreeObjects_BlockNativeFree already
++ * demonstrates that BCL-typed roots block the free, i.e. exactly the shape this classification
++ * cannot see. Read these kinds as "which handle classes DIRECTLY hold the set, and how many
++ * witnesses are still live" — a triage funnel, never a proof of absence.
++ *
++ * ATOMICITY. All nine values are fields of ONE snapshot: kind 17 recomputes the whole snapshot
++ * (set build + a single handle walk + witness count) and returns its monotonic sequence
++ * number; kinds 11-16, 18 and 19 then read that latched snapshot. Six independent reads would
++ * be mutually inconsistent — a context reclaimed between two of them yields "every bucket 0
++ * while witnesses are live", manufacturing precisely the false signal this exists to rule out.
++ *
++ * COST. The snapshot is O(handles + managers): membership is a pointer-keyed set, so the walk
++ * does not degrade quadratically as contexts strand — the state this diagnostic explains. It
++ * short-circuits entirely on an empty condemned set, and the walk carries a slot budget with a
++ * saturation flag (kind 18) so it can never run unbounded on the single browser thread.
++ *
++ * PURITY. Reading never mutates runtime state: the snapshot is built from the global ALC list
++ * plus each context's own manager arrays, the handle walk write-back is a self-store, and
++ * m_class_get_mem_manager is a pure lookup that cannot lazily allocate a manager (see the
++ * PRECONDITION note at sgen_scan_handles_into_managers). Gated exactly like the rest of the
++ * feature: this whole region is DISABLE_THREADS-only, the handle walk additionally requires
++ * sgen, and unavailable kinds keep returning -1.
 + */
-+typedef struct {
-+	GPtrArray *managers;      /* MonoMemoryManager* of every condemned context */
-+	gint32 condemned_alcs;    /* contexts contributing to the set */
-+	gint32 live_witnesses;    /* managers whose LoaderAllocator witness is still alive */
-+} AlcCondemnedSet;
 +
-+static void
-+alc_condemned_set_collect (AlcCondemnedSet *set)
++#define ALC_CONDEMNED_HANDLE_BUCKETS 4
++#if defined(HAVE_SGEN_GC) && (MONO_SGEN_CONDEMNED_HANDLE_BUCKETS != ALC_CONDEMNED_HANDLE_BUCKETS)
++#error "condemned handle bucket count must match the sgen scan contract in gc-internals.h"
++#endif
++
++/*
++ * Classification budget. 200k slots is one to two orders of magnitude above the whole-process
++ * handle population this runtime has ever been measured at, so a healthy read is never
++ * truncated; the cap exists so a pathological table can never turn a read-only gauge into a
++ * long pause on the single browser thread. Exceeding it sets kind 18 and makes kinds 11-14/19
++ * lower bounds rather than silently understating them.
++ */
++#define ALC_CONDEMNED_HANDLE_SLOT_BUDGET 200000
++
++/* Contexts a teardown could still be pending for: the ONE definition of "condemned", shared by
++ * the kind 8 gauge and the kinds 11-19 snapshot so the two can never drift apart. */
++static gboolean
++alc_is_condemned (MonoAssemblyLoadContext *alc)
 +{
-+	set->managers = g_ptr_array_new ();
-+	set->condemned_alcs = 0;
-+	set->live_witnesses = 0;
++	return alc && alc->collectible && alc->unloading;
++}
 +
-+	alcs_lock ();
-+	for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
-+		MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)tmp->data;
-+		if (!alc || !alc->collectible || !alc->unloading)
-+			continue;
++/* The manager's LoaderAllocator witness object, or NULL if the witness is dead or was never
++ * materialised. A NULL weak handle means no LoaderAllocator bookkeeping ever existed for that
++ * manager (no vtable/object of it was created), which is quiescent, not live. */
++static MonoObject *
++alc_manager_witness_object (MonoMemoryManager *mm)
++{
++	if (!mm || !mm->loader_allocator_weak_handle)
++		return NULL;
++	return (MonoObject *)mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle);
++}
 +
-+		set->condemned_alcs++;
++/* Return FALSE to stop the walk early. */
++typedef gboolean (*AlcManagerVisitFunc) (MonoMemoryManager *mm, gpointer user_data);
 +
-+		MonoMemoryManager *primary_mm = alc->memory_manager;
-+		if (primary_mm) {
-+			g_ptr_array_add (set->managers, primary_mm);
-+			if (primary_mm->loader_allocator_weak_handle &&
-+					mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
-+				set->live_witnesses++;
-+		}
++/*
++ * Visits EVERY memory manager a teardown of `alc` would free: the primary manager plus each
++ * shared generic manager the context owns, skipping duplicates of the primary. THE single
++ * definition of that set — the quiescence gate (alc_is_managed_quiescent), and the condemned
++ * snapshot behind stats kinds 11-19, all consume it, so the gate can never disagree with the
++ * gauge that claims to report "the exact quantity the gate refuses on".
++ *
++ * NULL-safe on both arrays: mono_alc_cleanup frees and NULLs generic_memory_managers (and the
++ * primary) during teardown, so a read-only gauge racing a tombstoned context must not
++ * dereference them. Tombstoned contexts are IN SCOPE for the walk and simply contribute
++ * nothing once their managers are gone.
++ */
++static gboolean
++alc_foreach_teardown_manager (MonoAssemblyLoadContext *alc, AlcManagerVisitFunc visit, gpointer user_data)
++{
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++	if (primary_mm && !visit (primary_mm, user_data))
++		return FALSE;
 +
-+		mono_alc_memory_managers_lock (alc);
++	gboolean completed = TRUE;
++	mono_alc_memory_managers_lock (alc);
++	if (alc->generic_memory_managers) {
 +		for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
 +			MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
 +			if (!mm || mm == primary_mm)
 +				continue;
-+			g_ptr_array_add (set->managers, mm);
-+			if (mm->loader_allocator_weak_handle &&
-+					mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL)
-+				set->live_witnesses++;
++			if (!visit (mm, user_data)) {
++				completed = FALSE;
++				break;
++			}
 +		}
-+		mono_alc_memory_managers_unlock (alc);
 +	}
-+	alcs_unlock ();
++	mono_alc_memory_managers_unlock (alc);
++	return completed;
 +}
 +
-+static void
-+alc_condemned_set_free (AlcCondemnedSet *set)
++static gboolean
++alc_visit_stop_on_live_witness (MonoMemoryManager *mm, gpointer user_data)
 +{
-+	g_ptr_array_free (set->managers, TRUE);
-+	set->managers = NULL;
++	if (!alc_manager_witness_object (mm))
++		return TRUE;
++	*(gboolean *)user_data = TRUE;
++	return FALSE;
 +}
 +
 +/*
-+ * Handle buckets for the current condemned set, in the order
-+ * { strong (Normal), pinned, weak (short), weak-track-resurrection }. Recomputed per read:
-+ * these are diagnostics, invoked a handful of times per unload cycle by lifecycle tests and
-+ * host telemetry, never on a hot path.
++ * Quiescence gate — ALL-OR-NOTHING over the exact set of managers a teardown would free.
++ * alc->unloading only means the managed Unload() was requested — it is NOT proof that the
++ * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
++ * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
++ * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
++ * LoaderAllocator is now held only by managed references; while a manager's weak-handle
++ * target is non-NULL, managed roots remain and freeing would reclaim live memory. This is
++ * exactly the criterion the LoaderAllocatorScout uses.
++ *
++ * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
++ * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
++ * {default, this} manager) keeps that shared witness alive even after the primary witness
++ * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
++ * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
++ * anything is freed — hence the shared walk above rather than a hand-copied loop. If ANY
++ * witness is live, nothing may be freed.
++ *
++ * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
++ * (which reports NotQuiescent so the host can retry) and the GC-driven scout completion in
++ * LoaderAllocatorScout_Destroy (which simply waits for a later finalization round).
 + */
 +static gboolean
-+alc_condemned_handle_counts (gint32 *out_counts)
++alc_is_managed_quiescent (MonoAssemblyLoadContext *alc)
 +{
-+#ifdef HAVE_SGEN_GC
-+	AlcCondemnedSet set;
-+	alc_condemned_set_collect (&set);
-+	mono_gc_count_handles_into_managers ((gpointer *)set.managers->pdata, (int)set.managers->len, out_counts);
-+	alc_condemned_set_free (&set);
++	gboolean witness_live = FALSE;
++	alc_foreach_teardown_manager (alc, alc_visit_stop_on_live_witness, &witness_live);
++	return !witness_live;
++}
++
++/* Latched result of one condemned-set snapshot; see the ATOMICITY note above. Scalars only:
++ * manager and object POINTERS must never outlive the read that collected them, because a
++ * moving collector may relocate an object once the icall returns. */
++typedef struct {
++	gint32 sequence;          /* monotonic; 0 = no snapshot has ever been taken */
++	gint32 managers_in_scope;
++	gint32 live_witnesses;
++	gint32 handle_counts [ALC_CONDEMNED_HANDLE_BUCKETS];
++	gint32 identity_hits;
++	gboolean handles_available; /* FALSE on a non-sgen build: kinds 11-14/18/19 report -1 */
++	gboolean saturated;
++} AlcCondemnedSnapshot;
++
++static AlcCondemnedSnapshot alc_condemned_snapshot;
++static gint32 alc_condemned_snapshot_sequence;
++
++typedef struct {
++	GHashTable *managers;        /* set: MonoMemoryManager* */
++	GHashTable *witness_objects; /* set: MonoObject* identities */
++	gint32 managers_in_scope;
++	gint32 live_witnesses;
++} AlcCondemnedSetBuild;
++
++static gboolean
++alc_condemned_set_visit (MonoMemoryManager *mm, gpointer user_data)
++{
++	AlcCondemnedSetBuild *build = (AlcCondemnedSetBuild *)user_data;
++
++	/* A shared generic manager can be owned by one context and listed by another; count and
++	 * store it once so kind 15 is a manager count, not a membership-edge count. */
++	if (g_hash_table_contains (build->managers, mm))
++		return TRUE;
++	g_hash_table_insert (build->managers, mm, mm);
++	build->managers_in_scope++;
++
++	MonoObject *witness = alc_manager_witness_object (mm);
++	if (witness) {
++		build->live_witnesses++;
++		g_hash_table_insert (build->witness_objects, witness, witness);
++	}
 +	return TRUE;
-+#else
-+	(void)out_counts;
-+	return FALSE;
++}
++
++/*
++ * Recompute the whole snapshot. The identity set holds raw MonoObject* between the ALC-list
++ * walk and the handle walk: safe here and only here, because nothing in between allocates
++ * managed memory or reaches a safepoint (the set uses native malloc), and this build has no
++ * other thread that could start a collection — so no object can be relocated mid-snapshot.
++ */
++static void
++alc_condemned_snapshot_take (void)
++{
++	AlcCondemnedSetBuild build;
++	build.managers = g_hash_table_new (g_direct_hash, g_direct_equal);
++	build.witness_objects = g_hash_table_new (g_direct_hash, g_direct_equal);
++	build.managers_in_scope = 0;
++	build.live_witnesses = 0;
++
++	alcs_lock ();
++	for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
++		MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)tmp->data;
++		if (!alc_is_condemned (alc))
++			continue;
++
++		/* The managed wrapper: PrepareForAssemblyLoadContextRelease swapped this handle to
++		 * STRONG when the unload was requested, so it is a real root — and corelib-classed,
++		 * hence invisible to class attribution. Identity catches it. */
++		if (alc->gchandle) {
++			MonoObject *wrapper = (MonoObject *)mono_gchandle_get_target_internal (alc->gchandle);
++			if (wrapper)
++				g_hash_table_insert (build.witness_objects, wrapper, wrapper);
++		}
++
++		alc_foreach_teardown_manager (alc, alc_condemned_set_visit, &build);
++	}
++	alcs_unlock ();
++
++	AlcCondemnedSnapshot *snap = &alc_condemned_snapshot;
++	memset (snap, 0, sizeof (*snap));
++	snap->managers_in_scope = build.managers_in_scope;
++	snap->live_witnesses = build.live_witnesses;
++
++#ifdef HAVE_SGEN_GC
++	MonoSgenCondemnedHandleScan scan;
++	memset (&scan, 0, sizeof (scan));
++	scan.condemned_managers = build.managers;
++	scan.condemned_objects = build.witness_objects;
++	scan.slot_budget = ALC_CONDEMNED_HANDLE_SLOT_BUDGET;
++	sgen_scan_handles_into_managers (&scan);
++	for (int i = 0; i < ALC_CONDEMNED_HANDLE_BUCKETS; ++i)
++		snap->handle_counts [i] = scan.class_hits [i];
++	snap->identity_hits = scan.identity_hits;
++	snap->saturated = scan.saturated;
++	snap->handles_available = TRUE;
 +#endif
++
++	g_hash_table_destroy (build.witness_objects);
++	g_hash_table_destroy (build.managers);
++
++	/* Monotonic and never 0 (0 means "never taken"); saturating rather than wrapping. */
++	if (alc_condemned_snapshot_sequence < G_MAXINT32)
++		alc_condemned_snapshot_sequence++;
++	snap->sequence = alc_condemned_snapshot_sequence;
++}
++
++/*
++ * The kinds 11-19 reader. Defined HERE, inside the DISABLE_THREADS region, so the gate sits
++ * with the code it guards instead of being inherited from an enclosing block hundreds of lines
++ * away; the icall's switch does nothing but forward to it.
++ */
++static int
++alc_condemned_diag_read (int kind)
++{
++	AlcCondemnedSnapshot *snap = &alc_condemned_snapshot;
++
++	if (kind == 17) {
++		alc_condemned_snapshot_take ();
++		return snap->sequence;
++	}
++
++	/* A lone read still answers, but reading several kinds without a preceding kind 17 serves
++	 * one older snapshot to all of them BY DESIGN — consistency beats freshness here (see the
++	 * ATOMICITY note). Callers that want fresh values take kind 17 first. */
++	if (snap->sequence == 0)
++		alc_condemned_snapshot_take ();
++
++	switch (kind) {
++	case 11:
++	case 12:
++	case 13:
++	case 14:
++		return snap->handles_available ? snap->handle_counts [kind - 11] : -1;
++	case 15:
++		return snap->managers_in_scope;
++	case 16:
++		return snap->live_witnesses;
++	case 18:
++		return snap->handles_available ? (snap->saturated ? 1 : 0) : -1;
++	case 19:
++		return snap->handles_available ? snap->identity_hits : -1;
++	default:
++		return -1;
++	}
 +}
 +
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -666,6 +755,21 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -493,56 +815,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	mono_alc_memory_managers_unlock (alc);
+ }
+ 
+-#ifdef DISABLE_THREADS
+-/*
+- * Quiescence gate — ALL-OR-NOTHING over the exact set of managers a teardown would free.
+- * alc->unloading only means the managed Unload() was requested — it is NOT proof that the
+- * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
+- * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
+- * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
+- * LoaderAllocator is now held only by managed references; while a manager's weak-handle
+- * target is non-NULL, managed roots remain and freeing would reclaim live memory. This is
+- * exactly the criterion the LoaderAllocatorScout uses.
+- *
+- * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
+- * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
+- * {default, this} manager) keeps that shared witness alive even after the primary witness
+- * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
+- * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
+- * anything is freed. If ANY witness is live, nothing may be freed. A NULL weak handle
+- * means no LoaderAllocator bookkeeping was ever materialised for that manager (no
+- * vtable/object of it ever existed), which is safe to free.
+- *
+- * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
+- * below (which reports NotQuiescent so the host can retry) and the GC-driven scout
+- * completion in LoaderAllocatorScout_Destroy (which simply waits for a later finalization
+- * round).
+- */
+-static gboolean
+-alc_is_managed_quiescent (MonoAssemblyLoadContext *alc)
+-{
+-	MonoMemoryManager *primary_mm = alc->memory_manager;
+-	if (primary_mm && primary_mm->loader_allocator_weak_handle &&
+-			mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
+-		return FALSE;
+-
+-	gboolean witness_live = FALSE;
+-	mono_alc_memory_managers_lock (alc);
+-	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
+-		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
+-		if (mm == primary_mm)
+-			continue;
+-		if (mm->loader_allocator_weak_handle &&
+-				mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL) {
+-			witness_live = TRUE;
+-			break;
+-		}
+-	}
+-	mono_alc_memory_managers_unlock (alc);
+-	return !witness_live;
+-}
+-#endif /* DISABLE_THREADS */
+-
+ int
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
+ {
+@@ -666,6 +938,31 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * re-registered. Behind the DISABLE_THREADS gate like kinds 0/1. Distinguishes "the
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
 +	 *
-+	 * Kinds 11-16 — ROOT CLASSIFICATION for the condemned set (see AlcCondemnedSet above).
-+	 * All GAUGES, all behind the DISABLE_THREADS gate, all recomputed per read:
-+	 *   11 — strong (Normal) GC handles whose target object belongs to a condemned context
-+	 *   12 — pinned GC handles into the condemned set
-+	 *   13 — weak (short) GC handles into the condemned set
-+	 *   14 — weak-track-resurrection GC handles into the condemned set
++	 * Kinds 11-19 — ROOT CLASSIFICATION for the condemned set. Fields of ONE snapshot, all
++	 * GAUGES, all behind the DISABLE_THREADS gate; the full contract (including what the
++	 * classification does NOT prove) is the "Root classification for condemned collectible
++	 * contexts" block at the top of this file, which is the canonical reference:
++	 *   11 — strong (Normal) handles whose TARGET's class belongs to the condemned set  [ROOTING]
++	 *   12 — pinned handles, same attribution                                           [ROOTING]
++	 *   13 — weak (short) handles, same attribution                            [INFORMATIONAL]
++	 *   14 — weak-track-resurrection handles, same attribution                 [INFORMATIONAL]
 +	 *   15 — condemned memory managers in scope (denominator; a context contributes its
 +	 *        primary manager plus every shared generic manager it owns, so this is >= kind 8)
-+	 *   16 — condemned managers whose LoaderAllocator witness is still alive
-+	 * Read together they answer the question a managed root tracer cannot: when a host's
-+	 * teardown reports NotQuiescent forever, a non-zero bucket names the handle class that
-+	 * holds the witness, while all-zero buckets with kind 16 > 0 prove the holder is NOT a
-+	 * GC handle at all — a thread stack/register or native structure — which is exactly the
-+	 * elimination needed before instrumenting deeper.
++	 *   16 — condemned managers whose LoaderAllocator witness is still alive — the exact
++	 *        quantity the quiescence gate refuses on, computed by the SAME shared walk
++	 *   17 — take a fresh snapshot; returns its monotonic sequence number. Read this FIRST:
++	 *        kinds 11-16/18/19 report the latched snapshot, so they are mutually consistent
++	 *   18 — 1 if the handle walk hit its slot budget (kinds 11-14/19 are then lower bounds)
++	 *   19 — handles of ANY type whose target IS a condemned context's own managed wrapper or
++	 *        LoaderAllocator witness. Those are corelib-classed, so kinds 11-14 are blind to
++	 *        them; the runtime installs one such strong handle per in-flight unload itself
++	 * Kinds 13/14 are informational only: a weak handle roots nothing, so it can never be the
++	 * holder — it merely shows that something still OBSERVES the condemned set.
++	 * A non-zero bucket says "a handle DIRECTLY targets an attributable object": necessary,
++	 * not sufficient. All-zero buckets do NOT prove the absence of a GC-handle holder, because
++	 * rooting is transitive and this attribution is one hop (see the contract block for the
++	 * enumerated miss classes: containers, reflection objects, delegates, interop buffers).
  	 */
  	if (kind == 2 || kind == 3)
  		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
-@@ -701,6 +805,39 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -690,8 +987,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 		int pending = 0;
+ 		alcs_lock ();
+ 		for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
+-			MonoAssemblyLoadContext *a = (MonoAssemblyLoadContext *)tmp->data;
+-			if (a && a->collectible && a->unloading)
++			/* Same alc_is_condemned predicate the kinds 11-19 snapshot uses, so this
++			 * context gauge and that manager gauge can never disagree about scope. */
++			if (alc_is_condemned ((MonoAssemblyLoadContext *)tmp->data))
+ 				pending++;
+ 		}
+ 		alcs_unlock ();
+@@ -701,6 +999,18 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
 +	case 11:
 +	case 12:
 +	case 13:
-+	case 14: {
-+		/* GC handles whose target lives in a condemned context, by handle type:
-+		 * 11 = strong (Normal), 12 = pinned, 13 = weak, 14 = weak-track-resurrection. */
-+		gint32 counts [4];
-+		if (!alc_condemned_handle_counts (counts))
-+			return -1;
-+		return counts [kind - 11];
-+	}
-+	case 15: {
-+		/* Condemned memory managers in scope — the denominator for kinds 11-14 and 16.
-+		 * Differs from kind 8 (contexts): a context contributes its primary manager plus
-+		 * every shared generic manager it owns. */
-+		AlcCondemnedSet set;
-+		alc_condemned_set_collect (&set);
-+		gint32 result = (gint32)set.managers->len;
-+		alc_condemned_set_free (&set);
-+		return result;
-+	}
-+	case 16: {
-+		/* Condemned managers whose LoaderAllocator witness is still alive — the exact
-+		 * quantity the quiescence gate refuses on. Read together with kinds 11-14 it
-+		 * separates "a GC handle holds the witness" (some bucket is non-zero) from "the
-+		 * witness is held by a root the handle tables cannot see — thread stack,
-+		 * register, or native structure" (every bucket zero while this is non-zero). */
-+		AlcCondemnedSet set;
-+		alc_condemned_set_collect (&set);
-+		gint32 result = set.live_witnesses;
-+		alc_condemned_set_free (&set);
-+		return result;
-+	}
++	case 14:
++	case 15:
++	case 16:
++	case 17:
++	case 18:
++	case 19:
++		/* One snapshot, nine fields — see alc_condemned_diag_read and the "Root
++		 * classification for condemned collectible contexts" contract block. */
++		return alc_condemned_diag_read (kind);
  	default:
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index f0141675b..020be9cda 100644
+index f0141675b..79b9ba9b1 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -431,4 +431,16 @@ extern gchar **mono_do_not_finalize_class_names;
+@@ -431,4 +431,48 @@ extern gchar **mono_do_not_finalize_class_names;
  MONO_COMPONENT_API void mono_stop_world (MonoThreadInfoFlags flags);
  MONO_COMPONENT_API void mono_restart_world (MonoThreadInfoFlags flags);
  
-+#ifdef HAVE_SGEN_GC
++#if defined(HAVE_SGEN_GC) && defined(DISABLE_THREADS)
 +/*
-+ * Diagnostic for host-triggered collectible AssemblyLoadContext unload (see
-+ * assembly-load-context.c): classify every live GC handle whose TARGET object belongs to one
-+ * of the supplied memory managers, bucketed by handle type. `managers` is an array of
-+ * MonoMemoryManager* (opaque here) of length n_managers; out_counts receives four counts in
-+ * this order: strong (Normal), pinned, weak (short), weak-track-resurrection. Read-only: the
-+ * walk never mutates a handle slot.
++ * Read-only GC-handle classification for the host-triggered collectible AssemblyLoadContext
++ * unload diagnostics. Implemented in sgen-mono.c; the canonical rationale, the attribution
++ * CONTRACT and its documented blind spots live with the sole consumer, in the "Root
++ * classification for condemned collectible contexts" block of assembly-load-context.c.
++ *
++ * Gated on DISABLE_THREADS as well as the collector: sgen_gchandle_iterate needs exclusive
++ * access to the handle tables, which the walk obtains from the single-threaded browser
++ * runtime rather than by stopping the world (see the PRECONDITION note at the definition).
++ * A threads-enabled or Boehm build has neither the declaration nor the definition, and the
++ * consumer reports the affected stat kinds as unavailable (-1).
 + */
-+void mono_gc_count_handles_into_managers (gpointer *managers, int n_managers, gint32 *out_counts);
++
++#define MONO_SGEN_CONDEMNED_HANDLE_BUCKETS 4
++
++typedef struct {
++	/* IN: set of condemned MonoMemoryManager* — keys only, direct-pointer hashed, so
++	 * membership is O(1) however many contexts are stranded. Sets rather than arrays: the
++	 * pointer types stay honest at the caller (this header must not name loader-internals
++	 * types) without erasing them to a gpointer* array. */
++	GHashTable *condemned_managers;
++	/* IN: set of MonoObject* identities — the condemned contexts' own managed wrapper objects
++	 * and LoaderAllocator witnesses. These are corelib-classed, so only identity can attribute
++	 * them. Valid for the duration of the call only (a moving collector may relocate them
++	 * afterwards); never retain this set across a GC. */
++	GHashTable *condemned_objects;
++	/* IN: cap on handle slots CLASSIFIED (<= 0 means no cap); past it counts are lower bounds
++	 * and `saturated` is set. */
++	gint32 slot_budget;
++
++	/* OUT: handles whose target's CLASS belongs to condemned_managers, per handle type, in the
++	 * order { strong (Normal), pinned, weak (short), weak-track-resurrection }. */
++	gint32 class_hits [MONO_SGEN_CONDEMNED_HANDLE_BUCKETS];
++	/* OUT: handles of ANY type whose target IS a member of condemned_objects. */
++	gint32 identity_hits;
++	/* OUT: handle slots visited, and whether slot_budget cut the classification short. */
++	gint32 slots_visited;
++	gboolean saturated;
++} MonoSgenCondemnedHandleScan;
++
++void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
 +#endif
 +
  #endif /* __MONO_METADATA_GC_INTERNAL_H__ */
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index e7611b1b9..e1f2cbc56 100644
+index e7611b1b9..b6fd5b893 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -1883,6 +1883,86 @@ walk_references (GCObject *start, size_t size, void *data)
-  * profiler event handler.
-  * \returns a non-zero value if the GC doesn't support heap walking
-  */
+@@ -1901,6 +1901,147 @@ mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data)
+ 	return 0;
+ }
+ 
++#ifdef DISABLE_THREADS
 +/*
 + * GC-handle classification for the host-triggered collectible AssemblyLoadContext unload
-+ * diagnostics (see the InternalGetScoutRetirementStats kinds 11-14 in
-+ * assembly-load-context.c). A downstream WASM host that strands one collectible context per
-+ * load/unload cycle needs to know WHICH class of root keeps a condemned context's
-+ * LoaderAllocator witness alive; managed reflection cannot enumerate raw GCHandles, so the
-+ * runtime reports them here, bucketed by handle type.
++ * diagnostics. The canonical rationale, the exact attribution CONTRACT and its documented
++ * blind spots live with the consumer, in the "Root classification for condemned collectible
++ * contexts" block of assembly-load-context.c; this file only implements the sgen walk.
 + *
-+ * Read-only by construction: the iteration callback always returns the slot value it was
-+ * given, so no handle is ever freed, moved or re-tagged by the walk.
++ * In one line: for every live GC handle, report whether its TARGET object is attributable to
++ * the condemned set, either because the target's class belongs to one of the condemned memory
++ * managers (bucketed by handle type) or because the target IS one of the condemned contexts'
++ * own runtime objects (identity). Attribution is per-handle and NON-transitive: a handle on a
++ * container that merely REFERENCES a condemned instance is not attributed. See the consumer's
++ * contract block for the enumerated miss classes.
 + *
-+ * Safety. sgen_gchandle_iterate documents that the world must be stopped; its callers are
-+ * collection-time. This entry point is only reached from the DISABLE_THREADS-gated
-+ * diagnostics icall on the single-threaded browser runtime, where no other thread can exist
-+ * and no collection can be in progress underneath an icall — the precondition is therefore
-+ * satisfied trivially rather than by taking the world down. Dereferencing a target's vtable
-+ * is safe for the same reason the forced teardown is: a manager is only freed once its
-+ * whole witness set is dead, so no object can outlive its own class's memory manager.
++ * Read-only: the iteration callback returns the slot value it was handed, so the write-back
++ * sgen_gchandle_iterate performs is a self-store — no handle is freed, moved or re-tagged.
++ *
++ * PRECONDITION, asserted rather than argued in prose. sgen_gchandle_iterate is annotated
++ * MONO_PERMIT (need (sgen_world_stopped)): its other callers run inside a collection pause,
++ * which is how a multi-threaded runtime gets exclusive access to the handle tables. This
++ * entry point is compiled only for the single-threaded browser runtime (DISABLE_THREADS), so
++ * "no other mutator can touch the tables" holds by construction; what remains to be
++ * guaranteed is that the COLLECTOR is not midway through rewriting slots underneath us, and
++ * that the walk is not re-entered. Both are now asserted below instead of assumed.
++ *
++ * Dereferencing a target's vtable is safe for the same reason the forced teardown is: a
++ * memory manager is only freed once its whole witness set is dead, so no live object can
++ * outlive its own class's memory manager. m_class_get_mem_manager is a pure lookup — a
++ * generic-instance owner pointer, an array's element-class recursion, or the class's image ALC
++ * (falling back to the default ALC's manager for dynamic assemblies) — so it cannot lazily
++ * allocate a manager mid-walk, which is what makes "read-only" true of the whole operation
++ * and not merely of the handle slots.
 + */
++
++/* Re-entrancy guard for the assert below (single-threaded build: no atomics needed). */
++static gboolean sgen_condemned_scan_in_progress;
++
 +typedef struct {
-+	gpointer *managers;
-+	int n_managers;
++	MonoSgenCondemnedHandleScan *scan;
 +	int bucket;
-+	gint32 *counts;
-+} SgenCollectibleHandleCtx;
++} SgenCondemnedScanCtx;
 +
 +static gpointer
-+count_handle_into_managers (gpointer hidden, GCHandleType handle_type, int max_generation, gpointer user)
++sgen_condemned_handle_visit (gpointer hidden, GCHandleType handle_type, int max_generation, gpointer user)
 +{
-+	SgenCollectibleHandleCtx *ctx = (SgenCollectibleHandleCtx *)user;
++	SgenCondemnedScanCtx *ctx = (SgenCondemnedScanCtx *)user;
++	MonoSgenCondemnedHandleScan *scan = ctx->scan;
 +
-+	(void)max_generation; /* liveness filtering is not wanted here: every live handle counts */
++	(void)max_generation; /* No liveness filtering: every live handle counts, in every generation. */
 +
-+	/* Skip empty slots and slots holding a metadata (null-target) pointer. */
++	/* Skip empty slots and slots holding a metadata (non-object) pointer. */
 +	if (!MONO_GC_HANDLE_VALID (hidden) || !MONO_GC_HANDLE_IS_OBJECT_POINTER (hidden))
 +		return hidden;
 +
++	/*
++	 * Slot budget. Past it the per-slot CLASSIFICATION work (vtable resolution plus the two
++	 * set lookups) is skipped and the counts become lower bounds, which the consumer reports
++	 * as a saturation flag rather than silently understating. The raw slot sweep itself is a
++	 * pointer scan sgen_gchandle_iterate performs unconditionally and cannot be stopped from
++	 * the callback, so the budget bounds the work this diagnostic ADDS, not the sweep.
++	 */
++	scan->slots_visited++;
++	if (scan->slot_budget > 0 && scan->slots_visited > scan->slot_budget) {
++		scan->saturated = TRUE;
++		return hidden;
++	}
++
 +	GCObject *obj = (GCObject *)MONO_GC_REVEAL_POINTER (hidden, GC_HANDLE_TYPE_IS_WEAK (handle_type));
 +	if (!obj)
++		return hidden;
++
++	/*
++	 * Identity attribution, checked FIRST and class-blind: the condemned contexts' own
++	 * runtime objects (the managed AssemblyLoadContext wrapper and each manager's
++	 * LoaderAllocator witness) are corelib-classed, so class attribution cannot see them —
++	 * yet a strong handle on one is exactly what pins a teardown (the runtime itself installs
++	 * such a handle when a managed Unload is requested). Counted separately so the caller can
++	 * tell the runtime's own expected roots from third-party ones.
++	 */
++	if (scan->condemned_objects && g_hash_table_contains (scan->condemned_objects, obj)) {
++		scan->identity_hits++;
++		return hidden;
++	}
++
++	if (!scan->condemned_managers)
 +		return hidden;
 +
 +	MonoVTable *vtable = (MonoVTable *)SGEN_LOAD_VTABLE (obj);
@@ -503,43 +1116,58 @@ index e7611b1b9..e1f2cbc56 100644
 +		return hidden;
 +
 +	MonoMemoryManager *mm = m_class_get_mem_manager (vtable->klass);
-+	if (mm) {
-+		for (int i = 0; i < ctx->n_managers; ++i) {
-+			if (ctx->managers [i] == (gpointer)mm) {
-+				ctx->counts [ctx->bucket]++;
-+				break;
-+			}
-+		}
-+	}
++	/* O(1) membership: a set keyed on the manager POINTER, so cost stays linear in handles
++	 * however many contexts are stranded (a per-handle scan over the manager list would
++	 * degrade quadratically in exactly the stranded state this diagnostic exists to explain). */
++	if (mm && g_hash_table_contains (scan->condemned_managers, mm))
++		scan->class_hits [ctx->bucket]++;
 +
 +	return hidden;
 +}
 +
 +void
-+mono_gc_count_handles_into_managers (gpointer *managers, int n_managers, gint32 *out_counts)
++sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
 +{
-+	static const GCHandleType bucket_types [4] = { HANDLE_NORMAL, HANDLE_PINNED, HANDLE_WEAK, HANDLE_WEAK_TRACK };
++	static const GCHandleType bucket_types [MONO_SGEN_CONDEMNED_HANDLE_BUCKETS] =
++		{ HANDLE_NORMAL, HANDLE_PINNED, HANDLE_WEAK, HANDLE_WEAK_TRACK };
 +
-+	for (int i = 0; i < 4; ++i)
-+		out_counts [i] = 0;
-+
-+	if (!managers || n_managers <= 0)
++	/* Internal API, but a NULL out-parameter must never be written through. */
++	if (!scan)
 +		return;
 +
-+	SgenCollectibleHandleCtx ctx;
-+	ctx.managers = managers;
-+	ctx.n_managers = n_managers;
-+	ctx.counts = out_counts;
++	for (int i = 0; i < MONO_SGEN_CONDEMNED_HANDLE_BUCKETS; ++i)
++		scan->class_hits [i] = 0;
++	scan->identity_hits = 0;
++	scan->slots_visited = 0;
++	scan->saturated = FALSE;
 +
-+	for (int i = 0; i < 4; ++i) {
++	/* Nothing to attribute to: skip the sweep entirely rather than walking every handle
++	 * table to accumulate zeroes. */
++	guint n_managers = scan->condemned_managers ? g_hash_table_size (scan->condemned_managers) : 0;
++	guint n_objects = scan->condemned_objects ? g_hash_table_size (scan->condemned_objects) : 0;
++	if (n_managers == 0 && n_objects == 0)
++		return;
++
++	/* See PRECONDITION above: not inside a collection pause (the collector is not rewriting
++	 * handle slots underneath the walk), and not re-entered. */
++	g_assert (sgen_get_current_collection_generation () == -1);
++	g_assert (!sgen_condemned_scan_in_progress);
++	sgen_condemned_scan_in_progress = TRUE;
++
++	SgenCondemnedScanCtx ctx;
++	ctx.scan = scan;
++	for (int i = 0; i < MONO_SGEN_CONDEMNED_HANDLE_BUCKETS; ++i) {
 +		ctx.bucket = i;
-+		sgen_gchandle_iterate (bucket_types [i], GENERATION_OLD, count_handle_into_managers, &ctx);
++		sgen_gchandle_iterate (bucket_types [i], GENERATION_OLD, sgen_condemned_handle_visit, &ctx);
 +	}
-+}
 +
- int
- mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data)
- {
++	sgen_condemned_scan_in_progress = FALSE;
++}
++#endif /* DISABLE_THREADS */
++
+ /*
+  * Threads
+  */
 -- 
 2.53.0.vfs.0.0
 
