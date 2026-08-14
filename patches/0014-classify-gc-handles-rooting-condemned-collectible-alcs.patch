@@ -66,19 +66,24 @@ instances of a collectible assembly's type must be counted in their
 OWN buckets (proving the buckets are distinguished by handle type), the
 strong handle must by itself hold the witness and pin the forced unload
 at NotQuiescent, and freeing the handles must drain the buckets, let the
-teardown complete, and return the whole surface to its baseline. With
-the flag off (or on a threads-enabled runtime) the test asserts the
-entire surface reports unavailable.
+teardown complete, and return the whole surface to its baseline. Every
+assertion is a delta against a captured baseline, so the test never
+depends on what an earlier test in the collection left pending. The two
+dark configurations are asserted distinctly, matching the rest of this
+stats block: a threads-enabled runtime has the machinery compiled out
+and reports -1 for every kind, while the single-threaded build with the
+opt-in off keeps the surface live and honestly reports an EMPTY
+condemned set (0), because nothing is natively collectible there.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 123 ++++++++++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 133 +++++++++++++++++
  .../Loader/AssemblyLoadContext.Mono.cs        |   8 +
  .../mono/metadata/assembly-load-context.c     | 137 ++++++++++++++++++
  src/mono/mono/metadata/gc-internals.h         |  12 ++
  src/mono/mono/metadata/sgen-mono.c            |  80 ++++++++++
- 5 files changed, 360 insertions(+)
+ 5 files changed, 370 insertions(+)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index a338595e1..6d71ef38d 100644
+index a338595e1..06ccf30ae 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -6,6 +6,7 @@
@@ -104,7 +109,7 @@ index a338595e1..6d71ef38d 100644
  
          private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
              .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
-@@ -511,6 +520,120 @@ await CollectAndAssertDeadAsync(weakNormal,
+@@ -511,6 +520,130 @@ await CollectAndAssertDeadAsync(weakNormal,
                  "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
          }
  
@@ -129,22 +134,30 @@ index a338595e1..6d71ef38d 100644
 +
 +            if (!ProtocolActive)
 +            {
-+                // Feature dark: the whole classification surface reports unavailable, exactly
-+                // like the rest of the stats block.
-+                Assert.Equal(-1, ScoutStats(CondemnedStrongHandles));
-+                Assert.Equal(-1, ScoutStats(CondemnedPinnedHandles));
-+                Assert.Equal(-1, ScoutStats(CondemnedWeakHandles));
-+                Assert.Equal(-1, ScoutStats(CondemnedWeakTrackHandles));
-+                Assert.Equal(-1, ScoutStats(CondemnedManagers));
-+                Assert.Equal(-1, ScoutStats(CondemnedLiveWitnesses));
++                // Two distinct dark cases, exactly like the rest of this stats block (compare
++                // the registry kinds, which detect the compiled-out build the same way):
++                //  * threads-enabled runtime — the forced-unload machinery, and this surface
++                //    with it, is compiled out by the DISABLE_THREADS hard gate: every kind
++                //    reports unavailable (-1);
++                //  * single-threaded with the opt-in off — the surface is live, but nothing is
++                //    natively collectible, so the condemned set is genuinely EMPTY and every
++                //    gauge honestly reads 0.
++                int expected = ScoutStats(RetiredSetSize) < 0 ? -1 : 0;
++                Assert.Equal(expected, ScoutStats(CondemnedStrongHandles));
++                Assert.Equal(expected, ScoutStats(CondemnedPinnedHandles));
++                Assert.Equal(expected, ScoutStats(CondemnedWeakHandles));
++                Assert.Equal(expected, ScoutStats(CondemnedWeakTrackHandles));
++                Assert.Equal(expected, ScoutStats(CondemnedManagers));
++                Assert.Equal(expected, ScoutStats(CondemnedLiveWitnesses));
 +                return;
 +            }
 +
-+            // Baseline: no condemned context in scope, so every gauge reads zero.
-+            Assert.Equal(0, ScoutStats(CondemnedManagers));
-+            Assert.Equal(0, ScoutStats(CondemnedStrongHandles));
-+            Assert.Equal(0, ScoutStats(CondemnedWeakHandles));
-+            Assert.Equal(0, ScoutStats(CondemnedLiveWitnesses));
++            // Baselines rather than absolute zeroes: the assertions below are deltas, so this
++            // test never depends on what an earlier test in the collection left pending.
++            int managersBefore = ScoutStats(CondemnedManagers);
++            int strongBefore = ScoutStats(CondemnedStrongHandles);
++            int weakBefore = ScoutStats(CondemnedWeakHandles);
++            int witnessesBefore = ScoutStats(CondemnedLiveWitnesses);
 +
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            var weakRef = new WeakReference(context);
@@ -155,22 +168,24 @@ index a338595e1..6d71ef38d 100644
 +            GcQuiesce();
 +
 +            // The context is condemned (collectible + unloading) and its managers are in scope.
-+            Assert.True(ScoutStats(CondemnedManagers) >= 1,
-+                $"the unloading context's managers must be in scope (got {ScoutStats(CondemnedManagers)}).");
++            Assert.True(ScoutStats(CondemnedManagers) > managersBefore,
++                $"the unloading context's managers must enter scope (before={managersBefore}, " +
++                $"after={ScoutStats(CondemnedManagers)}).");
 +
 +            // The handles are classified by TYPE, not lumped: one strong and one weak handle
 +            // target objects whose class lives in the collectible context.
-+            Assert.True(ScoutStats(CondemnedStrongHandles) >= 1,
++            Assert.True(ScoutStats(CondemnedStrongHandles) > strongBefore,
 +                $"a strong GCHandle into the condemned set must be counted in the strong bucket " +
-+                $"(got {ScoutStats(CondemnedStrongHandles)}; weak={ScoutStats(CondemnedWeakHandles)}, " +
-+                $"managers={ScoutStats(CondemnedManagers)}).");
-+            Assert.True(ScoutStats(CondemnedWeakHandles) >= 1,
++                $"(before={strongBefore}, after={ScoutStats(CondemnedStrongHandles)}; " +
++                $"weak={ScoutStats(CondemnedWeakHandles)}, managers={ScoutStats(CondemnedManagers)}).");
++            Assert.True(ScoutStats(CondemnedWeakHandles) > weakBefore,
 +                $"a weak GCHandle into the condemned set must be counted in the weak bucket " +
-+                $"(got {ScoutStats(CondemnedWeakHandles)}).");
++                $"(before={weakBefore}, after={ScoutStats(CondemnedWeakHandles)}).");
 +
 +            // The strong handle is a real root: the witness stays alive and the teardown refuses.
-+            Assert.True(ScoutStats(CondemnedLiveWitnesses) >= 1,
-+                "the strong handle must keep the condemned context's LoaderAllocator witness alive.");
++            Assert.True(ScoutStats(CondemnedLiveWitnesses) > witnessesBefore,
++                $"the strong handle must keep the condemned context's LoaderAllocator witness alive " +
++                $"(before={witnessesBefore}, after={ScoutStats(CondemnedLiveWitnesses)}).");
 +            Assert.Equal(NotQuiescent, Force(context));
 +
 +            // Release every root: the buckets must drain and the teardown must now complete —
@@ -180,14 +195,14 @@ index a338595e1..6d71ef38d 100644
 +            s_weakHandleKeepAlive = null;
 +            GcQuiesce();
 +
-+            Assert.Equal(0, ScoutStats(CondemnedStrongHandles));
-+            Assert.Equal(0, ScoutStats(CondemnedWeakHandles));
++            Assert.Equal(strongBefore, ScoutStats(CondemnedStrongHandles));
++            Assert.Equal(weakBefore, ScoutStats(CondemnedWeakHandles));
 +
 +            Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
 +
-+            // Nothing condemned remains, so the whole surface returns to its baseline.
-+            Assert.Equal(0, ScoutStats(CondemnedManagers));
-+            Assert.Equal(0, ScoutStats(CondemnedLiveWitnesses));
++            // The context is gone from the condemned set, so the surface returns to baseline.
++            Assert.Equal(managersBefore, ScoutStats(CondemnedManagers));
++            Assert.Equal(witnessesBefore, ScoutStats(CondemnedLiveWitnesses));
 +
 +            context = null;
 +            await CollectAndAssertDeadAsync(weakRef,
