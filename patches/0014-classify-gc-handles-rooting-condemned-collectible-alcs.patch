@@ -240,18 +240,18 @@ must honestly report an EMPTY condemned set (0 in every field), with a
 small budget unable to manufacture truncation out of a walk that never
 ran.
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 889 +++++++++++++++++-
+ .../tests/ForcedNativeUnloadTests.cs          | 908 +++++++++++++++++-
  .../Loader/AssemblyLoadContext.Mono.cs        |  35 +
- .../mono/metadata/assembly-load-context.c     | 498 +++++++++-
+ .../mono/metadata/assembly-load-context.c     | 504 +++++++++-
  src/mono/mono/metadata/gc-internals.h         |  61 ++
  src/mono/mono/metadata/icall-def.h            |   1 +
  src/mono/mono/metadata/sgen-mono.c            | 165 ++++
  src/mono/mono/sgen/sgen-gc.h                  |  31 +
  src/mono/mono/sgen/sgen-gchandles.c           |  70 ++
- 8 files changed, 1696 insertions(+), 54 deletions(-)
+ 8 files changed, 1721 insertions(+), 54 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index a338595..e023de5 100644
+index a338595..2b2f170 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -6,6 +6,7 @@
@@ -339,7 +339,7 @@ index a338595..e023de5 100644
              return true;
          }
  
-@@ -511,6 +559,843 @@ await CollectAndAssertDeadAsync(weakNormal,
+@@ -511,6 +559,862 @@ await CollectAndAssertDeadAsync(weakNormal,
                  "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
          }
  
@@ -1017,23 +1017,42 @@ index a338595..e023de5 100644
 +
 +            // Single-threaded with the opt-in off: the surface is LIVE -- the call succeeds and
 +            // fills the whole tuple -- but nothing is natively collectible, so the condemned set is
-+            // genuinely EMPTY and every field honestly reads 0.
++            // genuinely EMPTY and the set-wide fields honestly read 0.
 +            int[] snapshot = CondemnedSnapshot();
 +            AssertSnapshotIsCoherent(snapshot);
-+            for (int i = 0; i < snapshot.Length; i++)
-+            {
-+                Assert.True(snapshot[i] == 0,
-+                    $"an empty condemned set must report 0, not {snapshot[i]}, in field {i}.");
-+            }
++            Assert.Equal(0, snapshot[CondemnedManagers]);
++            Assert.Equal(0, snapshot[CondemnedLiveWitnesses]);
++            AssertWalkFieldsAreZeroWhenAvailable(snapshot);
++
++            // A refusal here is exactly 0 ("too small"), which is a DIFFERENT answer from the -1
++            // ("unavailable") the threads-enabled leg above gives. Asserting the two separately is
++            // what keeps a runtime that conflated them from passing both legs.
++            Assert.Equal(0, FillCondemnedSnapshot(new int[0], CondemnedDefaultSlotBudget));
 +
 +            // The tiny budget is live here too. With an EMPTY condemned set the handle walk is
 +            // skipped entirely, so it can neither visit a slot nor saturate -- a small budget does
 +            // not manufacture truncation out of a walk that never ran.
 +            int[] budgeted = CondemnedSnapshot(CondemnedTestSlotBudget);
 +            AssertSnapshotIsCoherent(budgeted);
-+            Assert.Equal(0, budgeted[CondemnedWalkSaturated]);
-+            Assert.Equal(0, budgeted[CondemnedSlotsVisited]);
-+            Assert.Equal(0, budgeted[CondemnedSlotsEligible]);
++            AssertWalkFieldsAreZeroWhenAvailable(budgeted);
++        }
++
++        // The walk-dependent fields must read 0 -- "the walk ran and found nothing" -- but ONLY
++        // where the walk can run at all. On a non-sgen collector they are -1 as a group, which
++        // AssertSnapshotIsCoherent already requires; asserting 0 unconditionally here would make
++        // the two helpers contradict each other for the same configuration.
++        private static void AssertWalkFieldsAreZeroWhenAvailable(int[] snapshot)
++        {
++            if (snapshot[CondemnedSlotsEligible] < 0)
++            {
++                return;
++            }
++
++            for (int i = CondemnedStrongHandles; i <= CondemnedWalkSaturated; i++)
++            {
++                Assert.True(snapshot[i] == 0,
++                    $"an empty condemned set must report 0, not {snapshot[i]}, in field {i}.");
++            }
 +        }
 +
 +        // Loads the collectible assembly, creates one instance, unloads, and roots the instance
@@ -1237,7 +1256,7 @@ index ca1b6ff..eade049 100644
          private static extern int InternalGetJiterpreterTableStat(int table, int kind);
  
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 065b4a4..b888016 100644
+index 065b4a4..1054345 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -6,6 +6,7 @@
@@ -1248,7 +1267,7 @@ index 065b4a4..b888016 100644
  #include "mono/metadata/icall-decl.h"
  #include "mono/metadata/loader-internals.h"
  #include "mono/metadata/loaded-images-internals.h"
-@@ -100,6 +101,414 @@ static gint32 collectible_alc_native_structs;
+@@ -100,6 +101,420 @@ static gint32 collectible_alc_native_structs;
   * of InternalGetScoutRetirementStats; diagnostics only. */
  static gint32 scout_completion_deferral_count;
  
@@ -1581,6 +1600,12 @@ index 065b4a4..b888016 100644
 + * safepoint (the set uses native malloc), and this build has no other thread that could start
 + * a collection -- so no object can be relocated mid-snapshot. Nothing retains those pointers
 + * past the return.
++ *
++ * LOCK NESTING: alcs_lock is held across alc_foreach_teardown_manager, which takes a context's
++ * memory-managers lock beneath it. That is the only direction this file ever nests the two
++ * (mono_alc_cleanup takes the managers lock under the loader lock, never under alcs_lock), and
++ * no lock is held across the handle walk itself. On this DISABLE_THREADS-only build there is no
++ * second thread to invert it against; the ordering is stated so it stays that way.
 + */
 +static int
 +alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
@@ -1663,7 +1688,7 @@ index 065b4a4..b888016 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -493,56 +902,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+@@ -493,56 +908,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
  	mono_alc_memory_managers_unlock (alc);
  }
  
@@ -1720,7 +1745,7 @@ index 065b4a4..b888016 100644
  int
  ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
  {
-@@ -666,6 +1025,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -666,6 +1031,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * re-registered. Behind the DISABLE_THREADS gate like kinds 0/1. Distinguishes "the
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
@@ -1732,7 +1757,7 @@ index 065b4a4..b888016 100644
  	 */
  	if (kind == 2 || kind == 3)
  		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
-@@ -690,8 +1054,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -690,8 +1060,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		int pending = 0;
  		alcs_lock ();
  		for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
@@ -1744,7 +1769,7 @@ index 065b4a4..b888016 100644
  				pending++;
  		}
  		alcs_unlock ();
-@@ -707,6 +1072,35 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -707,6 +1078,35 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  #endif
  }
  
