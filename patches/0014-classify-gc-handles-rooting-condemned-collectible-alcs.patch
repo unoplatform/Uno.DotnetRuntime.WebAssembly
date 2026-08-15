@@ -251,7 +251,7 @@ ran.
  8 files changed, 1696 insertions(+), 54 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index a338595..be1bf71 100644
+index a338595..e023de5 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -6,6 +6,7 @@
@@ -346,16 +346,16 @@ index a338595..be1bf71 100644
 +        /// <summary>
 +        /// Root-classification regression for the condemned-set snapshot. A downstream WASM host whose
 +        /// teardown reports NotQuiescent forever needs to know WHICH class of root holds the
-+        /// condemned context's LoaderAllocator witness — managed reflection cannot enumerate raw
++        /// condemned context's LoaderAllocator witness -- managed reflection cannot enumerate raw
 +        /// GCHandles, so the runtime classifies them.
 +        ///
 +        /// What this test establishes, and deliberately no more:
 +        ///   * EXACT attribution. Each of the four handle buckets moves by exactly +1 for its
 +        ///     own handle type and by exactly +0 for the others, measured across intervals whose
-+        ///     only content is the GCHandle.Alloc calls themselves — so the buckets are proven
++        ///     only content is the GCHandle.Alloc calls themselves -- so the buckets are proven
 +        ///     separated by handle type, not merely non-zero.
-+        ///   * NEGATIVE CONTROLS. A handle on a plain corelib object moves nothing, and — the
-+        ///     documented LIMIT of this diagnostic — neither does a handle on an object[] that
++        ///   * NEGATIVE CONTROLS. A handle on a plain corelib object moves nothing, and -- the
++        ///     documented LIMIT of this diagnostic -- neither does a handle on an object[] that
 +        ///     HOLDS a collectible instance: attribution is one hop, so a container root is
 +        ///     invisible to the class buckets. That zero is asserted, not just described.
 +        ///   * The STRONG handle alone holds the witness: after every other handle is freed it
@@ -363,10 +363,10 @@ index a338595..be1bf71 100644
 +        ///     lets the teardown complete.
 +        ///   * Kinds 12 and 14 are exercised LIVE (real Pinned / WeakTrackResurrection handles),
 +        ///     not merely asserted to stay at zero.
-+        ///   * Kind 19 counts HANDLES, not distinct objects. A second strong handle onto the
-+        ///     already-registered managed ALC wrapper moves it by exactly +1 (and -1 on free)
-+        ///     while the four class buckets stay flat — so an implementation that reported the SIZE of the
-+        ///     identity set instead of the number of handles into it fails here.
++        ///   * Identity attribution counts HANDLES, not distinct objects. A second strong handle
++        ///     onto the already-registered managed ALC wrapper moves it by exactly +1 (and -1 on
++        ///     free) while the four class buckets stay flat -- so an implementation that reported
++        ///     the SIZE of the identity set instead of the number of handles into it fails here.
 +        /// </summary>
 +        [Fact]
 +        public async Task CondemnedHandleClassification_ReportsHoldingHandleByType()
@@ -401,7 +401,7 @@ index a338595..be1bf71 100644
 +                Assert.Equal(NotQuiescent, Force(context));
 +
 +                // Drop the negative controls and every NON-rooting handle. Only the strong
-+                // handle is left — no static keeps anything else alive — so this is where "the
++                // handle is left -- no static keeps anything else alive -- so this is where "the
 +                // strong handle ALONE holds the witness" is actually established.
 +                handles[HandleNegativePlain].Free();
 +                handles[HandleNegativeContainer].Free();
@@ -420,7 +420,7 @@ index a338595..be1bf71 100644
 +                Assert.Equal(NotQuiescent, Force(context));
 +
 +                // Release the last root: the bucket drains by exactly one and the teardown
-+                // completes — the classification tracked the ACTUAL holder, not a static shape.
++                // completes -- the classification tracked the ACTUAL holder, not a static shape.
 +                handles[HandleStrong].Free();
 +                GcQuiesce();
 +                Assert.Equal(strongOnly[CondemnedStrongHandles] - 1,
@@ -696,7 +696,7 @@ index a338595..be1bf71 100644
 +            await WithHoleyHandleTableAsync((full, selfTest) =>
 +            {
 +                // The real 200k budget is nowhere near crossed by a healthy runtime, and the full
-+                // walk really did find the rooting handle — without which the comparison below
++                // walk really did find the rooting handle -- without which the comparison below
 +                // would be a statement about two empty readings.
 +                Assert.Equal(0, full[CondemnedWalkSaturated]);
 +                Assert.True(full[CondemnedStrongHandles] > 0,
@@ -709,7 +709,7 @@ index a338595..be1bf71 100644
 +                // A saturated read may only UNDERSTATE. Deliberately stated as a weak
 +                // monotonicity check, and worth being explicit about why it cannot be stronger:
 +                // the surviving window is the LOW slots, which belong to the runtime's own
-+                // long-lived handles, while sgen places new handles from slot_hint upward — so
++                // long-lived handles, while sgen places new handles from slot_hint upward -- so
 +                // after the inflation this test's own rooting handle is far above the cap and a
 +                // truncated bucket legitimately reads 0. "0 <= 1" is all that is provable here;
 +                // the load-bearing truncation assertions are the saturation flag above, and the
@@ -736,13 +736,13 @@ index a338595..be1bf71 100644
 +        }
 +
 +        /// <summary>
-+        /// Raw-slot bound regression (visited versus eligible) on a HOLEY table — the shape a
++        /// Raw-slot bound regression (visited versus eligible) on a HOLEY table -- the shape a
 +        /// classification-only budget cannot bound.
 +        ///
 +        /// Each sgen handle table is an SgenArrayList whose next_slot is a persistent high-water
 +        /// mark: freeing a handle only NULLs its slot, and refills reuse holes, so the mark never
 +        /// comes back down. A budget that merely skipped per-slot classification work would
-+        /// therefore still sweep every slot of a long, mostly-empty table — once per handle type —
++        /// therefore still sweep every slot of a long, mostly-empty table, once per handle type,
 +        /// while every bucket reported 0. On a single browser thread that is a pause, not just
 +        /// wasted work.
 +        ///
@@ -751,7 +751,7 @@ index a338595..be1bf71 100644
 +        /// rather than at the mark.
 +        ///
 +        /// SCOPE OF THIS PROOF, stated plainly rather than overclaimed. Kind 21 is the runtime's
-+        /// own report of how many slots it loaded, and it is the only channel there is — so this
++        /// own report of how many slots it loaded, and it is the only channel there is -- so this
 +        /// test pins the REPORTED bound, not the sweep. A probe that walked the whole table while
 +        /// still reporting the cap passed this suite unchanged; the sweep itself is guaranteed by
 +        /// the loop's range expression in sgen_gchandle_foreach_slot_bounded, which is a matter for
@@ -776,7 +776,7 @@ index a338595..be1bf71 100644
 +            {
 +                // The scanned range really is long. Kind 22 sums the high-water marks of all FOUR
 +                // scanned tables, so this does not attribute the length to the strong-handle table
-+                // specifically — but it does not need to: HoleyTableInflation simultaneously live
++                // specifically -- but it does not need to: HoleyTableInflation simultaneously live
 +                // Normal handles occupy that many distinct indices, so that table's mark alone is
 +                // >= HoleyTableInflation and the sum can only be larger. (A DELTA across the
 +                // inflation would be the attributing form but is NOT sound: sgen refills holes via
@@ -793,7 +793,7 @@ index a338595..be1bf71 100644
 +                    $"a table's high-water mark must never shrink " +
 +                    $"(full={full[CondemnedSlotsEligible]}, selfTest={selfTest[CondemnedSlotsEligible]}).");
 +
-+                // The unbudgeted walk covers that whole range — which is what makes the next
++                // The unbudgeted walk covers that whole range -- which is what makes the next
 +                // assertion a statement about the CAP and not about an empty table.
 +                Assert.Equal(full[CondemnedSlotsEligible], full[CondemnedSlotsVisited]);
 +                Assert.True(full[CondemnedSlotsVisited] > CondemnedTestSlotBudget,
@@ -804,8 +804,8 @@ index a338595..be1bf71 100644
 +                // far short of the mark it was eligible to cover. See the SCOPE note above for
 +                // what this does and does not establish.
 +                Assert.True(selfTest[CondemnedSlotsVisited] > 0,
-+                    "the budgeted walk must still have loaded slots — a walk that ran not at all " +
-+                    "would satisfy the cap vacuously.");
++                    "the budgeted walk must still have loaded slots: a walk that ran not at " +
++                    "all would satisfy the cap vacuously.");
 +                Assert.True(selfTest[CondemnedSlotsVisited] <= CondemnedTestSlotBudget,
 +                    $"the walk must stop at its raw-slot cap, not at the table's high-water mark " +
 +                    $"(visited={selfTest[CondemnedSlotsVisited]}, cap={CondemnedTestSlotBudget}, " +
@@ -816,9 +816,9 @@ index a338595..be1bf71 100644
 +            });
 +        }
 +
-+        // Builds the shape both raw-walk regressions need — a CONDEMNED context, so the walk runs
++        // Builds the shape both raw-walk regressions need -- a CONDEMNED context, so the walk runs
 +        // at all, plus a strong-handle table whose persistent high-water mark is far above the
-+        // requested cap while nearly every slot in it is a hole — takes one default-budget
++        // requested cap while nearly every slot in it is a hole -- takes one default-budget
 +        // snapshot and one reduced-budget snapshot of that state, hands both to `assert`, and drains the
 +        // context so no later test's gauges are polluted.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
@@ -882,8 +882,8 @@ index a338595..be1bf71 100644
 +
 +            // HoleyTableInflation simultaneously LIVE handles must occupy that many DISTINCT slots
 +            // below the table's next_slot, so the mark is at least that high while they exist.
-+            // Freeing them all then leaves the mark exactly where it was — sgen only NULLs the slot
-+            // — producing a table that is long and nearly empty. That is precisely the shape a
++            // Freeing them all then leaves the mark exactly where it was (sgen only NULLs the
++            // slot), producing a table that is long and nearly empty. That is precisely the shape a
 +            // budget on classified hits walks end to end.
 +            var filler = new GCHandle[HoleyTableInflation];
 +            try
@@ -1054,7 +1054,7 @@ index a338595..be1bf71 100644
 +        }
 +
 +        // Loads the collectible assembly, creates the two probe instances, unloads, and then
-+        // allocates the classified handles in four tight phases — asserting EXACT bucket deltas
++        // allocates the classified handles in four tight phases -- asserting EXACT bucket deltas
 +        // across each, including a +1/-1 pair on the identity bucket. Everything managed stays
 +        // confined to this frame so the GCHandles are the only roots the buckets can attribute,
 +        // and each measurement interval contains nothing but the GCHandle.Alloc calls under test,
@@ -1069,7 +1069,7 @@ index a338595..be1bf71 100644
 +            Type pointerFreeType = asm.GetType(PointerFreeClassName, throwOnError: true);
 +            object strongTarget = Activator.CreateInstance(type);
 +
-+            // PointerFreeTestClass has no reference fields, so an instance of it is PINNABLE —
++            // PointerFreeTestClass has no reference fields, so an instance of it is PINNABLE --
 +            // which is what lets the pinned and weak-track buckets be exercised with real handles instead of being
 +            // asserted to stay at zero.
 +            object pinnedTarget = Activator.CreateInstance(pointerFreeType);
@@ -1089,7 +1089,7 @@ index a338595..be1bf71 100644
 +                $"witness (witnesses={before[CondemnedLiveWitnesses]}).");
 +            Assert.Equal(0, before[CondemnedWalkSaturated]);
 +
-+            // The runtime's OWN roots are already attributable — but only by IDENTITY: the
++            // The runtime's OWN roots are already attributable -- but only by IDENTITY: the
 +            // managed wrapper (which PrepareForAssemblyLoadContextRelease promoted to a STRONG
 +            // handle when Unload was requested) and the LoaderAllocator witness are both
 +            // corelib-classed, so the class buckets are blind to them by construction. Asserting this
@@ -1098,13 +1098,13 @@ index a338595..be1bf71 100644
 +                $"the runtime's own wrapper and witness handles must be identity-attributed " +
 +                $"(identity={before[CondemnedIdentityHandles]}, strong={before[CondemnedStrongHandles]}).");
 +
-+            // PHASE A — strong and weak only. The +0 on the untouched buckets is the load-bearing
++            // PHASE A -- strong and weak only. The +0 on the untouched buckets is the load-bearing
 +            // half: it proves the buckets are separated by handle TYPE rather than lumped.
 +            handles[HandleStrong] = GCHandle.Alloc(strongTarget, GCHandleType.Normal);
 +            handles[HandleWeak] = GCHandle.Alloc(pinnedTarget, GCHandleType.Weak);
 +            AssertBucketDeltas(before, CondemnedSnapshot(), 1, 0, 1, 0);
 +
-+            // PHASE B — add the pinned and weak-track handles. Both target the pointer-free
++            // PHASE B -- add the pinned and weak-track handles. Both target the pointer-free
 +            // instance, which the pinned handle also keeps observable for the weak buckets: the
 +            // previous shape used a static for that, and a static is a second STRONG root, so it
 +            // made "the strong handle alone holds the witness" unprovable.
@@ -1113,7 +1113,7 @@ index a338595..be1bf71 100644
 +            int[] afterB = CondemnedSnapshot();
 +            AssertBucketDeltas(before, afterB, 1, 1, 1, 1);
 +
-+            // NEGATIVE CONTROLS. (1) A handle on a plain corelib object must move nothing — the
++            // NEGATIVE CONTROLS. (1) A handle on a plain corelib object must move nothing -- the
 +            // walk is not counting handles indiscriminately. (2) A handle on an object[] HOLDING
 +            // the collectible instance must ALSO move nothing: the array is corelib-classed, so
 +            // one-hop class attribution cannot see the condemned instance it roots. That second
@@ -1125,7 +1125,7 @@ index a338595..be1bf71 100644
 +            Assert.Equal(afterB[CondemnedManagers], afterControls[CondemnedManagers]);
 +
 +            // IDENTITY ATTRIBUTION COUNTS HANDLES, NOT DISTINCT OBJECTS. `context` is ALREADY in
-+            // the identity set — the runtime's own strong handle targets it — so a SECOND handle
++            // the identity set -- the runtime's own strong handle targets it -- so a SECOND handle
 +            // onto the very same object must still move the identity count by exactly +1, and back by exactly
 +            // -1 when freed. That +1/-1 pair is what separates per-handle counting from
 +            // unique-object counting: an implementation that reported the size of the identity set
@@ -1237,7 +1237,7 @@ index ca1b6ff..eade049 100644
          private static extern int InternalGetJiterpreterTableStat(int table, int kind);
  
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 065b4a4..a3124d1 100644
+index 065b4a4..b888016 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
 @@ -6,6 +6,7 @@
@@ -1509,8 +1509,8 @@ index 065b4a4..a3124d1 100644
 +}
 +
 +/*
-+ * Quiescence gate — ALL-OR-NOTHING over the exact set of managers a teardown would free.
-+ * alc->unloading only means the managed Unload() was requested — it is NOT proof that the
++ * Quiescence gate -- ALL-OR-NOTHING over the exact set of managers a teardown would free.
++ * alc->unloading only means the managed Unload() was requested -- it is NOT proof that the
 + * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
 + * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
 + * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
@@ -1523,7 +1523,7 @@ index 065b4a4..a3124d1 100644
 + * {default, this} manager) keeps that shared witness alive even after the primary witness
 + * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
 + * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
-+ * anything is freed — hence the shared walk above rather than a hand-copied loop. If ANY
++ * anything is freed -- hence the shared walk above rather than a hand-copied loop. If ANY
 + * witness is live, nothing may be freed.
 + *
 + * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
@@ -1781,7 +1781,7 @@ index 065b4a4..a3124d1 100644
  /*
   * Implemented in mini/interp/jiterpreter.c, which is only built for the browser runtime
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index f014167..4f34592 100644
+index f014167..1c51c11 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
 @@ -431,4 +431,65 @@ extern gchar **mono_do_not_finalize_class_names;
@@ -1805,12 +1805,12 @@ index f014167..4f34592 100644
 +#define MONO_SGEN_CONDEMNED_HANDLE_BUCKETS 4
 +
 +typedef struct {
-+	/* IN: set of condemned MonoMemoryManager* — keys only, direct-pointer hashed, so
++	/* IN: set of condemned MonoMemoryManager* -- keys only, direct-pointer hashed, so
 +	 * membership is O(1) however many contexts are stranded. Sets rather than arrays: the
 +	 * pointer types stay honest at the caller (this header must not name loader-internals
 +	 * types) without erasing them to a gpointer* array. */
 +	GHashTable *condemned_managers;
-+	/* IN: set of MonoObject* identities — the condemned contexts' own managed wrapper objects
++	/* IN: set of MonoObject* identities -- the condemned contexts' own managed wrapper objects
 +	 * and LoaderAllocator witnesses. These are corelib-classed, so only identity can attribute
 +	 * them. Valid for the duration of the call only (a moving collector may relocate them
 +	 * afterwards); never retain this set across a GC. */
@@ -1819,8 +1819,8 @@ index f014167..4f34592 100644
 +	 * an "unbounded" mode is deliberately not offered, because the whole point of this scan is
 +	 * that a synchronous diagnostic on a single browser thread has a bound. The cap bounds the
 +	 * pointer sweep itself, not merely the per-slot classification work, so the walk cannot be
-+	 * dragged out by a table's persistent high-water mark. Once a pass is cut short — or a later
-+	 * pass never starts because the shared budget is spent — every count below is a LOWER BOUND
++	 * dragged out by a table's persistent high-water mark. Once a pass is cut short -- or a later
++	 * pass never starts because the shared budget is spent -- every count below is a LOWER BOUND
 +	 * and `saturated` is set. */
 +	gint32 slot_budget;
 +
@@ -1835,7 +1835,7 @@ index f014167..4f34592 100644
 +	 * table-blind, so HANDLE_WEAK_FIELDS registrations are outside its scope exactly as they are
 +	 * outside class_hits' and slots_eligible's. */
 +	gint32 identity_hits;
-+	/* OUT: RAW slots visited, empty and metadata slots INCLUDED — they cost the same pointer
++	/* OUT: RAW slots visited, empty and metadata slots INCLUDED -- they cost the same pointer
 +	 * load as an occupied one, and that load is what slot_budget exists to bound. */
 +	gint32 slots_visited;
 +	/* OUT: combined high-water mark of the scanned tables, i.e. how many raw slots the walk was
@@ -1863,7 +1863,7 @@ index 340ea53..aabc741 100644
  HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
  HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index e7611b1..91358a8 100644
+index e7611b1..fd4e6e5 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
 @@ -1901,6 +1901,171 @@ mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data)
@@ -1887,12 +1887,12 @@ index e7611b1..91358a8 100644
 + * instance is not attributed. See the consumer's contract block for the enumerated miss classes.
 + *
 + * Read-only in the strict sense: the walk goes through sgen_gchandle_foreach_slot_bounded,
-+ * whose callback returns nothing and whose slots are never written back — no self-store, no
++ * whose callback returns nothing and whose slots are never written back -- no self-store, no
 + * dislink protocol update, nothing for the collector to observe.
 + *
 + * BOUNDED, which sgen_gchandle_iterate is NOT. That iterator walks each table to its
-+ * persistent `next_slot` high-water mark — a mark sgen_gchandle_free never lowers, since
-+ * freeing only NULLs a slot — and its callback cannot stop it. A table that once grew large and
++ * persistent `next_slot` high-water mark -- a mark sgen_gchandle_free never lowers, since
++ * freeing only NULLs a slot -- and its callback cannot stop it. A table that once grew large and
 + * is now mostly holes would therefore be swept end to end on every read, once per type pass,
 + * regardless of how few handles are actually classified. Since this runs synchronously on the
 + * single browser thread at a host's request, that is a pause hazard, not merely wasted work.
@@ -1905,16 +1905,16 @@ index e7611b1..91358a8 100644
 + * underneath the walk. A multi-threaded runtime would get that from a collection pause (which
 + * is why sgen_gchandle_iterate is annotated MONO_PERMIT (need (sgen_world_stopped))); this
 + * entry point is compiled only for the single-threaded browser runtime (DISABLE_THREADS), so
-+ * "no other mutator can touch the tables" holds by construction — and because the walk writes
++ * "no other mutator can touch the tables" holds by construction -- and because the walk writes
 + * nothing, it needs no permit of its own. What remains to be guaranteed is that the COLLECTOR
 + * is not midway through rewriting slots underneath us, and that the walk is not re-entered.
 + * Both are asserted below instead of assumed.
 + *
 + * Dereferencing a target's vtable is safe for the same reason the forced teardown is: a
 + * memory manager is only freed once its whole witness set is dead, so no live object can
-+ * outlive its own class's memory manager. m_class_get_mem_manager is a pure lookup — a
++ * outlive its own class's memory manager. m_class_get_mem_manager is a pure lookup -- a
 + * generic-instance owner pointer, an array's element-class recursion, or the class's image ALC
-+ * (falling back to the default ALC's manager for dynamic assemblies) — so it cannot lazily
++ * (falling back to the default ALC's manager for dynamic assemblies) -- so it cannot lazily
 + * allocate a manager mid-walk, which is what makes "read-only" true of the whole operation
 + * and not merely of the handle slots.
 + */
@@ -1934,7 +1934,7 @@ index e7611b1..91358a8 100644
 +	MonoSgenCondemnedHandleScan *scan = ctx->scan;
 +
 +	/* No liveness filtering and no generation filtering: every live handle counts. Skip empty
-+	 * slots and slots holding a metadata (non-object) pointer — those are still counted as
++	 * slots and slots holding a metadata (non-object) pointer -- those are still counted as
 +	 * VISITED by the bounded walk, because the budget bounds the sweep, not the hits. */
 +	if (!MONO_GC_HANDLE_VALID (hidden) || !MONO_GC_HANDLE_IS_OBJECT_POINTER (hidden))
 +		return;
@@ -1946,7 +1946,7 @@ index e7611b1..91358a8 100644
 +	/*
 +	 * Identity attribution, checked FIRST and class-blind: the condemned contexts' own
 +	 * runtime objects (the managed AssemblyLoadContext wrapper and each manager's
-+	 * LoaderAllocator witness) are corelib-classed, so class attribution cannot see them —
++	 * LoaderAllocator witness) are corelib-classed, so class attribution cannot see them --
 +	 * yet a strong handle on one is exactly what pins a teardown (the runtime itself installs
 +	 * such a handle when a managed Unload is requested). Counted separately so the caller can
 +	 * tell the runtime's own expected roots from third-party ones.
@@ -2006,7 +2006,7 @@ index e7611b1..91358a8 100644
 +	 * ONE raw-slot budget shared by all four type passes, so the bound is on the WHOLE
 +	 * operation rather than on each pass: total work is `budget` slot loads even if every
 +	 * table carries a huge historical high-water mark. The budget is spent in the FIXED order
-+	 * of bucket_types, so under saturation the LATER buckets are the ones that go dark — kind
++	 * of bucket_types, so under saturation the LATER buckets are the ones that go dark -- kind
 +	 * 11 (strong), the one that can actually be the holder, is always the first served. A pass
 +	 * that gets a spent budget visits nothing and contributes 0 to its bucket, which is exactly
 +	 * why `saturated` must be surfaced: those zeroes are not "no such handle exists".
@@ -2039,7 +2039,7 @@ index e7611b1..91358a8 100644
   * Threads
   */
 diff --git a/src/mono/mono/sgen/sgen-gc.h b/src/mono/mono/sgen/sgen-gc.h
-index 3e4d208..936e4ff 100644
+index 3e4d208..cf5c5ac 100644
 --- a/src/mono/mono/sgen/sgen-gc.h
 +++ b/src/mono/mono/sgen/sgen-gc.h
 @@ -1081,6 +1081,37 @@ guint32 sgen_gchandle_new (GCObject *obj, gboolean pinned);
@@ -2060,13 +2060,13 @@ index 3e4d208..936e4ff 100644
 + *     was eligible to cover through `out_high_water`, so the caller can bound total work across
 + *     several tables AND tell that it truncated.
 + *   * READ-ONLY. The callback returns nothing and no slot is ever written back, so there is no
-+ *     self-store and no dislink protocol update — hence no need for the world to be stopped,
++ *     self-store and no dislink protocol update -- hence no need for the world to be stopped,
 + *     which is why this one carries no MONO_PERMIT requirement. Exclusive access to the tables
 + *     comes from the single-threaded (DISABLE_THREADS) runtime this is compiled for; the caller
 + *     additionally asserts that no collection is in progress.
 + *
 + * Returns the number of raw slots visited, COUNTED IN THE LOOP rather than restated from the
-+ * bound — empty and metadata slots included, since they cost the same pointer load as an
++ * bound -- empty and metadata slots included, since they cost the same pointer load as an
 + * occupied one and bounding that load is the entire point. Counting it in the loop keeps the
 + * published figure from drifting away from the loop that produced it; it does NOT make a
 + * miscounting implementation detectable from outside, because this return value is the only
@@ -2081,7 +2081,7 @@ index 3e4d208..936e4ff 100644
  void sgen_mark_normal_gc_handles (void *addr, SgenUserMarkFunc mark_func, void *gc_data)
  	MONO_PERMIT (need (sgen_world_stopped));
 diff --git a/src/mono/mono/sgen/sgen-gchandles.c b/src/mono/mono/sgen/sgen-gchandles.c
-index f869775..da18de6 100644
+index f869775..80918e6 100644
 --- a/src/mono/mono/sgen/sgen-gchandles.c
 +++ b/src/mono/mono/sgen/sgen-gchandles.c
 @@ -239,6 +239,76 @@ sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandl
@@ -2111,12 +2111,12 @@ index f869775..da18de6 100644
 +	 * sgen_gchandle_free merely NULLs a slot, and sgen_array_list_add refills holes via
 +	 * sgen_array_list_find_unset without ever lowering the mark. A table that once grew large
 +	 * and is now mostly holes therefore stays just as LONG as it was at its peak, for the
-+	 * lifetime of the process. Clamping the RAW slot range here — rather than only skipping
-+	 * per-slot work once a budget is spent — is what makes the walk's cost a function of the
++	 * lifetime of the process. Clamping the RAW slot range here -- rather than only skipping
++	 * per-slot work once a budget is spent -- is what makes the walk's cost a function of the
 +	 * budget instead of the historical peak.
 +	 *
 +	 * The mark is reported UNCLAMPED and the loop bound is clamped separately. Should
-+	 * next_slot ever exceed capacity (it cannot today — see sgen_array_list_add /
++	 * next_slot ever exceed capacity (it cannot today -- see sgen_array_list_add /
 +	 * sgen_array_list_alloc_block), the skipped tail then shows up as visited < high_water,
 +	 * i.e. as saturation, rather than as a silent omission the caller cannot see.
 +	 */
@@ -2139,8 +2139,8 @@ index f869775..da18de6 100644
 +	 * the ONLY channel through which the bound is observable from managed code, so no regression
 +	 * test can tell a correctly bounded sweep from one that walks further and reports the bound
 +	 * anyway. (Verified, not assumed: a probe that did exactly that passed the whole suite.) What
-+	 * actually enforces the bound is the range of the loop below — `end`, a single reviewable
-+	 * expression — and the fact that the same loop both walks and counts. The regression pins the
++	 * actually enforces the bound is the range of the loop below -- `end`, a single reviewable
++	 * expression -- and the fact that the same loop both walks and counts. The regression pins the
 +	 * REPORTED bound, which is what catches the shape this replaced, where the budget did not
 +	 * clamp the range at all.
 +	 */
