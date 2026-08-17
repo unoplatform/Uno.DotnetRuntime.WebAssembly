@@ -1,0 +1,2191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Sat, 15 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat: classify GC handles rooting condemned collectible ALCs
+
+A downstream WASM host doing repeated collectible-ALC load/unload cycles
+still strands one context per cycle with the forced-unload opt-in
+active: the teardown reports NotQuiescent indefinitely, so some root
+keeps the condemned contexts' LoaderAllocator witnesses alive. An
+exhaustive managed-side investigation (a BFS root tracer over every
+non-collectible static, ConditionalWeakTable enumeration, and direct
+probes of the interop/RPC tables) found no managed root -- which leaves
+exactly the roots managed reflection CANNOT enumerate: raw GCHandles,
+thread stacks/registers, and native structures.
+
+This patch adds read-only diagnostics that narrow that down from inside
+the runtime, through ONE new icall that returns the whole measurement as
+a single tuple:
+
+  * sgen_gchandle_foreach_slot_bounded (sgen-gchandles.c) is a new
+    read-only, RAW-SLOT-BOUNDED walk over one handle table. It exists
+    because sgen_gchandle_iterate cannot serve a synchronous diagnostic:
+    that iterator always walks a table to its persistent next_slot
+    high-water mark -- which sgen_gchandle_free never lowers, since
+    freeing only NULLs a slot and refills reuse holes -- and its
+    callback cannot stop it. The new entry point clamps the raw slot
+    range, reports the mark it was eligible to cover, and writes no slot
+    at all (its callback returns nothing), so there is no self-store and
+    no dislink protocol update either.
+  * sgen_scan_handles_into_managers (sgen-mono.c) drives that walk and
+    reports, per handle, whether the handle's TARGET is attributable to
+    the condemned set. ONE budget is spent across all four type passes,
+    so total cost is a fixed number of slot loads regardless of the
+    tables' history.
+  * assembly-load-context.c builds the condemned set (every collectible
+    + unloading context's primary manager plus each shared generic
+    manager it owns) and exposes it through
+    InternalGetCondemnedSnapshot, which fills a caller-supplied gint32
+    buffer with ten fields: condemned managers in scope; how many of
+    them still have a live LoaderAllocator witness; four handle buckets
+    (strong/pinned/weak/weak-track) attributed BY THE TARGET'S CLASS;
+    identity-attributed handles; raw slots visited; raw slots eligible;
+    and a saturation flag.
+
+ONE CALL, ONE TUPLE. The first revision of this surface exposed those
+fields as fourteen additional integer "kinds" of the existing
+InternalGetScoutRetirementStats, served out of a process-global latched
+snapshot, with atomicity supplied by a caller-side
+refresh / read-gauges / validate-token protocol plus a retry. Review
+found three separate defects in that shape, all instances of the same
+root cause -- consistency enforced by caller CONVENTION rather than by
+the surface:
+
+  * a mixed-generation read, needing only two LOGICAL callers and no
+    native thread race: A refreshes and reads one gauge, yields, B
+    refreshes, A reads the rest out of B's generation;
+  * a token contract that documented a monotonic clock while the
+    counter wrapped, so a "newer than" comparison rejected correct
+    reads at the boundary;
+  * a test-only seam that reseeded the free-running counter but left
+    the LATCHED token untouched, so reseeding while the latch already
+    held G_MAXINT32 republished a token a stale reader still accepted --
+    re-arming exactly the tear the token existed to reject.
+
+Filling the whole tuple in a single call removes that class of defect
+rather than the individual instances. There is no latch, no
+process-global mutable state for this surface, no generation token, no
+retry loop, and no test-only stat kinds on the production dispatch
+switch: the two that existed (a self-test cap and the counter seed)
+are gone, the cap becoming an ordinary caller-chosen budget that the
+runtime clamps. InternalGetScoutRetirementStats is left exactly as it
+was, and unknown kinds keep returning -1.
+
+The fill is ALL-OR-NOTHING: it returns the number of fields written,
+0 when the caller's buffer cannot hold the whole tuple (writing
+nothing, so a stale buffer stays stale rather than half-updated), and
+-1 where the feature is compiled out. -1 therefore means UNAVAILABLE
+and never "zero"; a live surface with an empty condemned set honestly
+reports 0 in every field.
+
+WHAT THIS PROVES, AND WHAT IT DOES NOT. Attribution is PER HANDLE and
+ONE HOP. A non-zero bucket establishes that a GC handle DIRECTLY TARGETS
+an object attributable to the condemned set -- a NECESSARY, not
+sufficient, condition for "a GC handle is the holder". All-zero buckets
+do NOT establish that no GC handle is involved, because rooting is
+transitive: a handle whose immediate target is corelib-classed while its
+object graph reaches a condemned instance lands in no bucket. The miss
+classes are enumerated in the contract comment (containers such as
+object[]/List<object>/Dictionary, the RuntimeType/RuntimeAssembly/
+MethodInfo reflection-cache family, delegates, pinned interop buffers,
+and anything reached only through native structures or thread
+stacks/registers). The sibling regression
+ForcedUnload_RootedPointerFreeObjects_BlockNativeFree already
+demonstrates that BCL-typed roots block the free, i.e. exactly the shape
+class attribution cannot see. These fields are a triage funnel, never a
+proof of absence.
+
+Identity attribution exists because of that limit: this very patch
+series promotes the native->managed ALC handle to STRONG while an unload
+is in flight, and the managed wrapper is corelib-classed, so class
+attribution is blind to the runtime's OWN most important root. Identity
+attribution catches it (and each manager's LoaderAllocator witness) and
+counts it separately, so the runtime's expected roots stay
+distinguishable from a third party's. It is class-blind but NOT
+table-blind: like the class buckets it sees only handles of the four
+scanned types, so its scope is "any of those four", never "any handle in
+the runtime".
+
+SINGLE-SOURCED CONTRACT. The "Root classification for condemned
+collectible contexts" block in assembly-load-context.c is the one place
+the field catalog, the attribution limits, the buffer protocol and the
+budget are defined. gc-internals.h, the managed bridge and the
+regressions reference it instead of restating it; an earlier revision
+restated the catalog in three places and the copies drifted.
+
+REMOVAL. This is temporary scaffolding and ships with a tracking marker
+saying so: a TODO in that same block names the tracking issue and both
+removal conditions (the residual root is found and fixed, or the
+stop-rule fires and the approach is abandoned rather than extended).
+alc_is_condemned and alc_foreach_teardown_manager stay either way --
+they are the single definition of "the managers a teardown would free"
+and the quiescence gate itself consumes them, which is why the gate can
+no longer disagree with the gauge that reports the quantity it refuses
+on. The shared walk is also NULL-safe on both manager arrays, which the
+hand-copied loops were not: the forced teardown NULLs them, so a
+read-only gauge racing a tombstoned context could abort the runtime.
+
+COST is O(managers + budget). Membership is a pointer-keyed set, so the
+walk does not degrade quadratically as contexts strand (the state it
+exists to explain), and it short-circuits entirely on an empty condemned
+set. The handle walk is bounded on RAW SLOTS rather than on classified
+hits, which is the only bound worth stating: a cap on hits would still
+sweep a long, mostly-holey table end to end, once per type pass, while
+every bucket read 0. The visited/eligible pair publishes what the walk
+visited versus what it was eligible to visit, so the bound is observable
+rather than merely asserted. The caller's budget is clamped to the
+runtime's own maximum, so the pause bound stays a property of the
+surface and not of whoever called it.
+
+GATING -- the whole region is DISABLE_THREADS-only, and the sgen entry
+points' declarations AND definitions are gated on DISABLE_THREADS as
+well as HAVE_SGEN_GC, so the walk cannot be reached on a build where the
+single-threaded precondition does not hold. Because the bounded walk
+writes nothing, it needs no MONO_PERMIT (need (sgen_world_stopped)) of
+its own -- exclusive access comes from the absence of other threads
+rather than from a collection pause. What remained unproven is ASSERTED
+rather than argued in prose: the walk g_asserts that no collection is in
+progress and that it is not re-entered.
+
+PURITY -- m_class_get_mem_manager is a pure lookup (generic-instance
+owner, array element-class recursion, or the class's image ALC with the
+default ALC's manager as the dynamic-assembly fallback), so it cannot
+lazily allocate a manager mid-walk; that is what makes "read-only" true
+of the whole operation and not merely of the slots. Dereferencing a
+target's vtable is safe for the same reason the forced teardown is: a
+manager is only freed once its whole witness set is dead, so no live
+object can outlive its own class's manager.
+
+SCOPE: thread-stack/register and native-structure roots are NOT
+attributed here, and are not eliminated by empty buckets either (see
+above). Attributing a pinning stack slot needs collection-time
+instrumentation of sgen's pin path, deliberately left to a follow-up.
+
+Five lifecycle regressions drive the surface end to end.
+
+CondemnedHandleClassification_ReportsHoldingHandleByType uses EXACT
+deltas rather than "more than baseline":
+
+  * each of the four buckets moves by exactly +1 for its own handle type
+    and exactly +0 for the others, measured across intervals whose only
+    content is the GCHandle.Alloc calls under test -- so the buckets are
+    proven separated by handle type, not merely non-zero. The pinned and
+    weak-track buckets are exercised with real Pinned /
+    WeakTrackResurrection handles on a pointer-free instance, not
+    asserted to stay at zero;
+  * identity attribution is proven to count HANDLES, not distinct
+    objects: a second strong handle onto the ALREADY-registered managed
+    ALC wrapper moves it by exactly +1 and back by exactly -1 on free,
+    while the class buckets stay flat. An implementation reporting the
+    SIZE of the identity set satisfies "identity >= 2" but fails that
+    pair;
+  * NEGATIVE CONTROLS: a handle on a plain corelib object moves nothing,
+    and -- documenting the blind spot in an assertion -- neither does a
+    handle on an object[] that HOLDS a collectible instance;
+  * the STRONG handle alone holds the witness: after every other handle
+    is freed it still pins the teardown at NotQuiescent, and freeing it
+    drains the bucket by exactly one and lets the teardown complete;
+  * set-wide fields are compared with <=, not equality: the GC-driven
+    scout completion can retire a stray an earlier test left pending,
+    which would make an exact equality order-dependent.
+
+CondemnedSnapshot_SingleCallTuple_CannotBeTornByACompetingCaller pins
+atomicity where it is observable -- at the boundary. A tuple that has
+been returned is a VALUE: a competing caller's snapshot, taken while the
+condemned set really changes underneath both of them, must not
+retroactively alter it, and the newer tuple must see the change so the
+first assertion cannot pass vacuously. Every tuple is additionally
+required to be INTERNALLY COHERENT -- visited <= eligible, live
+witnesses <= managers in scope, and the saturation flag agreeing with
+the visited/eligible pair in BOTH directions. Those are precisely the
+cross-field invariants a mixed-generation read could violate and a
+single-call fill cannot.
+
+CondemnedSnapshot_BufferContract_IsAllOrNothing drives the fill's
+length and availability contract, on buffers poisoned first so "the
+runtime wrote this" and "the runtime left this alone" are
+distinguishable (0 would not be: 0 is a legitimate value for every
+count). An UNDERSIZED buffer must be refused with 0 and left completely
+untouched; an OVERSIZED one must receive EXACTLY the tuple with its
+tail still poisoned, so the fill honours the caller's length as a bound
+rather than assuming it; a threads-enabled runtime must report -1 and
+write nothing; and an absurd slot budget (int.MaxValue) must be clamped
+rather than trusted, while a negative one means "use the default".
+
+CondemnedHandleWalk_SaturationFlag_IsSetWhenTheRawBudgetIsCrossed
+exercises the POSITIVE saturation branch, which every other assertion in
+the suite requires to be 0: the flag must read 1 under the reduced cap,
+and the truncated counts must not exceed the full-budget ones.
+
+CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark
+builds the shape the bound exists for -- several hundred simultaneously
+live strong handles, all then freed, leaving a table whose persistent
+high-water mark is far above the cap while nearly every slot is a hole
+-- and requires the visited count to stop at the cap rather than at the
+eligible mark. Its scope is stated in the test rather than overclaimed:
+that count is the runtime's own report and the only channel through
+which the bound is observable, so the test pins the REPORTED bound and
+catches the shape this replaced (a budget that gated only per-slot
+classification while the swept range stayed at the high-water mark). The
+sweep itself rests on the loop's range expression, which is a review
+matter, not a test one.
+
+All five assert both dark configurations off PlatformDetection, never
+off the call under test: deriving the expectation from the same call
+would be self-confirming, since a regression to -1 everywhere would
+satisfy both dark legs vacuously. A threads-enabled runtime has the
+machinery compiled out and must report -1 while writing nothing; the
+single-threaded build with the opt-in off keeps the surface live and
+must honestly report an EMPTY condemned set (0 in every field), with a
+small budget unable to manufacture truncation out of a walk that never
+ran.
+---
+ .../tests/ForcedNativeUnloadTests.cs          | 908 +++++++++++++++++-
+ .../Loader/AssemblyLoadContext.Mono.cs        |  35 +
+ .../mono/metadata/assembly-load-context.c     | 504 +++++++++-
+ src/mono/mono/metadata/gc-internals.h         |  61 ++
+ src/mono/mono/metadata/icall-def.h            |   1 +
+ src/mono/mono/metadata/sgen-mono.c            | 165 ++++
+ src/mono/mono/sgen/sgen-gc.h                  |  31 +
+ src/mono/mono/sgen/sgen-gchandles.c           |  70 ++
+ 8 files changed, 1721 insertions(+), 54 deletions(-)
+
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+index a338595..2b2f170 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -6,6 +6,7 @@
+ using System.Collections.Generic;
+ using System.Reflection;
+ using System.Runtime.CompilerServices;
++using System.Runtime.InteropServices;
+ using System.Threading.Tasks;
+ using Xunit;
+ 
+@@ -92,6 +93,50 @@ public class ForcedNativeUnloadTests
+         // Monotonic: scout finalizer ran but completed nothing and re-registered. Distinguishes
+         // "ran and refused" from "never ran" (a never-dying witness climbs this, kind 7 flat).
+         private const int ScoutCompletionDeferralCount = 10;
++        // FIELD INDICES of the condemned-set snapshot (collectible + unloading contexts), which
++        // AssemblyLoadContext.GetCondemnedSnapshot fills in ONE call. They MUST match the
++        // ALC_SNAPSHOT_* enum in assembly-load-context.c, whose "Root classification for condemned
++        // collectible contexts" block is the single source for what every field means, what a
++        // non-zero bucket does and does NOT prove (attribution is ONE HOP, so all-zero buckets
++        // never prove absence), and the buffer/budget protocol. Not restated here on purpose: an
++        // earlier revision restated it in three places and the copies drifted.
++        private const int CondemnedManagers = 0;
++        private const int CondemnedLiveWitnesses = 1;
++        private const int CondemnedStrongHandles = 2;
++        private const int CondemnedPinnedHandles = 3;
++        private const int CondemnedWeakHandles = 4;
++        private const int CondemnedWeakTrackHandles = 5;
++        private const int CondemnedIdentityHandles = 6;
++        private const int CondemnedSlotsVisited = 7;
++        private const int CondemnedSlotsEligible = 8;
++        private const int CondemnedWalkSaturated = 9;
++
++        // MUST match ALC_SNAPSHOT_FIELD_COUNT. Hard-coded rather than derived from the call so the
++        // buffer-contract regression can pin the exact size the runtime demands; a value read back
++        // from the same call would make that test self-confirming.
++        private const int CondemnedFieldCount = 10;
++
++        // The raw-slot cap the truncation regressions ask for. Small enough that a table a test can
++        // build in a few hundred allocations already crosses it, so the saturation path is reachable
++        // without allocating the runtime's full default budget's worth of handles. This is an
++        // ordinary caller-chosen cost knob, not a test-only seam in the runtime: the runtime clamps
++        // it and every value of it is safe, because a smaller budget can only truncate a read-only
++        // walk (and says so through CondemnedWalkSaturated).
++        private const int CondemnedTestSlotBudget = 128;
++
++        // Ask for the runtime's default budget. Any non-positive value means the same thing.
++        private const int CondemnedDefaultSlotBudget = 0;
++
++        // Simultaneously live strong handles the holey-table regression allocates before freeing
++        // them all. N live handles must occupy N DISTINCT slots below the table's next_slot, and
++        // next_slot never comes back down, so this leaves a table whose persistent high-water
++        // mark is far above CondemnedTestSlotBudget while almost every slot in it is a hole.
++        private const int HoleyTableInflation = 512;
++
++        // Poison written into a snapshot buffer before every call, so "the runtime wrote here" and
++        // "the runtime left this alone" are distinguishable. 0 would not be: 0 is also a legitimate
++        // value for every count in the tuple.
++        private const int SnapshotPoison = -424242;
+ 
+         private static readonly MethodInfo s_forceNativeUnload = typeof(AssemblyLoadContext)
+             .GetMethod("ForceNativeUnload", BindingFlags.NonPublic | BindingFlags.Instance);
+@@ -99,6 +144,9 @@ public class ForcedNativeUnloadTests
+         private static readonly MethodInfo s_getScoutRetirementStats = typeof(AssemblyLoadContext)
+             .GetMethod("GetScoutRetirementStats", BindingFlags.NonPublic | BindingFlags.Static);
+ 
++        private static readonly MethodInfo s_getCondemnedSnapshot = typeof(AssemblyLoadContext)
++            .GetMethod("GetCondemnedSnapshot", BindingFlags.NonPublic | BindingFlags.Static);
++
+         private static bool FlagEnabled
+         {
+             get
+@@ -135,13 +183,13 @@ private static bool FlagEnabled
+         // masking the regression.
+         private static bool BridgeMissing()
+         {
+-            if (s_forceNativeUnload != null && s_getScoutRetirementStats != null)
++            if (s_forceNativeUnload != null && s_getScoutRetirementStats != null && s_getCondemnedSnapshot != null)
+             {
+                 return false;
+             }
+ 
+             Assert.False(RequireBridge,
+-                "AssemblyLoadContext.ForceNativeUnload and/or GetScoutRetirementStats is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
++                "AssemblyLoadContext.ForceNativeUnload, GetScoutRetirementStats and/or GetCondemnedSnapshot is missing: the native-unload bridge was trimmed away, or the opt-in patch is not applied (trim/rooting regression).");
+             return true;
+         }
+ 
+@@ -511,6 +559,862 @@ await CollectAndAssertDeadAsync(weakNormal,
+                 "a normal subclass context must stay reclaimable after a field-hiding subclass resolved the latch cache first.");
+         }
+ 
++        /// <summary>
++        /// Root-classification regression for the condemned-set snapshot. A downstream WASM host whose
++        /// teardown reports NotQuiescent forever needs to know WHICH class of root holds the
++        /// condemned context's LoaderAllocator witness -- managed reflection cannot enumerate raw
++        /// GCHandles, so the runtime classifies them.
++        ///
++        /// What this test establishes, and deliberately no more:
++        ///   * EXACT attribution. Each of the four handle buckets moves by exactly +1 for its
++        ///     own handle type and by exactly +0 for the others, measured across intervals whose
++        ///     only content is the GCHandle.Alloc calls themselves -- so the buckets are proven
++        ///     separated by handle type, not merely non-zero.
++        ///   * NEGATIVE CONTROLS. A handle on a plain corelib object moves nothing, and -- the
++        ///     documented LIMIT of this diagnostic -- neither does a handle on an object[] that
++        ///     HOLDS a collectible instance: attribution is one hop, so a container root is
++        ///     invisible to the class buckets. That zero is asserted, not just described.
++        ///   * The STRONG handle alone holds the witness: after every other handle is freed it
++        ///     still pins the teardown at NotQuiescent, and freeing it drains the bucket and
++        ///     lets the teardown complete.
++        ///   * Kinds 12 and 14 are exercised LIVE (real Pinned / WeakTrackResurrection handles),
++        ///     not merely asserted to stay at zero.
++        ///   * Identity attribution counts HANDLES, not distinct objects. A second strong handle
++        ///     onto the already-registered managed ALC wrapper moves it by exactly +1 (and -1 on
++        ///     free) while the four class buckets stay flat -- so an implementation that reported
++        ///     the SIZE of the identity set instead of the number of handles into it fails here.
++        /// </summary>
++        [Fact]
++        public async Task CondemnedHandleClassification_ReportsHoldingHandleByType()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                AssertClassificationDarkSurface();
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            var handles = new GCHandle[HandleSlotCount];
++
++            try
++            {
++                int[] baseline = RootCollectibleInstancesWithClassifiedHandles(context, handles);
++
++                // The strong handle is a real root: the witness stays alive across collections
++                // and the teardown refuses.
++                GcQuiesce();
++                int[] rooted = CondemnedSnapshot();
++                Assert.Equal(baseline[CondemnedStrongHandles] + 1, rooted[CondemnedStrongHandles]);
++                Assert.True(rooted[CondemnedLiveWitnesses] > 0,
++                    $"a strong GCHandle into the condemned set must keep a LoaderAllocator witness alive " +
++                    $"(managers={rooted[CondemnedManagers]}, witnesses={rooted[CondemnedLiveWitnesses]}).");
++                Assert.Equal(NotQuiescent, Force(context));
++
++                // Drop the negative controls and every NON-rooting handle. Only the strong
++                // handle is left -- no static keeps anything else alive -- so this is where "the
++                // strong handle ALONE holds the witness" is actually established.
++                handles[HandleNegativePlain].Free();
++                handles[HandleNegativeContainer].Free();
++                handles[HandlePinned].Free();
++                handles[HandleWeak].Free();
++                handles[HandleWeakTrack].Free();
++                GcQuiesce();
++
++                int[] strongOnly = CondemnedSnapshot();
++                Assert.Equal(rooted[CondemnedStrongHandles], strongOnly[CondemnedStrongHandles]);
++                Assert.Equal(rooted[CondemnedPinnedHandles] - 1, strongOnly[CondemnedPinnedHandles]);
++                Assert.Equal(rooted[CondemnedWeakHandles] - 1, strongOnly[CondemnedWeakHandles]);
++                Assert.Equal(rooted[CondemnedWeakTrackHandles] - 1, strongOnly[CondemnedWeakTrackHandles]);
++                Assert.True(strongOnly[CondemnedLiveWitnesses] > 0,
++                    "the strong handle alone must still hold a witness after every other handle is freed.");
++                Assert.Equal(NotQuiescent, Force(context));
++
++                // Release the last root: the bucket drains by exactly one and the teardown
++                // completes -- the classification tracked the ACTUAL holder, not a static shape.
++                handles[HandleStrong].Free();
++                GcQuiesce();
++                Assert.Equal(strongOnly[CondemnedStrongHandles] - 1,
++                    CondemnedSnapshot()[CondemnedStrongHandles]);
++
++                Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 10));
++
++                // The context has left the condemned set, so the set-wide gauges must not have
++                // GROWN. Deliberately not an exact equality: the GC-driven scout completion can
++                // retire a stray an earlier test left pending, which would push these BELOW the
++                // baseline and make an equality order-dependent.
++                int[] drained = CondemnedSnapshot();
++                Assert.True(drained[CondemnedManagers] <= baseline[CondemnedManagers],
++                    $"the condemned manager set must not grow after a completed teardown " +
++                    $"(baseline={baseline[CondemnedManagers]}, after={drained[CondemnedManagers]}).");
++                Assert.True(drained[CondemnedLiveWitnesses] <= baseline[CondemnedLiveWitnesses],
++                    $"live witnesses must not grow after a completed teardown " +
++                    $"(baseline={baseline[CondemnedLiveWitnesses]}, after={drained[CondemnedLiveWitnesses]}).");
++                Assert.Equal(0, drained[CondemnedWalkSaturated]);
++
++                context = null;
++                await CollectAndAssertDeadAsync(weakRef,
++                    "the context must be reclaimable once the classified handles are freed.");
++            }
++            finally
++            {
++                // Any handle still allocated here would root a collectible context for the rest
++                // of the run and corrupt every later test's gauges, so release them on EVERY
++                // exit path, not just the successful one.
++                for (int i = 0; i < handles.Length; i++)
++                {
++                    if (handles[i].IsAllocated)
++                    {
++                        handles[i].Free();
++                    }
++                }
++            }
++        }
++
++        /// <summary>
++        /// ATOMICITY regression for the condemned-set snapshot.
++        ///
++        /// The tuple this surface reports is process-wide mutable state, and an earlier revision
++        /// delivered it as a dozen separate single-integer reads out of a process-global latch,
++        /// glued together by a caller-side refresh/read/validate token protocol. Two LOGICAL
++        /// callers were then enough to tear it, with no native thread race at all: A refreshed and
++        /// read one gauge, yielded, B refreshed, and A read the rest out of B's generation --
++        /// holding a tuple that never existed. That shape produced three separate defects in
++        /// review before it was replaced.
++        ///
++        /// The whole tuple now arrives from ONE call, so there is no "middle" for a competing
++        /// caller to splice into and a torn read is not a thing the surface can express. This test
++        /// pins that where it is observable -- at the boundary:
++        ///   * a returned tuple is a VALUE, not a window onto runtime state: a competing caller's
++        ///     snapshot, and a real change to the condemned set, must not retroactively alter a
++        ///     tuple that was already returned;
++        ///   * the newer tuple must see the change, so the previous assertion is not passing
++        ///     merely because nothing moved;
++        ///   * every tuple is INTERNALLY COHERENT -- visited &lt;= eligible, live witnesses &lt;=
++        ///     managers in scope, and the saturation flag agreeing with the visited/eligible pair.
++        ///     Those are exactly the cross-field invariants a mixed-generation read used to be
++        ///     able to violate, and they are checked on both tuples.
++        /// </summary>
++        [Fact]
++        public async Task CondemnedSnapshot_SingleCallTuple_CannotBeTornByACompetingCaller()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                AssertClassificationDarkSurface();
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            GCHandle first = default;
++            GCHandle second = default;
++
++            bool bodySucceeded = false;
++            try
++            {
++                first = RootCollectibleInstance(context);
++                GcQuiesce();
++
++                int[] before = CondemnedSnapshot();
++                AssertSnapshotIsCoherent(before);
++                Assert.True(before[CondemnedStrongHandles] > 0,
++                    $"the strong handle rooting the collectible instance must be attributed " +
++                    $"(strong={before[CondemnedStrongHandles]}).");
++
++                // Snapshot the tuple's own value, so "did the ALREADY RETURNED array change?" is
++                // answerable at all. A competing caller then takes its own snapshot AND the
++                // condemned set really moves underneath both of them.
++                int strongBefore = before[CondemnedStrongHandles];
++                int identityBefore = before[CondemnedIdentityHandles];
++
++                // A SECOND handle onto the same instance: counting is per HANDLE, so this moves the
++                // strong bucket by exactly one without needing a second collectible object.
++                second = GCHandle.Alloc(first.Target, GCHandleType.Normal);
++                int[] competing = CondemnedSnapshot();
++
++                // THE PROPERTY: the earlier tuple is a value copy. Neither the competing call nor
++                // the state change may reach back into it.
++                Assert.Equal(strongBefore, before[CondemnedStrongHandles]);
++                Assert.Equal(identityBefore, before[CondemnedIdentityHandles]);
++
++                // ...and the newer tuple DID see the change, so the assertion above is not passing
++                // vacuously on a surface that reports nothing at all.
++                Assert.Equal(strongBefore + 1, competing[CondemnedStrongHandles]);
++                AssertSnapshotIsCoherent(competing);
++
++                // Releasing the second handle brings the bucket back down by exactly one, and the
++                // tuple taken across that change is coherent too.
++                second.Free();
++                GcQuiesce();
++                int[] after = CondemnedSnapshot();
++                AssertSnapshotIsCoherent(after);
++                Assert.Equal(strongBefore, after[CondemnedStrongHandles]);
++                Assert.Equal(strongBefore + 1, competing[CondemnedStrongHandles]);
++
++                bodySucceeded = true;
++            }
++            finally
++            {
++                // Unconditional: a collectible+unloading context left pending would corrupt every
++                // later test in this serialized collection that asserts an exact gauge.
++                if (second.IsAllocated)
++                {
++                    second.Free();
++                }
++
++                if (first.IsAllocated)
++                {
++                    first.Free();
++                }
++
++                GcQuiesce();
++                int outcome = await ForceUntilCompletedAsync(context, 10);
++                context = null;
++
++                if (bodySucceeded)
++                {
++                    Assert.Equal(Completed, outcome);
++                    await CollectAndAssertDeadAsync(weakRef,
++                        "the context must be reclaimable once the rooting handles are freed.");
++                }
++            }
++        }
++
++        /// <summary>
++        /// BUFFER CONTRACT regression for the condemned-set snapshot (see the contract block in
++        /// assembly-load-context.c). The fill is ALL-OR-NOTHING, which is what makes a rejected
++        /// call safe: a caller's stale buffer stays stale rather than half-updated, so a partially
++        /// written tuple -- the very thing the single-call shape exists to make impossible -- can
++        /// never be observed either.
++        ///
++        /// Every buffer here is poisoned first, so "the runtime wrote this" and "the runtime left
++        /// this alone" are distinguishable; 0 would not be, since 0 is a legitimate value for every
++        /// count in the tuple. The test then requires:
++        ///   * an UNDERSIZED buffer to be refused with 0 and left completely untouched;
++        ///   * an OVERSIZED buffer to receive EXACTLY the tuple, with the tail still poisoned --
++        ///     so the fill honours the caller's length as a bound rather than assuming it;
++        ///   * a threads-enabled runtime to report -1 (UNAVAILABLE, never 0) and write nothing;
++        ///   * an absurd slot budget to be HANDLED rather than propagated -- the call still
++        ///     succeeds and still returns a coherent tuple. Deliberately NOT stated as "the clamp
++        ///     is proven": see the scope note at that assertion for what it does and does not
++        ///     establish.
++        ///
++        /// Keyed off PlatformDetection rather than off the call under test: deriving the
++        /// expectation from the same call would be self-confirming, since a regression that made
++        /// the surface report -1 everywhere would satisfy a self-derived expectation vacuously.
++        /// </summary>
++        [Fact]
++        public void CondemnedSnapshot_BufferContract_IsAllOrNothing()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            // An undersized buffer is refused on EVERY leg, threads-enabled included: the length
++            // check is part of the call's contract, not of the feature behind it.
++            int[] tooSmall = NewPoisonedSnapshotBuffer(CondemnedFieldCount - 1);
++            int shortResult = FillCondemnedSnapshot(tooSmall, CondemnedDefaultSlotBudget);
++            Assert.True(shortResult <= 0,
++                $"an undersized buffer must never report a successful fill (returned {shortResult}).");
++            AssertAllPoison(tooSmall, "an undersized buffer must be left completely untouched.");
++
++            int[] empty = new int[0];
++            Assert.True(FillCondemnedSnapshot(empty, CondemnedDefaultSlotBudget) <= 0,
++                "a zero-length buffer must never report a successful fill.");
++
++            if (PlatformDetection.IsThreadingSupported)
++            {
++                // Compiled out by the DISABLE_THREADS hard gate: UNAVAILABLE, and nothing written.
++                int[] dark = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++                Assert.Equal(-1, FillCondemnedSnapshot(dark, CondemnedDefaultSlotBudget));
++                AssertAllPoison(dark, "an unavailable surface must write nothing at all.");
++                return;
++            }
++
++            // Live on BOTH single-threaded legs: the buffer protocol is a property of the call, not
++            // of whether anything is currently condemned. Here the refusal is exactly 0 -- "too
++            // small", which is distinct from the -1 the threads leg above reports for UNAVAILABLE.
++            Assert.Equal(0, shortResult);
++
++            const int Slack = 4;
++            int[] oversized = NewPoisonedSnapshotBuffer(CondemnedFieldCount + Slack);
++            Assert.Equal(CondemnedFieldCount, FillCondemnedSnapshot(oversized, CondemnedDefaultSlotBudget));
++
++            for (int i = 0; i < CondemnedFieldCount; i++)
++            {
++                Assert.NotEqual(SnapshotPoison, oversized[i]);
++            }
++
++            // THE BOUND: everything past the tuple is still poison, so the fill wrote exactly the
++            // fields it declared and no more.
++            for (int i = CondemnedFieldCount; i < oversized.Length; i++)
++            {
++                Assert.Equal(SnapshotPoison, oversized[i]);
++            }
++
++            // An exact-size buffer is the ordinary case and must succeed identically.
++            int[] exact = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++            Assert.Equal(CondemnedFieldCount, FillCondemnedSnapshot(exact, CondemnedDefaultSlotBudget));
++            AssertSnapshotIsCoherent(exact);
++
++            // THE BUDGET IS A REQUEST, NOT A COMMAND -- with the scope of that stated plainly,
++            // because it is tempting to overclaim here. What this pins is that an absurd budget is
++            // HANDLED: the call still succeeds, still returns a coherent tuple, and nothing
++            // overflows on the way (int.MaxValue is the interesting value for that). It does NOT
++            // prove the clamp itself. Observing the clamp would need a handle table with more raw
++            // slots than the runtime's own cap, which no test can build cheaply -- so the clamp,
++            // like the sweep in sgen_gchandle_foreach_slot_bounded, rests on review of a single
++            // expression rather than on a regression.
++            int[] greedy = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++            Assert.Equal(CondemnedFieldCount, FillCondemnedSnapshot(greedy, int.MaxValue));
++            AssertSnapshotIsCoherent(greedy);
++
++            // A negative budget means "use the default" rather than "walk nothing" or "abort".
++            int[] negative = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++            Assert.Equal(CondemnedFieldCount, FillCondemnedSnapshot(negative, -1));
++            AssertSnapshotIsCoherent(negative);
++        }
++
++        /// <summary>
++        /// POSITIVE saturation regression for CondemnedWalkSaturated. Every other assertion in this
++        /// suite requires that flag to be 0, so a runtime that never set it at all would stay green;
++        /// this one requires it to be SET, on a table deliberately pushed past a raw-slot budget the
++        /// test itself asks for.
++        ///
++        /// It also pins what saturation MEANS: truncated counts are LOWER BOUNDS, so they can
++        /// never exceed the same reading taken under the full budget.
++        /// </summary>
++        [Fact]
++        public async Task CondemnedHandleWalk_SaturationFlag_IsSetWhenTheRawBudgetIsCrossed()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                AssertClassificationDarkSurface();
++                return;
++            }
++
++            await WithHoleyHandleTableAsync((full, selfTest) =>
++            {
++                // The real 200k budget is nowhere near crossed by a healthy runtime, and the full
++                // walk really did find the rooting handle -- without which the comparison below
++                // would be a statement about two empty readings.
++                Assert.Equal(0, full[CondemnedWalkSaturated]);
++                Assert.True(full[CondemnedStrongHandles] > 0,
++                    $"the unbudgeted walk must attribute the strong handle holding the condemned " +
++                    $"instance (strong={full[CondemnedStrongHandles]}).");
++
++                // THE POSITIVE BRANCH: the reduced cap IS crossed and the flag says so.
++                Assert.Equal(1, selfTest[CondemnedWalkSaturated]);
++
++                // A saturated read may only UNDERSTATE. Deliberately stated as a weak
++                // monotonicity check, and worth being explicit about why it cannot be stronger:
++                // the surviving window is the LOW slots, which belong to the runtime's own
++                // long-lived handles, while sgen places new handles from slot_hint upward -- so
++                // after the inflation this test's own rooting handle is far above the cap and a
++                // truncated bucket legitimately reads 0. "0 <= 1" is all that is provable here;
++                // the load-bearing truncation assertions are the saturation flag above, and the
++                // visited/eligible pair in
++                // CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark.
++                Assert.True(selfTest[CondemnedStrongHandles] <= full[CondemnedStrongHandles],
++                    $"a truncated walk's counts are lower bounds " +
++                    $"(selfTest={selfTest[CondemnedStrongHandles]}, full={full[CondemnedStrongHandles]}).");
++                Assert.True(selfTest[CondemnedIdentityHandles] <= full[CondemnedIdentityHandles],
++                    $"a truncated walk's identity count is a lower bound " +
++                    $"(selfTest={selfTest[CondemnedIdentityHandles]}, full={full[CondemnedIdentityHandles]}).");
++
++                // Set-wide gauges are computed outside the handle walk, so truncation must not
++                // INVENT condemned managers: saturation is about the walk, not about the set.
++                // Deliberately <= rather than equality, exactly as elsewhere in this suite: the
++                // GC-driven scout completion can retire a stray an earlier test left pending
++                // between the two snapshots, which would make an equality order-dependent.
++                Assert.True(selfTest[CondemnedManagers] > 0,
++                    "the budgeted snapshot must still see the condemned context's managers.");
++                Assert.True(selfTest[CondemnedManagers] <= full[CondemnedManagers],
++                    $"a truncated handle walk must not grow the condemned manager set " +
++                    $"(full={full[CondemnedManagers]}, selfTest={selfTest[CondemnedManagers]}).");
++            });
++        }
++
++        /// <summary>
++        /// Raw-slot bound regression (visited versus eligible) on a HOLEY table -- the shape a
++        /// classification-only budget cannot bound.
++        ///
++        /// Each sgen handle table is an SgenArrayList whose next_slot is a persistent high-water
++        /// mark: freeing a handle only NULLs its slot, and refills reuse holes, so the mark never
++        /// comes back down. A budget that merely skipped per-slot classification work would
++        /// therefore still sweep every slot of a long, mostly-empty table, once per handle type,
++        /// while every bucket reported 0. On a single browser thread that is a pause, not just
++        /// wasted work.
++        ///
++        /// So: inflate the strong-handle table's high-water mark far past the requested cap, free
++        /// every one of those handles to leave it holey, and require the walk to stop AT the cap
++        /// rather than at the mark.
++        ///
++        /// SCOPE OF THIS PROOF, stated plainly rather than overclaimed. Kind 21 is the runtime's
++        /// own report of how many slots it loaded, and it is the only channel there is -- so this
++        /// test pins the REPORTED bound, not the sweep. A probe that walked the whole table while
++        /// still reporting the cap passed this suite unchanged; the sweep itself is guaranteed by
++        /// the loop's range expression in sgen_gchandle_foreach_slot_bounded, which is a matter for
++        /// review. What this test does catch is the shape it replaced, where the budget gated only
++        /// per-slot classification and left the reported range at the table's high-water mark.
++        /// </summary>
++        [Fact]
++        public async Task CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                AssertClassificationDarkSurface();
++                return;
++            }
++
++            await WithHoleyHandleTableAsync((full, selfTest) =>
++            {
++                // The scanned range really is long. Kind 22 sums the high-water marks of all FOUR
++                // scanned tables, so this does not attribute the length to the strong-handle table
++                // specifically -- but it does not need to: HoleyTableInflation simultaneously live
++                // Normal handles occupy that many distinct indices, so that table's mark alone is
++                // >= HoleyTableInflation and the sum can only be larger. (A DELTA across the
++                // inflation would be the attributing form but is NOT sound: sgen refills holes via
++                // sgen_array_list_find_unset, so if the table already had enough holes the mark
++                // legitimately does not move at all.)
++                Assert.True(full[CondemnedSlotsEligible] >= HoleyTableInflation,
++                    $"the inflated strong-handle table must leave the scanned high-water mark at " +
++                    $"least {HoleyTableInflation} raw slots (eligible={full[CondemnedSlotsEligible]}).");
++
++                // A high-water mark never comes back down, so the second snapshot's eligible range
++                // can only be >= the first's (>= rather than == because the two icall sweeps
++                // themselves may allocate a handle the runtime places past a table's mark).
++                Assert.True(selfTest[CondemnedSlotsEligible] >= full[CondemnedSlotsEligible],
++                    $"a table's high-water mark must never shrink " +
++                    $"(full={full[CondemnedSlotsEligible]}, selfTest={selfTest[CondemnedSlotsEligible]}).");
++
++                // The unbudgeted walk covers that whole range -- which is what makes the next
++                // assertion a statement about the CAP and not about an empty table.
++                Assert.Equal(full[CondemnedSlotsEligible], full[CondemnedSlotsVisited]);
++                Assert.True(full[CondemnedSlotsVisited] > CondemnedTestSlotBudget,
++                    $"the eligible range must exceed the requested cap for this to be a bound " +
++                    $"(visited={full[CondemnedSlotsVisited]}, cap={CondemnedTestSlotBudget}).");
++
++                // THE PROPERTY UNDER TEST: the walk reports having stopped at the RAW slot cap,
++                // far short of the mark it was eligible to cover. See the SCOPE note above for
++                // what this does and does not establish.
++                Assert.True(selfTest[CondemnedSlotsVisited] > 0,
++                    "the budgeted walk must still have loaded slots: a walk that ran not at " +
++                    "all would satisfy the cap vacuously.");
++                Assert.True(selfTest[CondemnedSlotsVisited] <= CondemnedTestSlotBudget,
++                    $"the walk must stop at its raw-slot cap, not at the table's high-water mark " +
++                    $"(visited={selfTest[CondemnedSlotsVisited]}, cap={CondemnedTestSlotBudget}, " +
++                    $"eligible={selfTest[CondemnedSlotsEligible]}).");
++                Assert.True(selfTest[CondemnedSlotsVisited] < selfTest[CondemnedSlotsEligible],
++                    $"the budgeted walk must have left slots unvisited " +
++                    $"(visited={selfTest[CondemnedSlotsVisited]}, eligible={selfTest[CondemnedSlotsEligible]}).");
++            });
++        }
++
++        // Builds the shape both raw-walk regressions need -- a CONDEMNED context, so the walk runs
++        // at all, plus a strong-handle table whose persistent high-water mark is far above the
++        // requested cap while nearly every slot in it is a hole -- takes one default-budget
++        // snapshot and one reduced-budget snapshot of that state, hands both to `assert`, and drains the
++        // context so no later test's gauges are polluted.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static async Task WithHoleyHandleTableAsync(Action<int[], int[]> assert)
++        {
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            var weakRef = new WeakReference(context);
++            GCHandle root = default;
++
++            bool bodySucceeded = false;
++            try
++            {
++                root = RootCollectibleInstanceAndInflateHandleTable(context);
++
++                // Both snapshots describe the SAME state: nothing between them allocates or frees
++                // a handle, so the only difference is the raw-slot cap they were taken under.
++                int[] full = CondemnedSnapshot();
++                int[] selfTest = CondemnedSnapshot(CondemnedTestSlotBudget);
++                assert(full, selfTest);
++                bodySucceeded = true;
++            }
++            finally
++            {
++                // The drain runs UNCONDITIONALLY, from the finally: a failing assertion above must
++                // not skip it. Leaving a collectible+unloading context pending would break every
++                // later test in this serialized collection that asserts an exact gauge, turning
++                // one real failure into a spray of order-dependent ones.
++                if (root.IsAllocated)
++                {
++                    root.Free();
++                }
++
++                GcQuiesce();
++                int outcome = await ForceUntilCompletedAsync(context, 10);
++                context = null;
++
++                // ...but its OUTCOME is only asserted when the body succeeded. An assertion thrown
++                // from a finally block replaces the in-flight one, which would hide the real
++                // failure behind a teardown symptom.
++                if (bodySucceeded)
++                {
++                    Assert.Equal(Completed, outcome);
++                    await CollectAndAssertDeadAsync(weakRef,
++                        "the context must be reclaimable once the rooting handle is freed.");
++                }
++            }
++        }
++
++        // Roots one instance out of the collectible context with a strong handle (so the context
++        // stays condemned and the walk has something to attribute), then inflates the strong-handle
++        // table's high-water mark and punches it full of holes.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static GCHandle RootCollectibleInstanceAndInflateHandleTable(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            object target = Activator.CreateInstance(type);
++            Assert.NotNull(target);
++
++            context.Unload();
++
++            // HoleyTableInflation simultaneously LIVE handles must occupy that many DISTINCT slots
++            // below the table's next_slot, so the mark is at least that high while they exist.
++            // Freeing them all then leaves the mark exactly where it was (sgen only NULLs the
++            // slot), producing a table that is long and nearly empty. That is precisely the shape a
++            // budget on classified hits walks end to end.
++            var filler = new GCHandle[HoleyTableInflation];
++            try
++            {
++                for (int i = 0; i < filler.Length; i++)
++                {
++                    filler[i] = GCHandle.Alloc(new object(), GCHandleType.Normal);
++                }
++            }
++            finally
++            {
++                for (int i = 0; i < filler.Length; i++)
++                {
++                    if (filler[i].IsAllocated)
++                    {
++                        filler[i].Free();
++                    }
++                }
++            }
++
++            return GCHandle.Alloc(target, GCHandleType.Normal);
++        }
++
++        // Slots of the handle array driven by CondemnedHandleClassification_ReportsHoldingHandleByType.
++        private const int HandleStrong = 0;
++        private const int HandlePinned = 1;
++        private const int HandleWeak = 2;
++        private const int HandleWeakTrack = 3;
++        private const int HandleNegativePlain = 4;
++        private const int HandleNegativeContainer = 5;
++        private const int HandleSlotCount = 6;
++
++        // Takes ONE condemned-set snapshot and returns it, indexed by the field constants above.
++        //
++        // There is no retry loop, no generation token and no read protocol, because there is
++        // nothing to protect: the whole tuple is filled by a single call, so a competing caller
++        // cannot replace half of it. (The multi-read protocol this replaced, and why it kept
++        // producing defects, are recorded in the contract block in assembly-load-context.c.)
++        //
++        // `slotBudget` is the caller's raw-slot cost knob; the default asks the runtime for its own
++        // budget. The buffer is poisoned first so a fill that silently skipped a field would be
++        // caught here rather than showing up as a mysterious 0 in an assertion downstream.
++        private static int[] CondemnedSnapshot(int slotBudget = CondemnedDefaultSlotBudget)
++        {
++            int[] buffer = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++            Assert.Equal(CondemnedFieldCount, FillCondemnedSnapshot(buffer, slotBudget));
++            for (int i = 0; i < buffer.Length; i++)
++            {
++                Assert.NotEqual(SnapshotPoison, buffer[i]);
++            }
++
++            return buffer;
++        }
++
++        private static int[] NewPoisonedSnapshotBuffer(int length)
++        {
++            int[] buffer = new int[length];
++            for (int i = 0; i < buffer.Length; i++)
++            {
++                buffer[i] = SnapshotPoison;
++            }
++
++            return buffer;
++        }
++
++        private static void AssertAllPoison(int[] buffer, string because)
++        {
++            for (int i = 0; i < buffer.Length; i++)
++            {
++                Assert.True(buffer[i] == SnapshotPoison, $"{because} (index {i} = {buffer[i]}).");
++            }
++        }
++
++        private static int FillCondemnedSnapshot(int[] buffer, int slotBudget)
++            => (int)s_getCondemnedSnapshot.Invoke(null, new object[] { buffer, slotBudget });
++
++        // The cross-field invariants a SINGLE tuple must satisfy. These are exactly the ones a
++        // mixed-generation read used to be able to violate -- fields from two different states of
++        // the world can contradict each other, fields from one state cannot -- so asserting them on
++        // every tuple this suite takes is how "the tuple is one state of the world" stays checked
++        // rather than merely claimed.
++        private static void AssertSnapshotIsCoherent(int[] snapshot)
++        {
++            Assert.True(snapshot[CondemnedLiveWitnesses] <= snapshot[CondemnedManagers],
++                $"live witnesses cannot exceed the managers in scope they are counted from " +
++                $"(witnesses={snapshot[CondemnedLiveWitnesses]}, managers={snapshot[CondemnedManagers]}).");
++
++            if (snapshot[CondemnedSlotsEligible] < 0)
++            {
++                // Non-sgen collector: the walk cannot run, so every field that depends on it
++                // reports UNAVAILABLE -- as a GROUP, never a mix of -1 and a misleading 0.
++                Assert.Equal(-1, snapshot[CondemnedStrongHandles]);
++                Assert.Equal(-1, snapshot[CondemnedPinnedHandles]);
++                Assert.Equal(-1, snapshot[CondemnedWeakHandles]);
++                Assert.Equal(-1, snapshot[CondemnedWeakTrackHandles]);
++                Assert.Equal(-1, snapshot[CondemnedIdentityHandles]);
++                Assert.Equal(-1, snapshot[CondemnedSlotsVisited]);
++                Assert.Equal(-1, snapshot[CondemnedWalkSaturated]);
++                return;
++            }
++
++            Assert.True(snapshot[CondemnedSlotsVisited] <= snapshot[CondemnedSlotsEligible],
++                $"the walk cannot visit more raw slots than it was eligible to visit " +
++                $"(visited={snapshot[CondemnedSlotsVisited]}, eligible={snapshot[CondemnedSlotsEligible]}).");
++
++            // The saturation flag is not an independent value: it means precisely "the walk stopped
++            // short", so it must agree with the pair that reports where it stopped, in BOTH
++            // directions. A flag that were merely set optimistically, or never set at all, fails
++            // one direction or the other.
++            Assert.Equal(
++                snapshot[CondemnedSlotsVisited] < snapshot[CondemnedSlotsEligible] ? 1 : 0,
++                snapshot[CondemnedWalkSaturated]);
++        }
++
++        // Both dark configurations, keyed off the PLATFORM rather than off the call under test:
++        // deriving the expectation from the same call would be self-confirming -- a regression that
++        // made the whole surface report -1 would satisfy both dark legs vacuously.
++        private static void AssertClassificationDarkSurface()
++        {
++            int[] buffer = NewPoisonedSnapshotBuffer(CondemnedFieldCount);
++
++            if (PlatformDetection.IsThreadingSupported)
++            {
++                // The forced-unload machinery, and this surface with it, is compiled out by the
++                // DISABLE_THREADS hard gate: the call must report UNAVAILABLE and write NOTHING --
++                // never a tuple of zeroes, which would read as "measured, and found nothing".
++                Assert.Equal(-1, FillCondemnedSnapshot(buffer, CondemnedDefaultSlotBudget));
++                AssertAllPoison(buffer, "a surface compiled out by DISABLE_THREADS must write nothing.");
++                return;
++            }
++
++            // Single-threaded with the opt-in off: the surface is LIVE -- the call succeeds and
++            // fills the whole tuple -- but nothing is natively collectible, so the condemned set is
++            // genuinely EMPTY and the set-wide fields honestly read 0.
++            int[] snapshot = CondemnedSnapshot();
++            AssertSnapshotIsCoherent(snapshot);
++            Assert.Equal(0, snapshot[CondemnedManagers]);
++            Assert.Equal(0, snapshot[CondemnedLiveWitnesses]);
++            AssertWalkFieldsAreZeroWhenAvailable(snapshot);
++
++            // A refusal here is exactly 0 ("too small"), which is a DIFFERENT answer from the -1
++            // ("unavailable") the threads-enabled leg above gives. Asserting the two separately is
++            // what keeps a runtime that conflated them from passing both legs.
++            Assert.Equal(0, FillCondemnedSnapshot(new int[0], CondemnedDefaultSlotBudget));
++
++            // The tiny budget is live here too. With an EMPTY condemned set the handle walk is
++            // skipped entirely, so it can neither visit a slot nor saturate -- a small budget does
++            // not manufacture truncation out of a walk that never ran.
++            int[] budgeted = CondemnedSnapshot(CondemnedTestSlotBudget);
++            AssertSnapshotIsCoherent(budgeted);
++            AssertWalkFieldsAreZeroWhenAvailable(budgeted);
++        }
++
++        // The walk-dependent fields must read 0 -- "the walk ran and found nothing" -- but ONLY
++        // where the walk can run at all. On a non-sgen collector they are -1 as a group, which
++        // AssertSnapshotIsCoherent already requires; asserting 0 unconditionally here would make
++        // the two helpers contradict each other for the same configuration.
++        private static void AssertWalkFieldsAreZeroWhenAvailable(int[] snapshot)
++        {
++            if (snapshot[CondemnedSlotsEligible] < 0)
++            {
++                return;
++            }
++
++            for (int i = CondemnedStrongHandles; i <= CondemnedWalkSaturated; i++)
++            {
++                Assert.True(snapshot[i] == 0,
++                    $"an empty condemned set must report 0, not {snapshot[i]}, in field {i}.");
++            }
++        }
++
++        // Loads the collectible assembly, creates one instance, unloads, and roots the instance
++        // with a strong handle so the context stays condemned with something attributable in it.
++        // Deliberately NOT shared with RootCollectibleInstanceAndInflateHandleTable: there the
++        // rooting handle must be allocated AFTER the table inflation so it lands above the cap,
++        // and that ordering is the point of that helper rather than an incidental detail.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static GCHandle RootCollectibleInstance(AssemblyLoadContext context)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            object target = Activator.CreateInstance(type);
++            Assert.NotNull(target);
++
++            context.Unload();
++            return GCHandle.Alloc(target, GCHandleType.Normal);
++        }
++
++        // Loads the collectible assembly, creates the two probe instances, unloads, and then
++        // allocates the classified handles in four tight phases -- asserting EXACT bucket deltas
++        // across each, including a +1/-1 pair on the identity bucket. Everything managed stays
++        // confined to this frame so the GCHandles are the only roots the buckets can attribute,
++        // and each measurement interval contains nothing but the GCHandle.Alloc calls under test,
++        // which is what makes the deltas exact rather than merely monotone. Returns the baseline
++        // snapshot for the caller's later phases.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static int[] RootCollectibleInstancesWithClassifiedHandles(
++            AssemblyLoadContext context, GCHandle[] handles)
++        {
++            Assembly asm = context.LoadFromAssemblyName(new AssemblyName(TestAssembly));
++            Type type = asm.GetType(TestClassName, throwOnError: true);
++            Type pointerFreeType = asm.GetType(PointerFreeClassName, throwOnError: true);
++            object strongTarget = Activator.CreateInstance(type);
++
++            // PointerFreeTestClass has no reference fields, so an instance of it is PINNABLE --
++            // which is what lets the pinned and weak-track buckets be exercised with real handles instead of being
++            // asserted to stay at zero.
++            object pinnedTarget = Activator.CreateInstance(pointerFreeType);
++            Assert.NotNull(strongTarget);
++            Assert.NotNull(pinnedTarget);
++
++            context.Unload();
++
++            // BASELINE: the context is already condemned (collectible + unloading) and its
++            // managers are in scope, but none of this test's handles exist yet.
++            int[] before = CondemnedSnapshot();
++            Assert.True(before[CondemnedManagers] > 0,
++                $"the unloading context's memory managers must enter the condemned set " +
++                $"(managers={before[CondemnedManagers]}).");
++            Assert.True(before[CondemnedLiveWitnesses] > 0,
++                $"an unloading context with live instances must still have a live LoaderAllocator " +
++                $"witness (witnesses={before[CondemnedLiveWitnesses]}).");
++            Assert.Equal(0, before[CondemnedWalkSaturated]);
++
++            // The runtime's OWN roots are already attributable -- but only by IDENTITY: the
++            // managed wrapper (which PrepareForAssemblyLoadContextRelease promoted to a STRONG
++            // handle when Unload was requested) and the LoaderAllocator witness are both
++            // corelib-classed, so the class buckets are blind to them by construction. Asserting this
++            // documents why the type buckets alone would under-report the real root set.
++            Assert.True(before[CondemnedIdentityHandles] >= 2,
++                $"the runtime's own wrapper and witness handles must be identity-attributed " +
++                $"(identity={before[CondemnedIdentityHandles]}, strong={before[CondemnedStrongHandles]}).");
++
++            // PHASE A -- strong and weak only. The +0 on the untouched buckets is the load-bearing
++            // half: it proves the buckets are separated by handle TYPE rather than lumped.
++            handles[HandleStrong] = GCHandle.Alloc(strongTarget, GCHandleType.Normal);
++            handles[HandleWeak] = GCHandle.Alloc(pinnedTarget, GCHandleType.Weak);
++            AssertBucketDeltas(before, CondemnedSnapshot(), 1, 0, 1, 0);
++
++            // PHASE B -- add the pinned and weak-track handles. Both target the pointer-free
++            // instance, which the pinned handle also keeps observable for the weak buckets: the
++            // previous shape used a static for that, and a static is a second STRONG root, so it
++            // made "the strong handle alone holds the witness" unprovable.
++            handles[HandlePinned] = GCHandle.Alloc(pinnedTarget, GCHandleType.Pinned);
++            handles[HandleWeakTrack] = GCHandle.Alloc(pinnedTarget, GCHandleType.WeakTrackResurrection);
++            int[] afterB = CondemnedSnapshot();
++            AssertBucketDeltas(before, afterB, 1, 1, 1, 1);
++
++            // NEGATIVE CONTROLS. (1) A handle on a plain corelib object must move nothing -- the
++            // walk is not counting handles indiscriminately. (2) A handle on an object[] HOLDING
++            // the collectible instance must ALSO move nothing: the array is corelib-classed, so
++            // one-hop class attribution cannot see the condemned instance it roots. That second
++            // zero is the documented blind spot of this diagnostic, asserted rather than assumed.
++            handles[HandleNegativePlain] = GCHandle.Alloc(new object(), GCHandleType.Normal);
++            handles[HandleNegativeContainer] = GCHandle.Alloc(new object[] { strongTarget }, GCHandleType.Normal);
++            int[] afterControls = CondemnedSnapshot();
++            AssertBucketDeltas(before, afterControls, 1, 1, 1, 1);
++            Assert.Equal(afterB[CondemnedManagers], afterControls[CondemnedManagers]);
++
++            // IDENTITY ATTRIBUTION COUNTS HANDLES, NOT DISTINCT OBJECTS. `context` is ALREADY in
++            // the identity set -- the runtime's own strong handle targets it -- so a SECOND handle
++            // onto the very same object must still move the identity count by exactly +1, and back by exactly
++            // -1 when freed. That +1/-1 pair is what separates per-handle counting from
++            // unique-object counting: an implementation that reported the size of the identity set
++            // would satisfy "identity >= 2" above and never move here at all.
++            //
++            // Kinds 11-14 must stay FLAT across the same interval: identity attribution is checked
++            // first and is class-blind, and the wrapper's own class lives in the (non-collectible)
++            // default context anyway, so no class bucket may claim this handle.
++            var identityHandle = GCHandle.Alloc(context, GCHandleType.Normal);
++            int[] afterIdentity;
++            try
++            {
++                afterIdentity = CondemnedSnapshot();
++
++                // Asserted FIRST so that a change in the identity SET (rather than in the number
++                // of handles into it) is attributed to its real cause instead of showing up as a
++                // mysterious identity-count delta.
++                Assert.Equal(afterControls[CondemnedLiveWitnesses], afterIdentity[CondemnedLiveWitnesses]);
++                Assert.Equal(afterControls[CondemnedIdentityHandles] + 1, afterIdentity[CondemnedIdentityHandles]);
++                AssertBucketDeltas(afterControls, afterIdentity, 0, 0, 0, 0);
++            }
++            finally
++            {
++                identityHandle.Free();
++            }
++
++            int[] afterIdentityFreed = CondemnedSnapshot();
++
++            // Same stability guard as the +1 direction, for the same reason: the identity count counts
++            // handles onto ANY member of the identity set, so a shared-generic witness dying in
++            // this window would move it for a reason that has nothing to do with handle counting.
++            // Without this the -1 assertion could fail as "expected N-1, got N-2" and point at
++            // the wrong thing.
++            Assert.Equal(afterIdentity[CondemnedLiveWitnesses], afterIdentityFreed[CondemnedLiveWitnesses]);
++            Assert.Equal(afterIdentity[CondemnedManagers], afterIdentityFreed[CondemnedManagers]);
++            Assert.Equal(afterIdentity[CondemnedIdentityHandles] - 1, afterIdentityFreed[CondemnedIdentityHandles]);
++            AssertBucketDeltas(before, afterIdentityFreed, 1, 1, 1, 1);
++
++            GC.KeepAlive(strongTarget);
++            GC.KeepAlive(pinnedTarget);
++            return before;
++        }
++
++        // Exact per-bucket deltas between two snapshots of the classification surface.
++        private static void AssertBucketDeltas(
++            int[] before, int[] after, int strong, int pinned, int weak, int weakTrack)
++        {
++            Assert.Equal(before[CondemnedStrongHandles] + strong, after[CondemnedStrongHandles]);
++            Assert.Equal(before[CondemnedPinnedHandles] + pinned, after[CondemnedPinnedHandles]);
++            Assert.Equal(before[CondemnedWeakHandles] + weak, after[CondemnedWeakHandles]);
++            Assert.Equal(before[CondemnedWeakTrackHandles] + weakTrack, after[CondemnedWeakTrackHandles]);
++            Assert.Equal(0, after[CondemnedWalkSaturated]);
++        }
++
+         /// <summary>
+         /// The no-retry residue regression: a host that never calls ForceNativeUnload at all —
+         /// N load/unload/drop cycles — must leave NO native residue. An orphaned struct is
+diff --git a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+index ca1b6ff..eade049 100644
+--- a/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
++++ b/src/mono/System.Private.CoreLib/src/System/Runtime/Loader/AssemblyLoadContext.Mono.cs
+@@ -37,6 +37,7 @@ internal IntPtr NativeALC
+         [DynamicDependency(nameof(_nativeAssemblyLoadContext))]
+         [DynamicDependency(nameof(ForceNativeUnload))] // trim-root: hosts invoke this bridge via reflection
+         [DynamicDependency(nameof(GetScoutRetirementStats))] // trim-root: diagnostics bridge, invoked via reflection
++        [DynamicDependency(nameof(GetCondemnedSnapshot))] // trim-root: diagnostics bridge, invoked via reflection
+         [DynamicDependency(nameof(GetJiterpreterTableStat))] // trim-root: lifecycle tests invoke this bridge via reflection
+         [DynamicDependency(nameof(RunJiterpreterTableSelfTest))] // trim-root: lifecycle tests invoke this bridge via reflection
+         private IntPtr InitializeAssemblyLoadContext(IntPtr thisHandlePtr, bool representsTPALoadContext, bool isCollectible)
+@@ -99,6 +100,40 @@ private static void KeepLoaderAllocator()
+         // ran" — a never-dying witness climbs this while kind 7 stays flat.
+         internal static int GetScoutRetirementStats(int kind) => InternalGetScoutRetirementStats(kind);
+ 
++        [MethodImplAttribute(MethodImplOptions.InternalCall)]
++        private static extern int InternalGetCondemnedSnapshot(IntPtr buffer, int length, int slotBudget);
++
++        // Root-classification SNAPSHOT for the condemned set (collectible + unloading contexts):
++        // which classes of GC handle DIRECTLY hold the contexts a teardown is still pending for.
++        //
++        // The contract is NOT restated here. The single source is the "Root classification for
++        // condemned collectible contexts" block in assembly-load-context.c: it defines the field
++        // indices and their meaning, what a non-zero bucket does and does NOT prove (attribution
++        // is ONE HOP, so all-zero buckets never prove absence), the buffer protocol, the raw-slot
++        // budget and the conditions under which this whole surface is removed again. An earlier
++        // revision duplicated that catalog here and in two other places, and the copies drifted.
++        //
++        // What belongs here is only the shape of the call. `buffer` must have room for the whole
++        // tuple; the fill is ALL-OR-NOTHING, so a rejected call leaves the caller's buffer
++        // untouched rather than half-updated. `slotBudget` is a cost knob clamped by the runtime
++        // (pass 0 for the default). Returns the number of fields written, 0 if `buffer` is too
++        // small, or -1 when the surface is unavailable -- a threads-enabled runtime has the whole
++        // feature compiled out by the DISABLE_THREADS hard gate. -1 never means "zero": a LIVE
++        // surface with an empty condemned set honestly reports 0 in every count.
++        //
++        // Deliberately a separate icall rather than more kinds of GetScoutRetirementStats: the
++        // tuple must arrive in ONE call. Composing it from several single-integer reads made
++        // consistency a property of caller convention rather than of the surface, which is what
++        // produced this diagnostic's earlier mixed-generation defects.
++        internal static unsafe int GetCondemnedSnapshot(int[] buffer, int slotBudget)
++        {
++            ArgumentNullException.ThrowIfNull(buffer);
++            fixed (int* p = buffer)
++            {
++                return InternalGetCondemnedSnapshot((IntPtr)p, buffer.Length, slotBudget);
++            }
++        }
++
+         [MethodImplAttribute(MethodImplOptions.InternalCall)]
+         private static extern int InternalGetJiterpreterTableStat(int table, int kind);
+ 
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index 065b4a4..1054345 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -6,6 +6,7 @@
+ #include "mono/metadata/class-internals.h"
+ #include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/exception-internals.h"
++#include "mono/metadata/gc-internals.h"
+ #include "mono/metadata/icall-decl.h"
+ #include "mono/metadata/loader-internals.h"
+ #include "mono/metadata/loaded-images-internals.h"
+@@ -100,6 +101,420 @@ static gint32 collectible_alc_native_structs;
+  * of InternalGetScoutRetirementStats; diagnostics only. */
+ static gint32 scout_completion_deferral_count;
+ 
++/*
++ * ===========================================================================================
++ * Root classification for condemned collectible contexts (the condemned-set SNAPSHOT)
++ * ===========================================================================================
++ *
++ * THE SINGLE SOURCE for this surface's contract. gc-internals.h, the managed bridge in
++ * AssemblyLoadContext.Mono.cs and the lifecycle regressions all POINT HERE rather than
++ * restating it: an earlier revision restated the field catalog in three places and it drifted
++ * between them, which is a maintenance hazard and not a documentation style.
++ *
++ * REMOVAL. This is temporary diagnostic scaffolding, not a supported runtime surface.
++ * TODO(unoplatform/Uno.DotnetRuntime.WebAssembly#176): remove this block, the
++ * InternalGetCondemnedSnapshot icall and its managed bridge, sgen_scan_handles_into_managers
++ * and sgen_gchandle_foreach_slot_bounded once EITHER (a) the residual root is identified and
++ * fixed, so the scaffolding has no remaining job, OR (b) the stop-rule fires: the snapshot is
++ * read across a full stranding repro and attributes nothing -- every handle bucket and the
++ * identity count 0 while live_witnesses is non-zero and the walk did not saturate -- which
++ * rules out a GC handle of the four scanned types and leaves only thread stacks/registers and
++ * native structures, needing collection-time instrumentation this surface cannot provide.
++ * alc_is_condemned and alc_foreach_teardown_manager STAY either way: they are the single
++ * definition of "the managers a teardown would free" and the quiescence gate itself uses them.
++ *
++ * WHY. A downstream WASM host doing repeated collectible-ALC load/unload cycles observes the
++ * teardown reporting NotQuiescent forever: some root keeps the LoaderAllocator witnesses
++ * alive, and an exhaustive managed-side root trace found nothing -- which leaves the roots
++ * managed reflection CANNOT enumerate (raw GCHandles, thread stacks/registers, native
++ * structures). This surface narrows that down without a debugger or a heap dump.
++ *
++ * WHAT IS MEASURED -- and what it does NOT prove. For every live GC handle of the FOUR SCANNED
++ * TYPES (normal, pinned, weak, weak-track-resurrection -- sgen's fifth handle table holds
++ * weak-FIELD registrations rather than user handles and is not walked at all), the target
++ * object is attributed to the condemned set (collectible + unloading contexts) in one of two
++ * ways:
++ *
++ *   CLASS attribution (the four per-handle-type buckets): the TARGET's class belongs to one of
++ *   the condemned memory managers.
++ *
++ *   IDENTITY attribution (identity_handles, class-blind but NOT table-blind -- it too sees only
++ *   handles of those same four scanned types): the TARGET *is* one of the condemned contexts'
++ *   own runtime objects -- the managed AssemblyLoadContext wrapper (which
++ *   PrepareForAssemblyLoadContextRelease deliberately promotes to a STRONG handle while an
++ *   unload is in flight) or a manager's LoaderAllocator witness. Those objects are
++ *   corelib-classed, so class attribution is blind to them by construction; counting them
++ *   separately keeps the runtime's own expected roots distinguishable from third-party ones.
++ *
++ * Attribution is PER HANDLE and NON-TRANSITIVE. A non-zero bucket therefore establishes
++ * "a GC handle DIRECTLY TARGETS an object attributable to the condemned set" -- a NECESSARY,
++ * not sufficient, condition for "a GC handle is the holder". All-zero buckets do NOT establish
++ * that no GC handle is involved: rooting is transitive, and a handle whose immediate target is
++ * corelib-classed while its object graph reaches a condemned instance lands in NO bucket. The
++ * miss classes, enumerated so nobody has to rediscover them:
++ *
++ *   - containers: object[] / List<object> / Dictionary<,> / boxes holding app instances;
++ *   - the reflection-cache family: RuntimeType, RuntimeAssembly, MethodInfo/FieldInfo -- all
++ *     corelib-classed even when they DESCRIBE collectible metadata (this is where a real
++ *     residual root was already found downstream);
++ *   - delegates: Action/Func are corelib types; the target instance and method are not;
++ *   - pinned byte[]/T[] buffers held for interop (element class corelib);
++ *   - a strong handle placed directly on a LoaderAllocator that live_witnesses counts, unless
++ *     it happens to be one of the identity objects identity_handles covers;
++ *   - objects registered in sgen's HANDLE_WEAK_FIELDS table (sgen_register_obj_with_weak_fields):
++ *     that fifth table is outside the scan entirely, so such a registration is invisible to
++ *     every field here -- slots_eligible included, which sums only the four scanned tables;
++ *   - anything reached only through native structures or thread stacks/registers.
++ *
++ * The sibling lifecycle test ForcedUnload_RootedPointerFreeObjects_BlockNativeFree already
++ * demonstrates that BCL-typed roots block the free, i.e. exactly the shape this classification
++ * cannot see. Read these fields as "which handle classes DIRECTLY hold the set, and how many
++ * witnesses are still live" -- a triage funnel, never a proof of absence.
++ *
++ * ONE CALL, ONE TUPLE. Every field is computed and delivered by a SINGLE icall that fills the
++ * caller's buffer: one condemned-set build, one bounded handle walk, one witness count, one
++ * copy out. The runtime keeps NO latched snapshot and NO process-global mutable state for this
++ * surface, so there is nothing a second caller can replace underneath a reader, nothing to
++ * synchronise against, and no read protocol for a caller to get wrong. Consistency is a
++ * property of the TYPE -- a tuple that is filled in one call cannot be torn -- rather than of
++ * caller convention.
++ *
++ * That is deliberate, and it is the SECOND design; the first is recorded here because the
++ * failure mode is not obvious. The fields were originally exposed as separate integer "kinds"
++ * of InternalGetScoutRetirementStats, each read out of a process-global latch, with atomicity
++ * supplied by a caller-side refresh / read-gauges / validate-token protocol and a retry. That
++ * shape produced three distinct defects in review: a mixed-generation read (two logical
++ * callers interleaving, no native thread race needed), a token contract that claimed to be
++ * monotonic while the counter wrapped, and finally a test-only seam that reseeded the
++ * free-running counter while leaving the LATCHED token untouched -- which at the wrap boundary
++ * republished a token a stale reader would accept, re-arming the exact tear the protocol
++ * existed to reject. All three are structurally impossible against a single-call fill, and the
++ * token, the retry loop and the test-only kinds that existed only to make the token's wrap
++ * reachable are gone with them.
++ *
++ * BUFFER CONTRACT. The caller supplies a gint32 buffer and its length; the icall returns the
++ * number of fields it WROTE. It writes ALL of them or NONE:
++ *
++ *   ALC_SNAPSHOT_FIELD_COUNT  the buffer was large enough and is now fully populated;
++ *   0                         the buffer is too small (or NULL) -- NOTHING was written, so a
++ *                             stale buffer stays stale rather than half-updated;
++ *   -1                        the surface is unavailable (threads-enabled build; the whole
++ *                             feature is compiled out by the DISABLE_THREADS hard gate) --
++ *                             again nothing is written.
++ *
++ * -1 therefore means UNAVAILABLE and never "zero". A LIVE surface with an empty condemned set
++ * honestly reports 0 in every count. On a non-sgen collector the set-wide fields are still
++ * computed but the handle walk cannot run, so the fields that depend on it are individually
++ * filled with -1 rather than with a misleading 0.
++ *
++ * Extending the tuple: APPEND a field before ALC_SNAPSHOT_FIELD_COUNT and never renumber, so
++ * an older caller's smaller buffer degrades to "0, nothing written" rather than to a silently
++ * misaligned tuple.
++ *
++ * COST, and the bound that actually holds. The snapshot is O(managers + budget): membership is
++ * a pointer-keyed set, so it does not degrade quadratically as contexts strand -- the state
++ * this diagnostic explains -- and it short-circuits entirely on an empty condemned set. The
++ * handle walk is bounded on RAW SLOTS, not on classified hits, which is the only bound worth
++ * stating: each sgen handle table is an SgenArrayList whose `next_slot` is a persistent
++ * high-water mark that sgen_gchandle_free never lowers (freeing only NULLs a slot), so a table
++ * that once grew large and is now mostly holes stays just as long as it was at its peak. A
++ * budget that merely skipped classification work past N hits would still sweep every one of
++ * those slots, four times over, while every bucket read 0 -- a pause hazard on a single browser
++ * thread, and exactly what an earlier revision of this code did. The budget is instead spent
++ * across the four passes as a cap on slot LOADS, and slots_visited / slots_eligible publish
++ * what the walk actually visited versus what it was eligible to visit, so the bound is
++ * observable rather than merely asserted -- with one honest caveat. slots_visited is counted
++ * INSIDE the loop, one increment per slot load, so the published figure cannot drift from the
++ * loop that produced it; but it is also the ONLY channel through which the bound is observable,
++ * so a regression can pin the reported bound and not the sweep itself. What enforces the sweep
++ * is the loop's range expression in sgen_gchandle_foreach_slot_bounded, reviewed rather than
++ * tested. Truncation sets `saturated` and makes every count a lower bound -- and because the
++ * budget is spent in a fixed table order, it is the LATER buckets that go dark, never the
++ * strong-handle bucket that can actually be the holder.
++ *
++ * The caller CHOOSES the budget, which is what lets a regression reach the truncation path
++ * without allocating a full budget's worth of handles; it is a cost knob, not a test seam, and
++ * every value of it is safe because a smaller budget can only truncate a read-only walk. It is
++ * clamped to ALC_CONDEMNED_HANDLE_SLOT_BUDGET so the pause bound stays a property of the
++ * SURFACE and not of the caller, and a non-positive request means "use the default".
++ *
++ * PURITY. Reading never mutates runtime state: the snapshot is built from the global ALC list
++ * plus each context's own manager arrays, the handle walk writes no slot at all (its callback
++ * returns nothing), and m_class_get_mem_manager is a pure lookup that cannot lazily allocate a
++ * manager (see the PRECONDITION note at sgen_scan_handles_into_managers). Gated exactly like
++ * the rest of the feature: this whole region is DISABLE_THREADS-only, the handle walk
++ * additionally requires sgen, and an unavailable surface reports -1.
++ */
++
++/*
++ * THE FIELD CATALOG -- the one definition of the tuple's layout and meaning. The managed
++ * bridge mirrors these indices (AssemblyLoadContext.Mono.cs) and the regressions index by
++ * them; nothing restates their meaning.
++ *
++ * The four class-attribution buckets are CONTIGUOUS and in the sgen bucket order
++ * { normal, pinned, weak, weak-track-resurrection }, so the fill copies them with one loop.
++ * ALC_SNAPSHOT_STRONG_HANDLES is the base of that run; the static assert below pins it.
++ */
++enum {
++	ALC_SNAPSHOT_MANAGERS_IN_SCOPE = 0,  /* condemned memory managers in scope (denominator) */
++	ALC_SNAPSHOT_LIVE_WITNESSES = 1,     /* of those, whose LoaderAllocator witness is alive */
++	ALC_SNAPSHOT_STRONG_HANDLES = 2,     /* strong (Normal) handles, class-attributed [ROOTING] */
++	ALC_SNAPSHOT_PINNED_HANDLES = 3,     /* pinned handles, class-attributed        [ROOTING] */
++	ALC_SNAPSHOT_WEAK_HANDLES = 4,       /* weak (short) handles              [INFORMATIONAL] */
++	ALC_SNAPSHOT_WEAK_TRACK_HANDLES = 5, /* weak-track-resurrection handles   [INFORMATIONAL] */
++	ALC_SNAPSHOT_IDENTITY_HANDLES = 6,   /* identity-attributed handles; counts HANDLES, not
++	                                      * distinct objects, so a second handle onto the same
++	                                      * wrapper is +1 */
++	ALC_SNAPSHOT_SLOTS_VISITED = 7,      /* raw handle slots the walk loaded */
++	ALC_SNAPSHOT_SLOTS_ELIGIBLE = 8,     /* raw slots it was ELIGIBLE to load; visited < this
++	                                      * is exactly the truncation `saturated` reports */
++	ALC_SNAPSHOT_SATURATED = 9,          /* 1 if the walk hit its raw-slot budget, so every
++	                                      * handle count above is a LOWER BOUND */
++	ALC_SNAPSHOT_FIELD_COUNT = 10        /* APPEND above this line; never renumber */
++};
++
++#define ALC_CONDEMNED_HANDLE_BUCKETS 4
++#if defined(HAVE_SGEN_GC) && (MONO_SGEN_CONDEMNED_HANDLE_BUCKETS != ALC_CONDEMNED_HANDLE_BUCKETS)
++#error "condemned handle bucket count must match the sgen scan contract in gc-internals.h"
++#endif
++
++/*
++ * DEFAULT and MAXIMUM raw-slot budget for the handle walk, spent across all four type passes
++ * (see the COST note above for why the bound has to be on raw slots and not on classified
++ * hits). A caller may ask for less; it may not ask for more, so this is the pause bound the
++ * surface itself guarantees. 200k slot loads is one to two orders of magnitude above the
++ * whole-process handle high-water mark this runtime has ever been measured at, so a healthy
++ * read is never truncated; the cap exists so a table with a pathological history can never
++ * turn a read-only gauge into a long pause on the single browser thread. Exhausting it sets
++ * `saturated` and makes every handle count a lower bound rather than silently understating it.
++ */
++#define ALC_CONDEMNED_HANDLE_SLOT_BUDGET 200000
++
++/* Contexts a teardown could still be pending for: the ONE definition of "condemned", shared by
++ * the kind 8 gauge and the condemned-set snapshot so the two can never drift apart. */
++static gboolean
++alc_is_condemned (MonoAssemblyLoadContext *alc)
++{
++	return alc && alc->collectible && alc->unloading;
++}
++
++/* The manager's LoaderAllocator witness object, or NULL if the witness is dead or was never
++ * materialised. A NULL weak handle means no LoaderAllocator bookkeeping ever existed for that
++ * manager (no vtable/object of it was created), which is quiescent, not live. */
++static MonoObject *
++alc_manager_witness_object (MonoMemoryManager *mm)
++{
++	if (!mm || !mm->loader_allocator_weak_handle)
++		return NULL;
++	return (MonoObject *)mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle);
++}
++
++/* Return FALSE to stop the walk early. */
++typedef gboolean (*AlcManagerVisitFunc) (MonoMemoryManager *mm, gpointer user_data);
++
++/*
++ * Visits EVERY memory manager a teardown of `alc` would free: the primary manager plus each
++ * shared generic manager the context owns, skipping duplicates of the primary. THE single
++ * definition of that set -- the quiescence gate (alc_is_managed_quiescent) and the condemned-set
++ * snapshot both consume it, so the gate can never disagree with the gauge that claims to report
++ * "the exact quantity the gate refuses on".
++ *
++ * NULL-safe on both arrays: mono_alc_cleanup frees and NULLs generic_memory_managers (and the
++ * primary) during teardown, so a read-only gauge racing a tombstoned context must not
++ * dereference them. Tombstoned contexts are IN SCOPE for the walk and simply contribute
++ * nothing once their managers are gone.
++ */
++static gboolean
++alc_foreach_teardown_manager (MonoAssemblyLoadContext *alc, AlcManagerVisitFunc visit, gpointer user_data)
++{
++	MonoMemoryManager *primary_mm = alc->memory_manager;
++	if (primary_mm && !visit (primary_mm, user_data))
++		return FALSE;
++
++	gboolean completed = TRUE;
++	mono_alc_memory_managers_lock (alc);
++	if (alc->generic_memory_managers) {
++		for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
++			MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
++			if (!mm || mm == primary_mm)
++				continue;
++			if (!visit (mm, user_data)) {
++				completed = FALSE;
++				break;
++			}
++		}
++	}
++	mono_alc_memory_managers_unlock (alc);
++	return completed;
++}
++
++static gboolean
++alc_visit_stop_on_live_witness (MonoMemoryManager *mm, gpointer user_data)
++{
++	if (!alc_manager_witness_object (mm))
++		return TRUE;
++	*(gboolean *)user_data = TRUE;
++	return FALSE;
++}
++
++/*
++ * Quiescence gate -- ALL-OR-NOTHING over the exact set of managers a teardown would free.
++ * alc->unloading only means the managed Unload() was requested -- it is NOT proof that the
++ * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
++ * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
++ * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
++ * LoaderAllocator is now held only by managed references; while a manager's weak-handle
++ * target is non-NULL, managed roots remain and freeing would reclaim live memory. This is
++ * exactly the criterion the LoaderAllocatorScout uses.
++ *
++ * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
++ * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
++ * {default, this} manager) keeps that shared witness alive even after the primary witness
++ * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
++ * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
++ * anything is freed -- hence the shared walk above rather than a hand-copied loop. If ANY
++ * witness is live, nothing may be freed.
++ *
++ * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
++ * (which reports NotQuiescent so the host can retry) and the GC-driven scout completion in
++ * LoaderAllocatorScout_Destroy (which simply waits for a later finalization round).
++ */
++static gboolean
++alc_is_managed_quiescent (MonoAssemblyLoadContext *alc)
++{
++	gboolean witness_live = FALSE;
++	alc_foreach_teardown_manager (alc, alc_visit_stop_on_live_witness, &witness_live);
++	return !witness_live;
++}
++
++typedef struct {
++	GHashTable *managers;        /* set: MonoMemoryManager* */
++	GHashTable *witness_objects; /* set: MonoObject* identities */
++	gint32 managers_in_scope;
++	gint32 live_witnesses;
++} AlcCondemnedSetBuild;
++
++static gboolean
++alc_condemned_set_visit (MonoMemoryManager *mm, gpointer user_data)
++{
++	AlcCondemnedSetBuild *build = (AlcCondemnedSetBuild *)user_data;
++
++	/* A shared generic manager can be owned by one context and listed by another; count and
++	 * store it once so managers_in_scope is a manager count, not a membership-edge count. */
++	if (g_hash_table_contains (build->managers, mm))
++		return TRUE;
++	g_hash_table_insert (build->managers, mm, mm);
++	build->managers_in_scope++;
++
++	MonoObject *witness = alc_manager_witness_object (mm);
++	if (witness) {
++		build->live_witnesses++;
++		g_hash_table_insert (build->witness_objects, witness, witness);
++	}
++	return TRUE;
++}
++
++/*
++ * Compute one condemned-set snapshot and write it to the caller's buffer. Returns the number
++ * of fields written: ALC_SNAPSHOT_FIELD_COUNT on success, 0 if the buffer cannot hold the
++ * whole tuple (see the BUFFER CONTRACT note; it is all-or-nothing on purpose, so a rejected
++ * call leaves a stale buffer stale rather than half-updated).
++ *
++ * There is no latch and no static state: every value below lives in this frame until it is
++ * copied out, which is what makes the tuple untearable and why this surface needs no read
++ * protocol. `slot_budget` is the caller's RAW-slot cap, clamped here so the walk's pause bound
++ * is a property of the surface rather than of the caller; <= 0 means "use the default".
++ *
++ * The identity set holds raw MonoObject* between the ALC-list walk and the handle walk: safe
++ * here and only here, because nothing in between allocates managed memory or reaches a
++ * safepoint (the set uses native malloc), and this build has no other thread that could start
++ * a collection -- so no object can be relocated mid-snapshot. Nothing retains those pointers
++ * past the return.
++ *
++ * LOCK NESTING: alcs_lock is held across alc_foreach_teardown_manager, which takes a context's
++ * memory-managers lock beneath it. That is the only direction this file ever nests the two
++ * (mono_alc_cleanup takes the managers lock under the loader lock, never under alcs_lock), and
++ * no lock is held across the handle walk itself. On this DISABLE_THREADS-only build there is no
++ * second thread to invert it against; the ordering is stated so it stays that way.
++ */
++static int
++alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
++{
++	/* The four class buckets must be a contiguous run in sgen's table order, because the copy
++	 * below is a single loop over it, and the tuple must have room for every field. */
++	g_static_assert (ALC_SNAPSHOT_WEAK_TRACK_HANDLES - ALC_SNAPSHOT_STRONG_HANDLES + 1 == ALC_CONDEMNED_HANDLE_BUCKETS);
++	g_static_assert (ALC_SNAPSHOT_STRONG_HANDLES + ALC_CONDEMNED_HANDLE_BUCKETS <= ALC_SNAPSHOT_FIELD_COUNT);
++
++	if (!fields || length < ALC_SNAPSHOT_FIELD_COUNT)
++		return 0;
++
++	AlcCondemnedSetBuild build;
++	build.managers = g_hash_table_new (g_direct_hash, g_direct_equal);
++	build.witness_objects = g_hash_table_new (g_direct_hash, g_direct_equal);
++	build.managers_in_scope = 0;
++	build.live_witnesses = 0;
++
++	alcs_lock ();
++	for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
++		MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)tmp->data;
++		if (!alc_is_condemned (alc))
++			continue;
++
++		/* The managed wrapper: PrepareForAssemblyLoadContextRelease swapped this handle to
++		 * STRONG when the unload was requested, so it is a real root -- and corelib-classed,
++		 * hence invisible to class attribution. Identity catches it. */
++		if (alc->gchandle) {
++			MonoObject *wrapper = (MonoObject *)mono_gchandle_get_target_internal (alc->gchandle);
++			if (wrapper)
++				g_hash_table_insert (build.witness_objects, wrapper, wrapper);
++		}
++
++		alc_foreach_teardown_manager (alc, alc_condemned_set_visit, &build);
++	}
++	alcs_unlock ();
++
++	fields [ALC_SNAPSHOT_MANAGERS_IN_SCOPE] = build.managers_in_scope;
++	fields [ALC_SNAPSHOT_LIVE_WITNESSES] = build.live_witnesses;
++
++#ifdef HAVE_SGEN_GC
++	/* The caller's cost knob, clamped: a smaller budget only truncates a read-only walk (and
++	 * says so through `saturated`), while a larger one must not be able to lift the pause
++	 * bound this surface promises. */
++	gint32 budget = (slot_budget <= 0 || slot_budget > ALC_CONDEMNED_HANDLE_SLOT_BUDGET)
++			? ALC_CONDEMNED_HANDLE_SLOT_BUDGET : slot_budget;
++
++	MonoSgenCondemnedHandleScan scan;
++	memset (&scan, 0, sizeof (scan));
++	scan.condemned_managers = build.managers;
++	scan.condemned_objects = build.witness_objects;
++	scan.slot_budget = budget;
++	sgen_scan_handles_into_managers (&scan);
++
++	for (int i = 0; i < ALC_CONDEMNED_HANDLE_BUCKETS; ++i)
++		fields [ALC_SNAPSHOT_STRONG_HANDLES + i] = scan.class_hits [i];
++	fields [ALC_SNAPSHOT_IDENTITY_HANDLES] = scan.identity_hits;
++	fields [ALC_SNAPSHOT_SLOTS_VISITED] = scan.slots_visited;
++	fields [ALC_SNAPSHOT_SLOTS_ELIGIBLE] = scan.slots_eligible;
++	fields [ALC_SNAPSHOT_SATURATED] = scan.saturated ? 1 : 0;
++#else
++	/* No sgen: the set-wide fields above are still honest, but nothing here can walk a handle
++	 * table, so the fields that depend on the walk report UNAVAILABLE rather than a 0 that
++	 * would read as "no such handle exists". */
++	(void)slot_budget;
++	for (int i = 0; i < ALC_CONDEMNED_HANDLE_BUCKETS; ++i)
++		fields [ALC_SNAPSHOT_STRONG_HANDLES + i] = -1;
++	fields [ALC_SNAPSHOT_IDENTITY_HANDLES] = -1;
++	fields [ALC_SNAPSHOT_SLOTS_VISITED] = -1;
++	fields [ALC_SNAPSHOT_SLOTS_ELIGIBLE] = -1;
++	fields [ALC_SNAPSHOT_SATURATED] = -1;
++#endif
++
++	g_hash_table_destroy (build.witness_objects);
++	g_hash_table_destroy (build.managers);
++
++	return ALC_SNAPSHOT_FIELD_COUNT;
++}
++
+ static void
+ retired_scout_targets_add (MonoMemoryManager *memory_manager)
+ {
+@@ -493,56 +908,6 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_PrepareForAssemblyLoadContex
+ 	mono_alc_memory_managers_unlock (alc);
+ }
+ 
+-#ifdef DISABLE_THREADS
+-/*
+- * Quiescence gate — ALL-OR-NOTHING over the exact set of managers a teardown would free.
+- * alc->unloading only means the managed Unload() was requested — it is NOT proof that the
+- * collectible LoaderAllocators have been collected. Stack frames, shared-generic type
+- * arguments, delegates and runtime handles can still root them (dotnet/runtime#40394,
+- * #34072). mono_mem_manager_start_unload already dropped the strong handles, so each
+- * LoaderAllocator is now held only by managed references; while a manager's weak-handle
+- * target is non-NULL, managed roots remain and freeing would reclaim live memory. This is
+- * exactly the criterion the LoaderAllocatorScout uses.
+- *
+- * Every shared/generic memory manager has its OWN LoaderAllocator witness: a live
+- * cross-context constructed generic (e.g. an instance whose vtable lives in a shared
+- * {default, this} manager) keeps that shared witness alive even after the primary witness
+- * has cleared. mono_alc_cleanup deletes the primary manager AND every shared generic
+- * manager on alc->generic_memory_managers, so each of those witnesses must be dead before
+- * anything is freed. If ANY witness is live, nothing may be freed. A NULL weak handle
+- * means no LoaderAllocator bookkeeping was ever materialised for that manager (no
+- * vtable/object of it ever existed), which is safe to free.
+- *
+- * Shared by the two teardown initiators: the host-triggered InternalForceNativeUnload
+- * below (which reports NotQuiescent so the host can retry) and the GC-driven scout
+- * completion in LoaderAllocatorScout_Destroy (which simply waits for a later finalization
+- * round).
+- */
+-static gboolean
+-alc_is_managed_quiescent (MonoAssemblyLoadContext *alc)
+-{
+-	MonoMemoryManager *primary_mm = alc->memory_manager;
+-	if (primary_mm && primary_mm->loader_allocator_weak_handle &&
+-			mono_gchandle_get_target_internal (primary_mm->loader_allocator_weak_handle) != NULL)
+-		return FALSE;
+-
+-	gboolean witness_live = FALSE;
+-	mono_alc_memory_managers_lock (alc);
+-	for (guint i = 0; i < alc->generic_memory_managers->len; i++) {
+-		MonoMemoryManager *mm = (MonoMemoryManager *)g_ptr_array_index (alc->generic_memory_managers, i);
+-		if (mm == primary_mm)
+-			continue;
+-		if (mm->loader_allocator_weak_handle &&
+-				mono_gchandle_get_target_internal (mm->loader_allocator_weak_handle) != NULL) {
+-			witness_live = TRUE;
+-			break;
+-		}
+-	}
+-	mono_alc_memory_managers_unlock (alc);
+-	return !witness_live;
+-}
+-#endif /* DISABLE_THREADS */
+-
+ int
+ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (gpointer alc_pointer, MonoError *error)
+ {
+@@ -666,6 +1031,11 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 	 * re-registered. Behind the DISABLE_THREADS gate like kinds 0/1. Distinguishes "the
+ 	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
+ 	 * counter while kind 7 stays flat.
++	 *
++	 * Kinds 11-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
++	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
++	 * reasons in the "Root classification for condemned collectible contexts" block at the top
++	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
+ 	 */
+ 	if (kind == 2 || kind == 3)
+ 		return mono_weak_hash_table_key_value_handle_stats (kind - 2);
+@@ -690,8 +1060,9 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 		int pending = 0;
+ 		alcs_lock ();
+ 		for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
+-			MonoAssemblyLoadContext *a = (MonoAssemblyLoadContext *)tmp->data;
+-			if (a && a->collectible && a->unloading)
++			/* Same alc_is_condemned predicate the condemned-set snapshot uses, so this
++			 * context gauge and that manager gauge can never disagree about scope. */
++			if (alc_is_condemned ((MonoAssemblyLoadContext *)tmp->data))
+ 				pending++;
+ 		}
+ 		alcs_unlock ();
+@@ -707,6 +1078,35 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ #endif
+ }
+ 
++/*
++ * Condemned-set root-classification SNAPSHOT: fills `buffer` with ALC_SNAPSHOT_FIELD_COUNT
++ * gint32 fields describing which classes of GC handle directly hold the collectible contexts
++ * a teardown is still pending for. The whole contract -- what the fields mean, what they do
++ * NOT prove, the buffer protocol, the budget and the removal plan -- is the "Root
++ * classification for condemned collectible contexts" block at the top of this file, which is
++ * its single source; nothing is restated here.
++ *
++ * Deliberately its OWN icall rather than more kinds of InternalGetScoutRetirementStats: the
++ * tuple has to arrive in ONE call, because atomicity supplied by caller convention across
++ * several single-integer reads is what produced this surface's earlier defects.
++ *
++ * Returns the number of fields written (ALC_SNAPSHOT_FIELD_COUNT), 0 if the buffer is too
++ * small, or -1 where the feature is compiled out.
++ */
++int
++ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetCondemnedSnapshot (gpointer buffer, gint32 length, gint32 slot_budget, MonoError *error)
++{
++#ifdef DISABLE_THREADS
++	return alc_condemned_snapshot_fill ((gint32 *)buffer, length, slot_budget);
++#else
++	/* Compiled out by the DISABLE_THREADS hard gate: report UNAVAILABLE and write nothing. */
++	(void)buffer;
++	(void)length;
++	(void)slot_budget;
++	return -1;
++#endif
++}
++
+ #if defined(HOST_BROWSER) && defined(DISABLE_THREADS)
+ /*
+  * Implemented in mini/interp/jiterpreter.c, which is only built for the browser runtime
+diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
+index f014167..1c51c11 100644
+--- a/src/mono/mono/metadata/gc-internals.h
++++ b/src/mono/mono/metadata/gc-internals.h
+@@ -431,4 +431,65 @@ extern gchar **mono_do_not_finalize_class_names;
+ MONO_COMPONENT_API void mono_stop_world (MonoThreadInfoFlags flags);
+ MONO_COMPONENT_API void mono_restart_world (MonoThreadInfoFlags flags);
+ 
++#if defined(HAVE_SGEN_GC) && defined(DISABLE_THREADS)
++/*
++ * Read-only GC-handle classification for the host-triggered collectible AssemblyLoadContext
++ * unload diagnostics. Implemented in sgen-mono.c; the canonical rationale, the attribution
++ * CONTRACT and its documented blind spots live with the sole consumer, in the "Root
++ * classification for condemned collectible contexts" block of assembly-load-context.c.
++ *
++ * Gated on DISABLE_THREADS as well as the collector: the walk needs exclusive access to the
++ * handle tables, which it obtains from the single-threaded browser runtime rather than by
++ * stopping the world (see the PRECONDITION note at the definition). A threads-enabled or Boehm
++ * build has neither the declaration nor the definition, and the consumer reports the affected
++ * stat kinds as unavailable (-1).
++ */
++
++#define MONO_SGEN_CONDEMNED_HANDLE_BUCKETS 4
++
++typedef struct {
++	/* IN: set of condemned MonoMemoryManager* -- keys only, direct-pointer hashed, so
++	 * membership is O(1) however many contexts are stranded. Sets rather than arrays: the
++	 * pointer types stay honest at the caller (this header must not name loader-internals
++	 * types) without erasing them to a gpointer* array. */
++	GHashTable *condemned_managers;
++	/* IN: set of MonoObject* identities -- the condemned contexts' own managed wrapper objects
++	 * and LoaderAllocator witnesses. These are corelib-classed, so only identity can attribute
++	 * them. Valid for the duration of the call only (a moving collector may relocate them
++	 * afterwards); never retain this set across a GC. */
++	GHashTable *condemned_objects;
++	/* IN: cap on RAW handle slots VISITED, shared by every type pass. MUST be > 0 (asserted):
++	 * an "unbounded" mode is deliberately not offered, because the whole point of this scan is
++	 * that a synchronous diagnostic on a single browser thread has a bound. The cap bounds the
++	 * pointer sweep itself, not merely the per-slot classification work, so the walk cannot be
++	 * dragged out by a table's persistent high-water mark. Once a pass is cut short -- or a later
++	 * pass never starts because the shared budget is spent -- every count below is a LOWER BOUND
++	 * and `saturated` is set. */
++	gint32 slot_budget;
++
++	/* OUT: handles whose target's CLASS belongs to condemned_managers, per handle type, in the
++	 * order { strong (Normal), pinned, weak (short), weak-track-resurrection }. These FOUR
++	 * tables are the entire scope of the scan: sgen's fifth handle table, HANDLE_WEAK_FIELDS
++	 * (objects registered by sgen_register_obj_with_weak_fields, not user GCHandles), is NOT
++	 * walked and contributes to no count below, including slots_eligible. */
++	gint32 class_hits [MONO_SGEN_CONDEMNED_HANDLE_BUCKETS];
++	/* OUT: handles of ANY of the four scanned types (see class_hits) whose target IS a member of
++	 * condemned_objects. "Any type" only ever means those four: this counter is class-blind, not
++	 * table-blind, so HANDLE_WEAK_FIELDS registrations are outside its scope exactly as they are
++	 * outside class_hits' and slots_eligible's. */
++	gint32 identity_hits;
++	/* OUT: RAW slots visited, empty and metadata slots INCLUDED -- they cost the same pointer
++	 * load as an occupied one, and that load is what slot_budget exists to bound. */
++	gint32 slots_visited;
++	/* OUT: combined high-water mark of the scanned tables, i.e. how many raw slots the walk was
++	 * ELIGIBLE to visit had the budget been unlimited. slots_visited < slots_eligible is
++	 * precisely the truncation `saturated` reports. */
++	gint32 slots_eligible;
++	/* OUT: TRUE when slot_budget cut the sweep short (see slot_budget). */
++	gboolean saturated;
++} MonoSgenCondemnedHandleScan;
++
++void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
++#endif
++
+ #endif /* __MONO_METADATA_GC_INTERNAL_H__ */
+diff --git a/src/mono/mono/metadata/icall-def.h b/src/mono/mono/metadata/icall-def.h
+index 340ea53..aabc741 100644
+--- a/src/mono/mono/metadata/icall-def.h
++++ b/src/mono/mono/metadata/icall-def.h
+@@ -473,6 +473,7 @@ NOHANDLES(ICALL(X86BASE_1, "__cpuidex", ves_icall_System_Runtime_Intrinsics_X86_
+ ICALL_TYPE(ALC, "System.Runtime.Loader.AssemblyLoadContext", ALC_5)
+ HANDLES(ALC_5, "GetLoadContextForAssembly", ves_icall_System_Runtime_Loader_AssemblyLoadContext_GetLoadContextForAssembly, gpointer, 1, (MonoReflectionAssembly))
+ HANDLES(ALC_7, "InternalForceNativeUnload", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload, int, 1, (gpointer))
++HANDLES(ALC_11, "InternalGetCondemnedSnapshot", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetCondemnedSnapshot, int, 3, (gpointer, gint32, gint32))
+ HANDLES(ALC_9, "InternalGetJiterpreterTableStat", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetJiterpreterTableStat, int, 2, (int, int))
+ HANDLES(ALC_4, "InternalGetLoadedAssemblies", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetLoadedAssemblies, MonoArray, 0, ())
+ HANDLES(ALC_8, "InternalGetScoutRetirementStats", ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementStats, int, 1, (gint32))
+diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
+index e7611b1..fd4e6e5 100644
+--- a/src/mono/mono/metadata/sgen-mono.c
++++ b/src/mono/mono/metadata/sgen-mono.c
+@@ -1901,6 +1901,171 @@ mono_gc_walk_heap (int flags, MonoGCReferences callback, void *data)
+ 	return 0;
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * GC-handle classification for the host-triggered collectible AssemblyLoadContext unload
++ * diagnostics. The canonical rationale, the exact attribution CONTRACT and its documented
++ * blind spots live with the consumer, in the "Root classification for condemned collectible
++ * contexts" block of assembly-load-context.c; this file only implements the sgen walk.
++ *
++ * In one line: for every live GC handle OF THE FOUR SCANNED TYPES (normal, pinned, weak,
++ * weak-track-resurrection), report whether its TARGET object is attributable to the condemned
++ * set, either because the target's class belongs to one of the condemned memory managers
++ * (bucketed by handle type) or because the target IS one of the condemned contexts' own runtime
++ * objects (identity). sgen's fifth table, HANDLE_WEAK_FIELDS, is NOT walked: it holds objects
++ * registered by sgen_register_obj_with_weak_fields rather than user GCHandles. Attribution is
++ * per-handle and NON-transitive: a handle on a container that merely REFERENCES a condemned
++ * instance is not attributed. See the consumer's contract block for the enumerated miss classes.
++ *
++ * Read-only in the strict sense: the walk goes through sgen_gchandle_foreach_slot_bounded,
++ * whose callback returns nothing and whose slots are never written back -- no self-store, no
++ * dislink protocol update, nothing for the collector to observe.
++ *
++ * BOUNDED, which sgen_gchandle_iterate is NOT. That iterator walks each table to its
++ * persistent `next_slot` high-water mark -- a mark sgen_gchandle_free never lowers, since
++ * freeing only NULLs a slot -- and its callback cannot stop it. A table that once grew large and
++ * is now mostly holes would therefore be swept end to end on every read, once per type pass,
++ * regardless of how few handles are actually classified. Since this runs synchronously on the
++ * single browser thread at a host's request, that is a pause hazard, not merely wasted work.
++ * sgen_gchandle_foreach_slot_bounded instead clamps the RAW slot range and reports the mark it
++ * was eligible to cover, and the loop below spends ONE budget across all four passes: total
++ * work is scan->slot_budget raw slots, whatever the tables' history. Truncation is reported as
++ * scan->saturated so the counts are read as lower bounds rather than as facts.
++ *
++ * PRECONDITION, asserted rather than argued in prose. The handle tables must not be mutated
++ * underneath the walk. A multi-threaded runtime would get that from a collection pause (which
++ * is why sgen_gchandle_iterate is annotated MONO_PERMIT (need (sgen_world_stopped))); this
++ * entry point is compiled only for the single-threaded browser runtime (DISABLE_THREADS), so
++ * "no other mutator can touch the tables" holds by construction -- and because the walk writes
++ * nothing, it needs no permit of its own. What remains to be guaranteed is that the COLLECTOR
++ * is not midway through rewriting slots underneath us, and that the walk is not re-entered.
++ * Both are asserted below instead of assumed.
++ *
++ * Dereferencing a target's vtable is safe for the same reason the forced teardown is: a
++ * memory manager is only freed once its whole witness set is dead, so no live object can
++ * outlive its own class's memory manager. m_class_get_mem_manager is a pure lookup -- a
++ * generic-instance owner pointer, an array's element-class recursion, or the class's image ALC
++ * (falling back to the default ALC's manager for dynamic assemblies) -- so it cannot lazily
++ * allocate a manager mid-walk, which is what makes "read-only" true of the whole operation
++ * and not merely of the handle slots.
++ */
++
++/* Re-entrancy guard for the assert below (single-threaded build: no atomics needed). */
++static gboolean sgen_condemned_scan_in_progress;
++
++typedef struct {
++	MonoSgenCondemnedHandleScan *scan;
++	int bucket;
++} SgenCondemnedScanCtx;
++
++static void
++sgen_condemned_handle_visit (gpointer hidden, GCHandleType handle_type, gpointer user)
++{
++	SgenCondemnedScanCtx *ctx = (SgenCondemnedScanCtx *)user;
++	MonoSgenCondemnedHandleScan *scan = ctx->scan;
++
++	/* No liveness filtering and no generation filtering: every live handle counts. Skip empty
++	 * slots and slots holding a metadata (non-object) pointer -- those are still counted as
++	 * VISITED by the bounded walk, because the budget bounds the sweep, not the hits. */
++	if (!MONO_GC_HANDLE_VALID (hidden) || !MONO_GC_HANDLE_IS_OBJECT_POINTER (hidden))
++		return;
++
++	GCObject *obj = (GCObject *)MONO_GC_REVEAL_POINTER (hidden, GC_HANDLE_TYPE_IS_WEAK (handle_type));
++	if (!obj)
++		return;
++
++	/*
++	 * Identity attribution, checked FIRST and class-blind: the condemned contexts' own
++	 * runtime objects (the managed AssemblyLoadContext wrapper and each manager's
++	 * LoaderAllocator witness) are corelib-classed, so class attribution cannot see them --
++	 * yet a strong handle on one is exactly what pins a teardown (the runtime itself installs
++	 * such a handle when a managed Unload is requested). Counted separately so the caller can
++	 * tell the runtime's own expected roots from third-party ones.
++	 */
++	if (scan->condemned_objects && g_hash_table_contains (scan->condemned_objects, obj)) {
++		/* PER HANDLE, not per object: two handles onto the same wrapper count twice. */
++		scan->identity_hits++;
++		return;
++	}
++
++	if (!scan->condemned_managers)
++		return;
++
++	MonoVTable *vtable = (MonoVTable *)SGEN_LOAD_VTABLE (obj);
++	if (!vtable || !vtable->klass)
++		return;
++
++	MonoMemoryManager *mm = m_class_get_mem_manager (vtable->klass);
++	/* O(1) membership: a set keyed on the manager POINTER, so cost stays linear in handles
++	 * however many contexts are stranded (a per-handle scan over the manager list would
++	 * degrade quadratically in exactly the stranded state this diagnostic exists to explain). */
++	if (mm && g_hash_table_contains (scan->condemned_managers, mm))
++		scan->class_hits [ctx->bucket]++;
++}
++
++void
++sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
++{
++	static const GCHandleType bucket_types [MONO_SGEN_CONDEMNED_HANDLE_BUCKETS] =
++		{ HANDLE_NORMAL, HANDLE_PINNED, HANDLE_WEAK, HANDLE_WEAK_TRACK };
++
++	/* Internal API, but a NULL out-parameter must never be written through. */
++	if (!scan)
++		return;
++
++	for (int i = 0; i < MONO_SGEN_CONDEMNED_HANDLE_BUCKETS; ++i)
++		scan->class_hits [i] = 0;
++	scan->identity_hits = 0;
++	scan->slots_visited = 0;
++	scan->slots_eligible = 0;
++	scan->saturated = FALSE;
++
++	/* Nothing to attribute to: skip the sweep entirely rather than walking every handle
++	 * table to accumulate zeroes. Nothing was ELIGIBLE either, because no walk ran. */
++	guint n_managers = scan->condemned_managers ? g_hash_table_size (scan->condemned_managers) : 0;
++	guint n_objects = scan->condemned_objects ? g_hash_table_size (scan->condemned_objects) : 0;
++	if (n_managers == 0 && n_objects == 0)
++		return;
++
++	/* See PRECONDITION above: not inside a collection pause (the collector is not rewriting
++	 * handle slots underneath the walk), and not re-entered. */
++	g_assert (sgen_get_current_collection_generation () == -1);
++	g_assert (!sgen_condemned_scan_in_progress);
++	sgen_condemned_scan_in_progress = TRUE;
++
++	/*
++	 * ONE raw-slot budget shared by all four type passes, so the bound is on the WHOLE
++	 * operation rather than on each pass: total work is `budget` slot loads even if every
++	 * table carries a huge historical high-water mark. The budget is spent in the FIXED order
++	 * of bucket_types, so under saturation the LATER buckets are the ones that go dark -- kind
++	 * 11 (strong), the one that can actually be the holder, is always the first served. A pass
++	 * that gets a spent budget visits nothing and contributes 0 to its bucket, which is exactly
++	 * why `saturated` must be surfaced: those zeroes are not "no such handle exists".
++	 *
++	 * No unbounded mode: a synchronous read-only gauge on the single browser thread has a bound
++	 * by construction, so a non-positive budget is a caller bug rather than a mode.
++	 */
++	g_assert (scan->slot_budget > 0);
++	guint32 budget = (guint32)scan->slot_budget;
++
++	SgenCondemnedScanCtx ctx;
++	ctx.scan = scan;
++	for (int i = 0; i < MONO_SGEN_CONDEMNED_HANDLE_BUCKETS; ++i) {
++		guint32 high_water = 0;
++		guint32 remaining = budget - (guint32)scan->slots_visited;
++		ctx.bucket = i;
++		guint32 visited = sgen_gchandle_foreach_slot_bounded (bucket_types [i], remaining, &high_water,
++				sgen_condemned_handle_visit, &ctx);
++		scan->slots_visited += (gint32)visited;
++		scan->slots_eligible += (gint32)high_water;
++		if (visited < high_water)
++			scan->saturated = TRUE;
++	}
++
++	sgen_condemned_scan_in_progress = FALSE;
++}
++#endif /* DISABLE_THREADS */
++
+ /*
+  * Threads
+  */
+diff --git a/src/mono/mono/sgen/sgen-gc.h b/src/mono/mono/sgen/sgen-gc.h
+index 3e4d208..cf5c5ac 100644
+--- a/src/mono/mono/sgen/sgen-gc.h
++++ b/src/mono/mono/sgen/sgen-gc.h
+@@ -1081,6 +1081,37 @@ guint32 sgen_gchandle_new (GCObject *obj, gboolean pinned);
+ guint32 sgen_gchandle_new_weakref (GCObject *obj, gboolean track_resurrection);
+ void sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandleIterateCallback callback, gpointer user)
+ 	MONO_PERMIT (need (sgen_world_stopped));
++#ifdef DISABLE_THREADS
++/*
++ * Read-only, RAW-SLOT-BOUNDED walk over one handle table, for the collectible-ALC unload
++ * diagnostics (see sgen_scan_handles_into_managers in sgen-mono.c).
++ *
++ * Differs from sgen_gchandle_iterate in the two ways that matter to a diagnostic running on a
++ * browser main thread:
++ *
++ *   * BOUNDED. sgen_gchandle_iterate always walks the table to its persistent `next_slot`
++ *     high-water mark, which sgen_gchandle_free never lowers, and its callback cannot stop it.
++ *     This entry point walks at most `max_slots` raw slots and reports the (unclamped) mark it
++ *     was eligible to cover through `out_high_water`, so the caller can bound total work across
++ *     several tables AND tell that it truncated.
++ *   * READ-ONLY. The callback returns nothing and no slot is ever written back, so there is no
++ *     self-store and no dislink protocol update -- hence no need for the world to be stopped,
++ *     which is why this one carries no MONO_PERMIT requirement. Exclusive access to the tables
++ *     comes from the single-threaded (DISABLE_THREADS) runtime this is compiled for; the caller
++ *     additionally asserts that no collection is in progress.
++ *
++ * Returns the number of raw slots visited, COUNTED IN THE LOOP rather than restated from the
++ * bound -- empty and metadata slots included, since they cost the same pointer load as an
++ * occupied one and bounding that load is the entire point. Counting it in the loop keeps the
++ * published figure from drifting away from the loop that produced it; it does NOT make a
++ * miscounting implementation detectable from outside, because this return value is the only
++ * channel through which the bound is observable at all. See the note at the definition.
++ */
++typedef void (*SgenGCHandleReadOnlyCallback) (gpointer hidden, GCHandleType handle_type, gpointer user);
++
++guint32 sgen_gchandle_foreach_slot_bounded (GCHandleType handle_type, guint32 max_slots, guint32 *out_high_water,
++		SgenGCHandleReadOnlyCallback callback, gpointer user);
++#endif
+ void sgen_gchandle_set_target (guint32 gchandle, GCObject *obj);
+ void sgen_mark_normal_gc_handles (void *addr, SgenUserMarkFunc mark_func, void *gc_data)
+ 	MONO_PERMIT (need (sgen_world_stopped));
+diff --git a/src/mono/mono/sgen/sgen-gchandles.c b/src/mono/mono/sgen/sgen-gchandles.c
+index f869775..80918e6 100644
+--- a/src/mono/mono/sgen/sgen-gchandles.c
++++ b/src/mono/mono/sgen/sgen-gchandles.c
+@@ -239,6 +239,76 @@ sgen_gchandle_iterate (GCHandleType handle_type, int max_generation, SgenGCHandl
+ 	} SGEN_ARRAY_LIST_END_FOREACH_SLOT;
+ }
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Read-only, raw-slot-bounded walk over one handle table. Contract, and why it exists next to
++ * sgen_gchandle_iterate rather than reusing it, in the declaration comment in sgen-gc.h.
++ */
++guint32
++sgen_gchandle_foreach_slot_bounded (GCHandleType handle_type, guint32 max_slots, guint32 *out_high_water,
++		SgenGCHandleReadOnlyCallback callback, gpointer user)
++{
++	if (out_high_water)
++		*out_high_water = 0;
++
++	HandleData *handle_data = gc_handles_for_type (handle_type);
++	if (!handle_data || !callback)
++		return 0;
++
++	SgenArrayList *array = &handle_data->entries_array;
++
++	/*
++	 * `next_slot` is the table's PERSISTENT high-water mark, not its live population:
++	 * sgen_gchandle_free merely NULLs a slot, and sgen_array_list_add refills holes via
++	 * sgen_array_list_find_unset without ever lowering the mark. A table that once grew large
++	 * and is now mostly holes therefore stays just as LONG as it was at its peak, for the
++	 * lifetime of the process. Clamping the RAW slot range here -- rather than only skipping
++	 * per-slot work once a budget is spent -- is what makes the walk's cost a function of the
++	 * budget instead of the historical peak.
++	 *
++	 * The mark is reported UNCLAMPED and the loop bound is clamped separately. Should
++	 * next_slot ever exceed capacity (it cannot today -- see sgen_array_list_add /
++	 * sgen_array_list_alloc_block), the skipped tail then shows up as visited < high_water,
++	 * i.e. as saturation, rather than as a silent omission the caller cannot see.
++	 */
++	guint32 high_water = array->next_slot;
++	if (out_high_water)
++		*out_high_water = high_water;
++
++	guint32 end = high_water;
++	guint32 capacity = array->capacity;
++	if (end > capacity)
++		end = capacity;
++	if (end > max_slots)
++		end = max_slots;
++
++	/*
++	 * COUNTED IN THE LOOP, deliberately, rather than returned as the precomputed `end`, so the
++	 * figure the caller publishes cannot silently disagree with the loop that produced it.
++	 *
++	 * Be clear about what that does NOT buy, because it is tempting to overclaim: this counter is
++	 * the ONLY channel through which the bound is observable from managed code, so no regression
++	 * test can tell a correctly bounded sweep from one that walks further and reports the bound
++	 * anyway. (Verified, not assumed: a probe that did exactly that passed the whole suite.) What
++	 * actually enforces the bound is the range of the loop below -- `end`, a single reviewable
++	 * expression -- and the fact that the same loop both walks and counts. The regression pins the
++	 * REPORTED bound, which is what catches the shape this replaced, where the budget did not
++	 * clamp the range at all.
++	 */
++	guint32 visited = 0;
++	volatile gpointer *slot;
++	guint32 index;
++	SGEN_ARRAY_LIST_FOREACH_SLOT_RANGE (array, 0, end, slot, index) {
++		gpointer hidden = *slot;
++		visited++;
++		if (MONO_GC_HANDLE_OCCUPIED (hidden))
++			callback (hidden, handle_type, user);
++	} SGEN_ARRAY_LIST_END_FOREACH_SLOT_RANGE;
++
++	return visited;
++}
++#endif /* DISABLE_THREADS */
++
+ guint32
+ sgen_gchandle_new (GCObject *obj, gboolean pinned)
+ {
+-- 
+2.53.0.vfs.0.0
+

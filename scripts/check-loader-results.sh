@@ -42,8 +42,11 @@ executed=$((passed + failed))
 
 echo "[$label] mode=$mode passed=$passed failed=$failed skipped=$skipped executed(passed+failed)=$executed"
 
-# A real threshold on EXECUTED (non-skipped) tests: a vacuous or all-skipped run must fail.
-MIN_EXECUTED=25
+# A real threshold on EXECUTED (non-skipped) tests: a vacuous or all-skipped run must fail. Kept
+# meaningfully close to the observed count (47 on the ST legs, 48 on MT at the time of writing) so
+# a partial run cannot slip through, with enough headroom that adding or splitting a test does not
+# require touching this line. Raise it whenever the required list below grows substantially.
+MIN_EXECUTED=44
 if [ "$executed" -lt "$MIN_EXECUTED" ]; then
   echo "[$label] FAIL: only $executed non-skipped tests executed (< $MIN_EXECUTED); a skipped/vacuous run is not a pass."
   exit 1
@@ -73,6 +76,11 @@ Unload_DroppedRootsWithoutAnyForcedAttempt_AlcIsCollectible
 ForcedUnload_RetryAfterRootsDropped_CompletesWithZeroResidual
 RepeatedUnloadWithoutRetry_NativeStructPopulationReturnsToBaseline
 ScoutCompletion_LatchesBaseFields_WhenSubclassHidesThem
+CondemnedHandleClassification_ReportsHoldingHandleByType
+CondemnedSnapshot_SingleCallTuple_CannotBeTornByACompetingCaller
+CondemnedSnapshot_BufferContract_IsAllOrNothing
+CondemnedHandleWalk_SaturationFlag_IsSetWhenTheRawBudgetIsCrossed
+CondemnedHandleWalk_RawSlotBudget_StopsShortOfAHoleyTablesHighWaterMark
 "
 if [ "$mode" = "mt" ]; then
   # The threads-enabled rejection test is [ConditionalFact(IsThreadingSupported)]: it self-skips
