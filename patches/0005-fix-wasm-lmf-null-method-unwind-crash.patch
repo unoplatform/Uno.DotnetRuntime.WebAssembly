@@ -1,5 +1,5 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Studio Live <noreply@platform.uno>
+From: Jerome Laban <noreply@platform.uno>
 Date: Wed, 09 Apr 2026 00:00:00 +0000
 Subject: [PATCH] fix: handle NULL method in LMF during WASM exception
  unwinding
@@ -19,8 +19,6 @@ Follow the x86 pattern: when an LMF entry has a NULL method, advance
 the LMF chain past the bad entry and return FALSE to stop unwinding
 gracefully.  This prevents a hard runtime abort while allowing the
 runtime to continue operating.
-
-Fixes: unoplatform/studio.live#1406
 ---
  src/mono/mono/mini/exceptions-wasm.c | 9 ++++++---
  1 file changed, 6 insertions(+), 3 deletions(-)
