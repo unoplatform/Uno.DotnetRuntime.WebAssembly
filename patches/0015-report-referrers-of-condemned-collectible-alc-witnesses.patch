@@ -194,12 +194,12 @@ root is found and fixed, or when the stop-rule fires.
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
  .../tests/ForcedNativeUnloadTests.cs          | 296 +++++++++++++++
- .../mono/metadata/assembly-load-context.c     | 343 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         | 143 ++++++++
+ .../mono/metadata/assembly-load-context.c     | 350 +++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         | 143 +++++++
  src/mono/mono/metadata/loader-internals.h     |  15 +
- src/mono/mono/metadata/sgen-mono.c            | 306 ++++++++++++++++
+ src/mono/mono/metadata/sgen-mono.c            | 306 +++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 +
- 6 files changed, 1117 insertions(+), 2 deletions(-)
+ 6 files changed, 1124 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 index 2b2f170..0bb1a45 100644
@@ -523,10 +523,10 @@ index 2b2f170..0bb1a45 100644
          public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
          {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..bda279b 100644
+index 1054345..9b86cff 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,306 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,313 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -669,10 +669,17 @@ index 1054345..bda279b 100644
 +		budget = ALC_REFERRER_SCAN_SLOT_BUDGET;
 +		char *val = g_getenv ("MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET");
 +		if (val) {
-+			gint64 parsed = g_ascii_strtoll (val, NULL, 10);
-+			/* Only a positive, strictly smaller value is honoured; anything else leaves the
-+			 * production budget in place rather than silently accepting nonsense. */
-+			if (parsed > 0 && parsed < ALC_REFERRER_SCAN_SLOT_BUDGET)
++			/* strtol, not g_ascii_strtoll: eglib does not provide the latter, and an earlier
++			 * revision calling it failed the build with an implicit-declaration error. This is
++			 * the same idiom mono/utils/options.c uses, and <stdlib.h> arrives via eglib's
++			 * glib.h. */
++			char *end = NULL;
++			long parsed = strtol (val, &end, 10);
++			/* Only a positive, strictly smaller, fully-parsed value is honoured; anything else --
++			 * trailing garbage, zero, negative, or a value at or above the production budget --
++			 * leaves the production budget in place rather than silently accepting nonsense. An
++			 * overflowing value saturates to LONG_MAX and so fails the upper bound too. */
++			if (end && end != val && *end == '\0' && parsed > 0 && parsed < ALC_REFERRER_SCAN_SLOT_BUDGET)
 +				budget = (gint32)parsed;
 +			g_free (val);
 +		}
@@ -833,7 +840,7 @@ index 1054345..bda279b 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1253,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1260,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -849,7 +856,7 @@ index 1054345..bda279b 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
-@@ -1032,7 +1338,30 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1032,7 +1345,30 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
  	 *
@@ -881,7 +888,7 @@ index 1054345..bda279b 100644
  	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
  	 * reasons in the "Root classification for condemned collectible contexts" block at the top
  	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
-@@ -1072,6 +1401,16 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1072,6 +1408,16 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
