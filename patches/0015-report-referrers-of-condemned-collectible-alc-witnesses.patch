@@ -1,0 +1,657 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Randolph <noreply@platform.uno>
+Date: Tue, 25 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat: report which objects reference a condemned collectible
+ ALC witness
+
+The GC-handle classification added earlier answered its question in the
+negative. Across a downstream WASM host's stranding repro -- repeated
+collectible-ALC load/unload cycles with the forced-unload opt-in active --
+eight complete unsaturated sweeps report every handle bucket at 0 (strong,
+pinned and weak-track alike) while managers_in_scope equals live_witnesses
+exactly on every cycle and never decays:
+
+  cycle=1  managers=2  liveWitnesses=2  strong=0 pinned=0 weakTrack=0
+  cycle=8  managers=16 liveWitnesses=16 strong=0 pinned=0 weakTrack=0
+
+That rules out a GC handle DIRECTLY targeting a condemned object, which is
+all the snapshot can ever see: its attribution is one hop, so a handle on a
+container that merely references a witness is invisible to it. The witnesses
+are nevertheless reachable, so the reference runs through the object graph --
+and no amount of further handle classification can follow a graph.
+
+This adds the reverse lookup: one bounded pass over the heap that reports,
+for each condemned witness, the CLASS of the objects referencing it and the
+field offset of the reference. It names the holder instead of narrowing the
+search space.
+
+  * sgen_scan_referrers_of_condemned (sgen-mono.c) mirrors the three regions
+    mono_gc_walk_heap covers -- nursery, major heap, LOS -- with a scanner
+    that tests each reference in place against the condemned set. It does not
+    reuse mono_gc_walk_heap because that entry point buffers every reference
+    of every object through a MonoGCReferences callback with no budget and no
+    way for the callback to stop, the same shape problem
+    sgen_gchandle_foreach_slot_bounded was added to solve for the handle
+    tables; all this walk needs is one hash lookup per reference.
+  * assembly-load-context.c owns the trigger, the condemned set and the
+    report. A quiescence refusal is the only evidence a witness is still
+    held, so a refusal RECORDS A REQUEST; the next collection's
+    pre-start-world point serves it, because a heap walk is only legal with
+    the world stopped. Requests coalesce rather than queue, so a host that
+    retries in a loop gets one report rather than one per retry.
+  * sgen-stw.c calls the consumer at that point, before the profiler event,
+    under DISABLE_THREADS only.
+
+DOUBLE OPT-IN. MONO_WASM_ENABLE_ALC_UNLOAD does not arm this on its own; it
+also needs MONO_WASM_ALC_UNLOAD_REFERRER_SCAN. Unlike the snapshot -- a
+read-only gauge a caller chooses to poll -- this adds work to a collection
+pause, so a flagged session that has not asked for referrers pays one load
+and a branch.
+
+WHAT IT BOUNDS, AND WHAT IT DOES NOT. object_budget caps the per-object
+reference scan and NOT the object enumeration: sgen's iterators run to
+completion and their callbacks cannot stop them, and the walk passes
+ITERATE_OBJECTS_SWEEP_ALL exactly as mono_gc_walk_heap does, which forces a
+lazily-swept major heap to finish sweeping. So a scan costs a full
+enumeration plus at most object_budget reference scans, and the budget is a
+bound on the second half only. Because the iterators always finish,
+objects_visited is a TRUE total rather than an estimate, and
+objects_scanned/objects_visited plus `saturated` say exactly how much of the
+heap the answer covers.
+
+A referrer row is direct evidence. An EMPTY report is much weaker and means
+anything only when the scan did not saturate -- and the report is written to
+the assembly trace, so it is invisible without --trace=asm at info or finer.
+An empty console is therefore never evidence of anything, which the contract
+block says in those words.
+
+Two things worth flagging for review, both found while writing this:
+
+  * The precondition is asserted as sgen_is_world_stopped (), NOT as "a
+    collection is in progress". sgen clears
+    sgen_current_collection_generation at the end of the minor/major
+    collection function, which runs BEFORE sgen_restart_world, so at the
+    pre-start-world point the generation already reads -1 just as it does
+    outside a collection. An earlier draft asserted != -1 and would have
+    aborted the runtime on the first armed collection.
+  * Taking alcs_lock inside a GC pause would be a real hazard on a
+    threads-enabled runtime, where mono_coop_mutex_lock does a
+    MONO_ENTER_GC_SAFE transition when contended. It is sound here only
+    because this surface is DISABLE_THREADS-only and every MonoCoopMutex
+    operation is an empty inline there. The reasoning is recorded at the
+    call site rather than left implicit.
+
+Temporary diagnostic scaffolding on the same terms and the same tracking
+issue (#176) as the snapshot it complements: it retires when the residual
+root is found and fixed, or when the stop-rule fires.
+
+NOT COMPILE-VERIFIED LOCALLY. This was authored against the pinned commit
+with the series applied, but building the WASM runtime is not something the
+author can do on this machine; the runtime CI on this PR is the first real
+compile. Reviewers should treat a green CI as the first evidence it builds,
+and the behaviour claims above as unexercised until someone runs a flagged
+session with the scan armed.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../mono/metadata/assembly-load-context.c     | 209 +++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         |  91 ++++++++
+ src/mono/mono/metadata/loader-internals.h     |  15 ++
+ src/mono/mono/metadata/sgen-mono.c            | 153 +++++++++++++
+ src/mono/mono/metadata/sgen-stw.c             |  16 ++
+ 5 files changed, 483 insertions(+), 1 deletion(-)
+
+diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
+index 1054345..a2abd44 100644
+--- a/src/mono/mono/metadata/assembly-load-context.c
++++ b/src/mono/mono/metadata/assembly-load-context.c
+@@ -515,6 +515,207 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+ 	return ALC_SNAPSHOT_FIELD_COUNT;
+ }
+ 
++/*
++ * ===========================================================================================
++ * Referrer lookup for condemned collectible contexts (WHO holds the witness)
++ * ===========================================================================================
++ *
++ * THE SINGLE SOURCE for this surface's contract, as its sibling block above is for the
++ * condemned-set snapshot. gc-internals.h and sgen-mono.c point here.
++ *
++ * REMOVAL. Temporary diagnostic scaffolding, on exactly the same terms and the same tracking
++ * issue as the snapshot.
++ * TODO(unoplatform/Uno.DotnetRuntime.WebAssembly#176): remove this block,
++ * mono_alc_referrer_scan_at_gc_pause, its call site in sgen_client_restart_world and
++ * sgen_scan_referrers_of_condemned once EITHER (a) the residual root is identified and fixed,
++ * or (b) the stop-rule fires.
++ *
++ * WHY THIS EXISTS AND THE SNAPSHOT DOES NOT SUFFICE. The snapshot answered its question in the
++ * negative. Across eight complete unsaturated sweeps of a stranding repro, every handle bucket
++ * read 0 -- strong, pinned and weak-track alike -- while managers_in_scope equalled
++ * live_witnesses exactly on every cycle and never decayed. That rules out a GC handle DIRECTLY
++ * targeting a condemned object, which is all the snapshot can ever see: its attribution is ONE
++ * HOP, so a handle on a container that merely references a witness is invisible to it. The
++ * witnesses are nevertheless reachable, so the reference runs through the object graph -- and no
++ * amount of further handle classification can follow a graph.
++ *
++ * WHAT THIS MEASURES. One bounded pass over the heap with the world already stopped, reporting
++ * for each condemned witness the CLASS of the objects that reference it, plus the field offset
++ * of the reference. That is the reverse of the snapshot's question, and it names the holder
++ * directly instead of narrowing the search space.
++ *
++ * WHEN IT RUNS -- and why it is not synchronous. The interesting moment is a REFUSAL: the
++ * quiescence gate answering not-quiescent is the only evidence that a witness is still held.
++ * But that gate runs from an icall with the world RUNNING, and a heap walk is only legal with
++ * the world stopped and the collection finished (mono_gc_walk_heap's own contract). So a
++ * refusal RECORDS A REQUEST and the next collection's pre-start-world point SERVES it. The
++ * consequence is worth stating plainly: the report is not attributable to one specific refusal,
++ * and if the process never collects again after a refusal, no report is ever produced. In the
++ * host that motivated this, the drain loop collects between attempts, so a request is served
++ * within one collection.
++ *
++ * A request is a single flag, not a queue: while one is outstanding, further refusals coalesce
++ * into it. The alternative -- one report per refusal -- would emit the same referrer shape once
++ * per retry in a loop that retries by design.
++ *
++ * DOUBLE OPT-IN. MONO_WASM_ENABLE_ALC_UNLOAD alone does NOT arm this. It also needs
++ * MONO_WASM_ALC_UNLOAD_REFERRER_SCAN, because unlike the snapshot -- a read-only gauge a caller
++ * chooses to poll -- this adds work to a collection pause that nothing asked for. A flagged
++ * session that has not asked for referrers must pay nothing.
++ *
++ * HOW TO SEE THE OUTPUT, and why silence is ambiguous. The report goes to the runtime's own
++ * assembly trace (mono_trace / MONO_TRACE_ASSEMBLY at INFO), so it also needs the assembly
++ * trace mask enabled: --trace=asm at a level of info or finer, i.e. monoTraceMask=asm and
++ * monoTraceLevel=info in a browser host. WITHOUT THAT MASK THE SCAN STILL RUNS AND SAYS
++ * NOTHING, which is indistinguishable from "no referrers found". An empty console is therefore
++ * never evidence; the saturated and objects_scanned/objects_visited figures in the report are
++ * the only things that qualify a negative result.
++ *
++ * WHAT A RESULT PROVES. A referrer row is direct evidence: that object, of that class, holds a
++ * reference to that witness at that offset. An EMPTY report is much weaker and means anything
++ * only when the scan did not saturate -- see object_budget on MonoSgenCondemnedReferrerScan,
++ * where the budget bounds the reference scanning but not the object enumeration. A saturated
++ * scan that finds nothing is inconclusive, exactly as a saturated snapshot is.
++ */
++
++/* Set by a refusal, consumed by the next collection pause. Coalescing, not a queue (see the
++ * block above). */
++static gboolean alc_referrer_scan_requested;
++
++/* Objects whose reference fields the pause-time walk may examine. Sized so the walk costs a
++ * bounded slice of a pause on the heaps this diagnostic runs against, in the same spirit as
++ * ALC_CONDEMNED_HANDLE_SLOT_BUDGET: large enough to cover a stranding repro's heap, small
++ * enough that saturation gets reported rather than silently paid for. */
++#define ALC_REFERRER_SCAN_OBJECT_BUDGET 400000
++
++/* Explicit, separate opt-in on top of MONO_WASM_ENABLE_ALC_UNLOAD (see DOUBLE OPT-IN above).
++ * Read once: an env lookup must not be repeated inside a GC pause. */
++static gboolean
++alc_referrer_scan_enabled (void)
++{
++	static int enabled = -1;
++	if (enabled == -1) {
++		char *val = g_getenv ("MONO_WASM_ALC_UNLOAD_REFERRER_SCAN");
++		enabled = (val && (!g_ascii_strcasecmp (val, "1") || !g_ascii_strcasecmp (val, "true"))) ? 1 : 0;
++		g_free (val);
++	}
++	return enabled != 0;
++}
++
++/* Called on a quiescence refusal. Cheap and allocation-free: the work happens at the pause. */
++static void
++alc_referrer_scan_request (void)
++{
++	if (alc_referrer_scan_enabled ())
++		alc_referrer_scan_requested = TRUE;
++}
++
++static gboolean
++alc_referrer_object_set_visit (MonoMemoryManager *mm, gpointer user_data)
++{
++	GHashTable *objects = (GHashTable *)user_data;
++
++	MonoObject *witness = alc_manager_witness_object (mm);
++	if (witness)
++		g_hash_table_insert (objects, witness, witness);
++	return TRUE;
++}
++
++/*
++ * Serve an outstanding request. Runs from sgen_client_restart_world with the world STOPPED and
++ * the collection finished, which is the only point a heap walk is legal.
++ *
++ * The condemned object set is rebuilt HERE, inside the pause, and never carried in from the
++ * refusal that requested the scan: a moving collector relocates objects, so a set captured
++ * earlier would hold stale pointers. The manager and context structs are native and stable, so
++ * re-deriving the set from the ALC list is the sound way to do it.
++ *
++ * LOCKING, and why taking a lock inside a GC pause is sound HERE and would not be in general.
++ * This takes alcs_lock and, under it, a context's memory-managers lock via
++ * alc_foreach_teardown_manager -- the same single nesting direction the snapshot uses. On a
++ * threads-enabled runtime that would be a hazard worth refusing: mono_coop_mutex_lock does a
++ * MONO_ENTER_GC_SAFE thread-state transition when contended, which is not something to do from
++ * inside a collection pause. This surface is compiled out there. On the DISABLE_THREADS build it
++ * is the only one that exists, every MonoCoopMutex operation is an EMPTY INLINE (see the
++ * DISABLE_THREADS branch of mono-coop-mutex.h), so both locks compile to nothing:
++ * no acquisition, no state transition, and no deadlock to reason about. The calls are kept
++ * rather than elided so this code reads like every other traversal of the ALC list, and so it
++ * stays correct if the surface is ever built with threads enabled -- at which point the
++ * transition above becomes a real question again.
++ */
++void
++mono_alc_referrer_scan_at_gc_pause (void)
++{
++	if (!alc_referrer_scan_requested)
++		return;
++
++	/* Clear FIRST: a scan that finds nothing has still served the request, and re-arming on
++	 * failure would attach the cost to every subsequent collection. */
++	alc_referrer_scan_requested = FALSE;
++
++#ifdef HAVE_SGEN_GC
++	GHashTable *objects = g_hash_table_new (g_direct_hash, g_direct_equal);
++
++	alcs_lock ();
++	for (GSList *tmp = alcs; tmp; tmp = tmp->next) {
++		MonoAssemblyLoadContext *alc = (MonoAssemblyLoadContext *)tmp->data;
++		if (!alc_is_condemned (alc))
++			continue;
++
++		/* The same two identity sources the snapshot uses: the managed wrapper (promoted to a
++		 * strong handle while an unload is in flight) and each manager's witness. */
++		if (alc->gchandle) {
++			MonoObject *wrapper = (MonoObject *)mono_gchandle_get_target_internal (alc->gchandle);
++			if (wrapper)
++				g_hash_table_insert (objects, wrapper, wrapper);
++		}
++
++		alc_foreach_teardown_manager (alc, alc_referrer_object_set_visit, objects);
++	}
++	alcs_unlock ();
++
++	if (g_hash_table_size (objects) == 0) {
++		/* Requested while stranded, served after the strand cleared. Reported rather than
++		 * dropped: it separates "nothing holds the witness" from "the scan never ran". */
++		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
++			"[alc-referrers] no condemned objects at pause; request served with nothing to search for");
++		g_hash_table_destroy (objects);
++		return;
++	}
++
++	MonoSgenCondemnedReferrerScan scan;
++	memset (&scan, 0, sizeof (scan));
++	scan.condemned_objects = objects;
++	scan.object_budget = ALC_REFERRER_SCAN_OBJECT_BUDGET;
++	sgen_scan_referrers_of_condemned (&scan);
++
++	/* One summary line, then one line per described referrer. The summary carries the figures
++	 * that qualify the rows -- and that qualify their ABSENCE, which is the reading mistake
++	 * this diagnostic is most likely to invite. */
++	mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
++		"[alc-referrers] witnesses=%u referenced=%d edges=%d described=%d objects=%d/%d saturated=%d",
++		g_hash_table_size (objects), scan.witnesses_referenced, scan.referrer_edges,
++		scan.referrers_recorded, scan.objects_scanned, scan.objects_visited,
++		scan.saturated ? 1 : 0);
++
++	for (gint32 i = 0; i < scan.referrers_recorded; ++i) {
++		MonoSgenCondemnedReferrer *row = &scan.referrers [i];
++		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
++			"[alc-referrers]   witness=%p <- %s.%s[%p] +%u",
++			row->witness,
++			row->referrer_klass_namespace ? row->referrer_klass_namespace : "?",
++			row->referrer_klass_name ? row->referrer_klass_name : "?",
++			row->referrer, row->field_offset);
++	}
++
++	g_hash_table_destroy (objects);
++#else
++	/* No sgen: no heap walk exists. Say so, rather than letting silence read as "no referrers". */
++	mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
++		"[alc-referrers] unavailable: no sgen heap walk in this build");
++#endif
++}
++
+ static void
+ retired_scout_targets_add (MonoMemoryManager *memory_manager)
+ {
+@@ -953,8 +1154,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+ 	if (!alc->unloading)
+ 		return FORCE_UNLOAD_REJECTED;
+ 
+-	if (!alc_is_managed_quiescent (alc))
++	if (!alc_is_managed_quiescent (alc)) {
++		/* A refusal is the only evidence that a witness is still held, so it is the trigger for
++		 * the referrer lookup -- served at the next collection pause, because a heap walk needs
++		 * the world stopped. No-op unless MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set; see the
++		 * "Referrer lookup for condemned collectible contexts" block. */
++		alc_referrer_scan_request ();
+ 		return FORCE_UNLOAD_NOT_QUIESCENT;
++	}
+ 
+ 	mono_alc_free (alc);
+ 	return FORCE_UNLOAD_COMPLETED;
+diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
+index 1c51c11..b9f99a2 100644
+--- a/src/mono/mono/metadata/gc-internals.h
++++ b/src/mono/mono/metadata/gc-internals.h
+@@ -490,6 +490,97 @@ typedef struct {
+ } MonoSgenCondemnedHandleScan;
+ 
+ void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
++
++/*
++ * Reverse lookup: WHICH OBJECTS REFERENCE a condemned LoaderAllocator witness. Implemented in
++ * sgen-mono.c; the canonical rationale and the reporting contract live with the sole consumer,
++ * in the "Referrer lookup for condemned collectible contexts" block of
++ * assembly-load-context.c.
++ *
++ * This is the complement of sgen_scan_handles_into_managers above, and it exists because that
++ * scan answered its question in the negative: across repeated stranding cycles every handle
++ * bucket reads 0 while live witnesses persist, which rules out a GC handle DIRECTLY targeting a
++ * condemned object and leaves the object graph. Handle classification is ONE HOP by
++ * construction and cannot follow that graph; this walk starts from the heap instead and reports
++ * the referrers themselves.
++ *
++ * PRECONDITION, and the reason this one differs from its sibling: the heap walk is only legal
++ * with the world already STOPPED and the collection finished, i.e. from the
++ * MONO_GC_EVENT_PRE_START_WORLD point (see mono_gc_walk_heap's own contract in sgen-mono.c),
++ * and it asserts sgen_is_world_stopped (). The handle scan runs with the world RUNNING instead,
++ * from an ordinary icall, because it only reads handle slots and must not be able to observe a
++ * collector mid-rewrite. Note that BOTH points see sgen_current_collection_generation == -1 --
++ * sgen clears it before restarting the world -- so the generation cannot tell them apart and
++ * neither assertion is phrased in terms of it.
++ */
++
++/* Referrers described per witness before further hits on that witness are counted but not
++ * described. Small on purpose: the question is "what CLASS of thing holds this", and the first
++ * few answers settle it -- an unbounded list would turn a diagnostic into a heap dump. */
++#define MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS 4
++/* Distinct witnesses described per scan. A stranding repro accumulates one witness per cycle
++ * and the referrer SHAPE repeats, so describing the first few is what identifies the holder. */
++#define MONO_SGEN_CONDEMNED_WITNESSES_REPORTED 8
++
++typedef struct {
++	/* The referenced (condemned) object this row is about, and the referrer that points at it.
++	 * Raw pointers, valid only until the world restarts -- printed by the consumer inside the
++	 * same pause and never retained. */
++	gpointer witness;
++	gpointer referrer;
++	/* The referrer's class, which is the actual answer being sought. NULL-safe: a referrer whose
++	 * vtable or class cannot be read is recorded with NULL names rather than dereferenced. */
++	const char *referrer_klass_name;
++	const char *referrer_klass_namespace;
++	/* Byte offset of the referencing field within the referrer, as reported by the object
++	 * scanner. Cheap to carry, and it separates "a field of X" from "an element of X". */
++	guint32 field_offset;
++} MonoSgenCondemnedReferrer;
++
++typedef struct {
++	/* IN: set of MonoObject* identities to find the referrers OF -- the condemned contexts'
++	 * LoaderAllocator witnesses and managed wrapper objects. MUST be built by the consumer
++	 * inside the same pause: a set built earlier cannot be carried across a collection, because
++	 * a moving collector relocates its members. */
++	GHashTable *condemned_objects;
++	/* IN: cap on objects whose REFERENCE FIELDS are examined. MUST be > 0 (asserted).
++	 *
++	 * READ THIS BEFORE TRUSTING AN EMPTY RESULT. The cap bounds the per-object REFERENCE SCAN
++	 * and NOT the object enumeration, because sgen's heap iterators (sgen_scan_area_with_callback,
++	 * the major collector's iterate_objects, sgen_los_iterate_objects) run to completion and
++	 * their callbacks cannot stop them. So a scan costs a full enumeration of the heap -- which
++	 * includes forcing the major collector to finish sweeping, since the walk passes
++	 * ITERATE_OBJECTS_SWEEP_ALL exactly as mono_gc_walk_heap does, and that is NOT free on a
++	 * lazily-swept heap -- plus at most `object_budget` reference scans on top. The budget bounds
++	 * the second half only; it is not a bound on the whole operation and must not be read as one.
++	 * Once it is spent, later objects are COUNTED but not examined, `saturated` is set, and every
++	 * count below becomes a LOWER BOUND: an empty referrer list from a saturated scan says
++	 * nothing at all. */
++	gint32 object_budget;
++
++	/* OUT: referrer rows, filled in discovery order up to the caps above. */
++	MonoSgenCondemnedReferrer referrers [MONO_SGEN_CONDEMNED_WITNESSES_REPORTED * MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS];
++	/* OUT: rows actually filled in `referrers`. */
++	gint32 referrers_recorded;
++	/* OUT: total referencing EDGES found into condemned_objects, including those not described
++	 * because a per-witness or per-scan cap was already reached. referrers_recorded <
++	 * referrer_edges is a DESCRIPTION cap, not truncation of the search -- distinct from
++	 * `saturated`, which reports the search itself being cut short. */
++	gint32 referrer_edges;
++	/* OUT: distinct condemned objects found to have at least one referrer. */
++	gint32 witnesses_referenced;
++	/* OUT: objects the heap iterators presented. This is the TRUE total, not an estimate: the
++	 * iterators always run to completion (see object_budget), so no denominator is fabricated. */
++	gint32 objects_visited;
++	/* OUT: objects whose reference fields were actually examined, i.e. the part of
++	 * objects_visited the budget paid for. */
++	gint32 objects_scanned;
++	/* OUT: TRUE when objects_scanned < objects_visited, i.e. the budget ran out and the search
++	 * is incomplete (see object_budget). */
++	gboolean saturated;
++} MonoSgenCondemnedReferrerScan;
++
++void sgen_scan_referrers_of_condemned (MonoSgenCondemnedReferrerScan *scan);
+ #endif
+ 
+ #endif /* __MONO_METADATA_GC_INTERNAL_H__ */
+diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
+index 4275a39..4a3191e 100644
+--- a/src/mono/mono/metadata/loader-internals.h
++++ b/src/mono/mono/metadata/loader-internals.h
+@@ -291,6 +291,21 @@ mono_alc_get_all_loaded_assemblies (void);
+ GPtrArray*
+ mono_alc_get_all (void);
+ 
++#ifdef DISABLE_THREADS
++/*
++ * Serve an outstanding condemned-referrer scan request. MUST be called with the world STOPPED
++ * and the collection finished (the MONO_GC_EVENT_PRE_START_WORLD point), which is the only
++ * place a heap walk is legal; sgen_client_restart_world is the sole caller. A no-op unless a
++ * quiescence refusal requested a scan AND MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set.
++ *
++ * Diagnostic scaffolding for the host-triggered collectible-ALC unload work. The contract lives
++ * in the "Referrer lookup for condemned collectible contexts" block of assembly-load-context.c,
++ * which also names the tracking issue for removing it.
++ */
++void
++mono_alc_referrer_scan_at_gc_pause (void);
++#endif
++
+ MonoMemoryManager *
+ mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
+ 
+diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
+index fd4e6e5..7ed2fee 100644
+--- a/src/mono/mono/metadata/sgen-mono.c
++++ b/src/mono/mono/metadata/sgen-mono.c
+@@ -2064,6 +2064,159 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+ 
+ 	sgen_condemned_scan_in_progress = FALSE;
+ }
++
++/*
++ * Referrer lookup for the same diagnostics: given a set of condemned objects, report WHICH
++ * OBJECTS IN THE HEAP REFERENCE THEM. The canonical rationale and the reporting contract live
++ * with the sole consumer, in the "Referrer lookup for condemned collectible contexts" block of
++ * assembly-load-context.c; the field-level contract is on MonoSgenCondemnedReferrerScan in
++ * gc-internals.h. This file only implements the walk.
++ *
++ * PRECONDITION: the world is STOPPED and the collection has finished, i.e. this runs from the
++ * MONO_GC_EVENT_PRE_START_WORLD point. That is mono_gc_walk_heap's documented contract and it
++ * applies here for the same reasons: the nursery fragments must be cleared, the major heap must
++ * be in a sweepable state, and no mutator may be writing references while they are read.
++ *
++ * WHY NOT mono_gc_walk_heap ITSELF. That entry point buffers up to REFS_SIZE references and
++ * calls a MonoGCReferences callback, with no budget and no way for the callback to stop the
++ * walk -- the same shape problem sgen_gchandle_foreach_slot_bounded was added to solve for the
++ * handle tables. Reusing it would mean paying the full per-object reference scan over the whole
++ * heap with no bound, and buffering every reference of every object when all this walk needs is
++ * a single hash lookup per reference. So the three iteration passes are mirrored here with a
++ * scanner that tests each reference in place and stops examining objects once its budget is
++ * spent. The passes themselves still run to completion, because sgen's iterators cannot be
++ * stopped -- which is exactly why objects_visited is a true total and objects_scanned is not.
++ */
++
++static MonoSgenCondemnedReferrerScan *sgen_referrer_scan_current;
++static gboolean sgen_referrer_scan_in_progress;
++
++/* Per-witness description budget. Keyed on the witness pointer, value is the number of rows
++ * already emitted for it, so the caps in gc-internals.h are enforced per witness rather than
++ * letting one heavily-referenced object consume every row. */
++static GHashTable *sgen_referrer_scan_described;
++
++static void
++sgen_referrer_record (GCObject *referrer, GCObject *witness, uintptr_t offset)
++{
++	MonoSgenCondemnedReferrerScan *scan = sgen_referrer_scan_current;
++
++	/* Every hit counts as an edge, described or not: the counts must stay honest even when the
++	 * description caps hide the individual rows. */
++	scan->referrer_edges++;
++
++	gpointer prior = g_hash_table_lookup (sgen_referrer_scan_described, witness);
++	guint described = prior ? GPOINTER_TO_UINT (prior) : 0;
++	if (described == 0)
++		scan->witnesses_referenced++;
++
++	if (described >= MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS)
++		return;
++	if (scan->referrers_recorded >= (gint32)G_N_ELEMENTS (scan->referrers))
++		return;
++
++	MonoSgenCondemnedReferrer *row = &scan->referrers [scan->referrers_recorded++];
++	row->witness = witness;
++	row->referrer = referrer;
++	row->field_offset = (guint32)offset;
++
++	/* NULL-safe on purpose: a referrer whose vtable or class cannot be read is still worth
++	 * reporting as an edge, and this is a diagnostic that must not be able to abort the runtime
++	 * from inside a GC pause. */
++	MonoVTable *vtable = (MonoVTable *)SGEN_LOAD_VTABLE (referrer);
++	MonoClass *klass = vtable ? vtable->klass : NULL;
++	row->referrer_klass_name = klass ? m_class_get_name (klass) : NULL;
++	row->referrer_klass_namespace = klass ? m_class_get_name_space (klass) : NULL;
++
++	g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (described + 1));
++}
++
++#undef HANDLE_PTR
++#define HANDLE_PTR(ptr,obj)	do {			GCObject *__ref = *(ptr);			if (__ref && g_hash_table_contains (sgen_referrer_scan_current->condemned_objects, __ref))				sgen_referrer_record ((GCObject*)start, __ref, (char*)(ptr) - (char*)start);		} while (0)
++
++static void
++sgen_referrer_scan_object (GCObject *obj)
++{
++	char *start = (char*)obj;
++	SgenDescriptor desc = sgen_obj_get_descriptor (obj);
++
++#include "sgen/sgen-scan-object.h"
++}
++
++static void
++sgen_referrer_visit_object (GCObject *obj, size_t size, void *data)
++{
++	MonoSgenCondemnedReferrerScan *scan = (MonoSgenCondemnedReferrerScan *)data;
++
++	/* Counted unconditionally: the iterators run to completion whatever the budget does, so
++	 * this is the honest denominator the report needs. */
++	scan->objects_visited++;
++
++	if (scan->objects_scanned >= scan->object_budget) {
++		scan->saturated = TRUE;
++		return;
++	}
++
++	scan->objects_scanned++;
++	sgen_referrer_scan_object (obj);
++}
++
++void
++sgen_scan_referrers_of_condemned (MonoSgenCondemnedReferrerScan *scan)
++{
++	/* Internal API, but a NULL out-parameter must never be written through. */
++	if (!scan)
++		return;
++
++	memset (scan->referrers, 0, sizeof (scan->referrers));
++	scan->referrers_recorded = 0;
++	scan->referrer_edges = 0;
++	scan->witnesses_referenced = 0;
++	scan->objects_visited = 0;
++	scan->objects_scanned = 0;
++	scan->saturated = FALSE;
++
++	/* Nothing to find referrers of: skip the sweep entirely rather than walking the whole heap
++	 * to accumulate zeroes. Nothing was VISITED either, because no walk ran. */
++	if (!scan->condemned_objects || g_hash_table_size (scan->condemned_objects) == 0)
++		return;
++
++	/*
++	 * See PRECONDITION above. The check is sgen_is_world_stopped () and deliberately NOT
++	 * "a collection is in progress": sgen clears sgen_current_collection_generation at the end
++	 * of the minor/major collection function, which runs BEFORE sgen_restart_world, so at the
++	 * pre-start-world point the generation already reads -1 just as it does outside a
++	 * collection. World-stopped is the property this walk actually depends on.
++	 */
++	g_assert (sgen_is_world_stopped ());
++	g_assert (!sgen_referrer_scan_in_progress);
++
++	/* No unbounded mode, for the same reason the handle scan has none: a diagnostic that runs
++	 * inside a GC pause on the single browser thread must carry a bound by construction, so a
++	 * non-positive budget is a caller bug rather than a mode. */
++	g_assert (scan->object_budget > 0);
++
++	sgen_referrer_scan_in_progress = TRUE;
++	sgen_referrer_scan_current = scan;
++	sgen_referrer_scan_described = g_hash_table_new (g_direct_hash, g_direct_equal);
++
++	/*
++	 * The same three regions mono_gc_walk_heap covers, in the same order, because between them
++	 * they are the heap: the nursery, the major heap, and the large-object space. Missing one
++	 * would silently narrow the search and make an empty result untrustworthy in a way
++	 * `saturated` does not report.
++	 */
++	sgen_clear_nursery_fragments ();
++	sgen_scan_area_with_callback (sgen_nursery_section->data, sgen_nursery_section->end_data,
++			sgen_referrer_visit_object, scan, FALSE, TRUE);
++	sgen_major_collector.iterate_objects (ITERATE_OBJECTS_SWEEP_ALL, sgen_referrer_visit_object, scan);
++	sgen_los_iterate_objects (sgen_referrer_visit_object, scan);
++
++	g_hash_table_destroy (sgen_referrer_scan_described);
++	sgen_referrer_scan_described = NULL;
++	sgen_referrer_scan_current = NULL;
++	sgen_referrer_scan_in_progress = FALSE;
++}
+ #endif /* DISABLE_THREADS */
+ 
+ /*
+diff --git a/src/mono/mono/metadata/sgen-stw.c b/src/mono/mono/metadata/sgen-stw.c
+index daaafba..7818d1e 100644
+--- a/src/mono/mono/metadata/sgen-stw.c
++++ b/src/mono/mono/metadata/sgen-stw.c
+@@ -25,6 +25,7 @@
+ #include "sgen/sgen-client.h"
+ #include "metadata/sgen-bridge-internals.h"
+ #include "metadata/gc-internals.h"
++#include "metadata/loader-internals.h"
+ #include "utils/mono-threads.h"
+ #include "utils/mono-threads-debug.h"
+ #ifdef HOST_BROWSER
+@@ -195,6 +196,21 @@ sgen_client_restart_world (int generation, gboolean serial_collection, gint64 *s
+ 	if (MONO_PROFILER_ENABLED (gc_resize))
+ 		mono_sgen_gc_event_resize ();
+ 
++#ifdef DISABLE_THREADS
++	/*
++	 * Diagnostic scaffolding for the host-triggered collectible-ALC unload work: a quiescence
++	 * refusal cannot walk the heap itself (it runs with the world running), so it records a
++	 * request and this point -- world stopped, collection finished -- serves it. A no-op unless
++	 * a request is outstanding and MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set, so an ordinary
++	 * collection pays one load and a branch. See the "Referrer lookup for condemned collectible
++	 * contexts" block in assembly-load-context.c, which names the tracking issue for removal.
++	 *
++	 * Placed BEFORE the profiler event so it observes the same heap a PRE_START_WORLD handler
++	 * would, and cannot be reordered behind a handler that allocates.
++	 */
++	mono_alc_referrer_scan_at_gc_pause ();
++#endif
++
+ 	MONO_PROFILER_RAISE (gc_event, (MONO_GC_EVENT_PRE_START_WORLD, generation, serial_collection));
+ 
+ 	FOREACH_THREAD_ALL (info) {
