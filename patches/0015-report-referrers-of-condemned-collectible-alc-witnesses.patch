@@ -195,11 +195,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
  .../tests/ForcedNativeUnloadTests.cs          | 296 +++++++++++++++
  .../mono/metadata/assembly-load-context.c     | 343 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         | 148 ++++++++
+ src/mono/mono/metadata/gc-internals.h         | 143 ++++++++
  src/mono/mono/metadata/loader-internals.h     |  15 +
  src/mono/mono/metadata/sgen-mono.c            | 306 ++++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 +
- 6 files changed, 1122 insertions(+), 2 deletions(-)
+ 6 files changed, 1117 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 index 2b2f170..0bb1a45 100644
@@ -899,10 +899,10 @@ index 1054345..bda279b 100644
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index 1c51c11..ca0f255 100644
+index 1c51c11..747d1fc 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -490,6 +490,154 @@ typedef struct {
+@@ -490,6 +490,149 @@ typedef struct {
  } MonoSgenCondemnedHandleScan;
  
  void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
@@ -1023,11 +1023,6 @@ index 1c51c11..ca0f255 100644
 +	 * referrer_edges is a DESCRIPTION cap, not truncation of the search -- distinct from
 +	 * `saturated`, which reports the search itself being cut short. */
 +	gint32 referrer_edges;
-+	/* OUT: of referrer_edges, how many were DEPENDENT edges (ephemeron key->value). Counted for
-+	 * every such edge found, independent of whether a row was recorded for it -- the description
-+	 * caps must not be able to make a found edge look absent, which is the whole reason this is
-+	 * separate from counting `dependent` rows in `referrers`. */
-+	gint32 dependent_edges;
 +	/* OUT: of referrer_edges, how many were DEPENDENT edges (ephemeron key->value). Counted for
 +	 * every such edge found, independent of whether a row was recorded for it -- the description
 +	 * caps must not be able to make a found edge look absent, which is the whole reason this is
