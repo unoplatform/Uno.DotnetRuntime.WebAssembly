@@ -97,9 +97,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
  .../mono/metadata/assembly-load-context.c     | 209 +++++++++++++++++-
  src/mono/mono/metadata/gc-internals.h         |  91 ++++++++
  src/mono/mono/metadata/loader-internals.h     |  15 ++
- src/mono/mono/metadata/sgen-mono.c            | 153 +++++++++++++
+ src/mono/mono/metadata/sgen-mono.c            | 176 +++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 ++
- 5 files changed, 483 insertions(+), 1 deletion(-)
+ 5 files changed, 506 insertions(+), 1 deletion(-)
 
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
 index 1054345..a2abd44 100644
@@ -458,10 +458,10 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..7ed2fee 100644
+index fd4e6e5..cb69a5d 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,159 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -2064,6 +2064,182 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -506,10 +506,22 @@ index fd4e6e5..7ed2fee 100644
 +	 * description caps hide the individual rows. */
 +	scan->referrer_edges++;
 +
++	/*
++	 * The stored value is described + 1, so that "seen at all" and "seen but described zero
++	 * times" are DIFFERENT states. They diverge whenever a witness's first hit arrives once a
++	 * cap is already reached: no row is recorded for it, and if the entry were written only
++	 * alongside a row, that witness would read as unseen on its next hit and be counted again.
++	 * witnesses_referenced is a distinct-object count, so that would inflate it -- and the
++	 * inflation would be worst in exactly the heavily-referenced case the caps exist for.
++	 */
 +	gpointer prior = g_hash_table_lookup (sgen_referrer_scan_described, witness);
-+	guint described = prior ? GPOINTER_TO_UINT (prior) : 0;
-+	if (described == 0)
++	guint described = prior ? GPOINTER_TO_UINT (prior) - 1 : 0;
++
++	if (!prior) {
 +		scan->witnesses_referenced++;
++		/* Mark seen BEFORE either cap below can return early. */
++		g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (1));
++	}
 +
 +	if (described >= MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS)
 +		return;
@@ -529,11 +541,16 @@ index fd4e6e5..7ed2fee 100644
 +	row->referrer_klass_name = klass ? m_class_get_name (klass) : NULL;
 +	row->referrer_klass_namespace = klass ? m_class_get_name_space (klass) : NULL;
 +
-+	g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (described + 1));
++	/* described + 1 rows now described, stored with the +1 bias above. */
++	g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (described + 2));
 +}
 +
 +#undef HANDLE_PTR
-+#define HANDLE_PTR(ptr,obj)	do {			GCObject *__ref = *(ptr);			if (__ref && g_hash_table_contains (sgen_referrer_scan_current->condemned_objects, __ref))				sgen_referrer_record ((GCObject*)start, __ref, (char*)(ptr) - (char*)start);		} while (0)
++#define HANDLE_PTR(ptr,obj)	do {	\
++		GCObject *__ref = *(ptr);	\
++		if (__ref && g_hash_table_contains (sgen_referrer_scan_current->condemned_objects, __ref))	\
++			sgen_referrer_record ((GCObject*)start, __ref, (char*)(ptr) - (char*)start);	\
++	} while (0)
 +
 +static void
 +sgen_referrer_scan_object (GCObject *obj)
@@ -543,6 +560,12 @@ index fd4e6e5..7ed2fee 100644
 +
 +#include "sgen/sgen-scan-object.h"
 +}
++
++/* Scoped to the one function above. The other two definitions in this file are each preceded by
++ * their own #undef, so leaving this one live would not have broken them -- but it is the last
++ * definition in the translation unit only by accident of ordering, and a later user would
++ * inherit a macro written for this scan's private statics. */
++#undef HANDLE_PTR
 +
 +static void
 +sgen_referrer_visit_object (GCObject *obj, size_t size, void *data)
