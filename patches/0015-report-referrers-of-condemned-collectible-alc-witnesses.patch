@@ -142,7 +142,16 @@ MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 -- the only leg that arms this code:
     unbounded per-slot cost would surface.
 
 Each asserts the refusal itself rather than tolerating a Completed, since a
-Completed would make the rest vacuous.
+Completed would make the rest vacuous, and each then drives its context
+TERMINAL. That last part is not tidiness: this suite has a standing invariant
+that every test leaves no context pending -- stated in
+Unload_DroppedRootsWithoutAnyForcedAttempt's own comment and asserted through
+PendingUnloadsGauge -- and a first revision of these three sustained their
+refusals past the end of the test, which failed two OTHER tests. The refusal
+half of each now lives in its own non-inlined frame so the rooting probe (and
+the CWT, and the wide array) are unreachable before the teardown runs, which a
+local in the test's frame would not reliably be: the interpreter scans its live
+slot region conservatively.
 
 Temporary diagnostic scaffolding on the same terms and the same tracking
 issue (#176) as the snapshot it complements: it retires when the residual
@@ -150,16 +159,16 @@ root is found and fixed, or when the stop-rule fires.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 181 +++++++++++
- .../mono/metadata/assembly-load-context.c     | 291 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         | 138 +++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 232 ++++++++++++++
+ .../mono/metadata/assembly-load-context.c     | 292 ++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         | 143 +++++++++
  src/mono/mono/metadata/loader-internals.h     |  15 +
- src/mono/mono/metadata/sgen-mono.c            | 288 +++++++++++++++++
+ src/mono/mono/metadata/sgen-mono.c            | 293 ++++++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 +
- 6 files changed, 927 insertions(+), 2 deletions(-)
+ 6 files changed, 989 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 2b2f170..3ef83c9 100644
+index 2b2f170..b51d33a 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -178,6 +178,14 @@ private static bool FlagEnabled
@@ -177,7 +186,25 @@ index 2b2f170..3ef83c9 100644
          // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
          // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
          // masking the regression.
-@@ -1585,6 +1593,179 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
+@@ -240,6 +248,17 @@ private static void GcQuiesce()
+         // Each NotQuiescent attempt must leave the once-only latch clear so a later attempt can
+         // still Complete — i.e. the single retry is never consumed by a premature force.
+         [MethodImpl(MethodImplOptions.NoInlining)]
++        // Restore the suite-wide invariant this file depends on: every test drives its contexts
++        // TERMINAL before returning, which is what lets Unload_DroppedRootsWithoutAnyForcedAttempt
++        // assert PendingUnloadsGauge == 0 and the population tests assert a return to baseline.
++        // The referrer-scan tests deliberately sustain a refusal, so they must undo it explicitly
++        // -- leaving a context pending fails two OTHER tests, which is how this was found.
++        private static async Task DriveTerminalAsync(AssemblyLoadContext context)
++        {
++            Assert.Equal(Completed, await ForceUntilCompletedAsync(context, 20));
++            await DrainRetiredScoutsAsync();
++        }
++
+         private static async Task<int> ForceUntilCompletedAsync(AssemblyLoadContext context, int maxAttempts)
+         {
+             int outcome = NotQuiescent;
+@@ -1585,6 +1604,219 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
              await RunConservativelyPinnedLosWitnessProtocol();
          }
  
@@ -197,8 +224,7 @@ index 2b2f170..3ef83c9 100644
 +        /// exists to identify.
 +        /// </summary>
 +        [Fact]
-+        [MethodImpl(MethodImplOptions.NoInlining)]
-+        public void ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection()
++        public async Task ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -218,16 +244,8 @@ index 2b2f170..3ef83c9 100644
 +            }
 +
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++            int after = RefuseAndReadScanCount(context, before);
 +
-+            // The refusal is the trigger. If this ever reports Completed the probe stopped rooting
-+            // the witness, which is a regression in its own right and would silently make the
-+            // assertions below vacuous -- so it is asserted rather than tolerated.
-+            Assert.Equal(NotQuiescent, Force(context));
-+
-+            GcQuiesce();
-+
-+            int after = ScoutStats(11);
 +            if (ReferrerScanRequested)
 +            {
 +                Assert.True(after > before,
@@ -238,9 +256,29 @@ index 2b2f170..3ef83c9 100644
 +                Assert.Equal(before, after);
 +            }
 +
-+            // The probe must outlive every assertion above: dropping it earlier would let the
-+            // witness die, clear the condemned set, and turn the refusal into a Completed.
++            // Undo the sustained refusal: see DriveTerminalAsync.
++            await DriveTerminalAsync(context);
++        }
++
++        // The refusal half of the referrer-scan tests, in its own NON-INLINED frame so the probe
++        // reference is confined to it. The probe has to root the witness across the Force and the
++        // serving collection, and must be UNREACHABLE afterwards so the caller can drive the
++        // context terminal -- which a local in the caller's frame would not reliably be, since the
++        // interpreter scans its live slot region conservatively.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static int RefuseAndReadScanCount(AssemblyLoadContext context, int scansBefore)
++        {
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++
++            // If this ever reports Completed the probe stopped rooting the witness, which is a
++            // regression in its own right and would silently make the caller's assertions vacuous.
++            Assert.Equal(NotQuiescent, Force(context));
++
++            GcQuiesce();
++            int after = ScoutStats(11);
++
 +            GC.KeepAlive(rooted);
++            return after;
 +        }
 +
 +        /// <summary>
@@ -259,8 +297,7 @@ index 2b2f170..3ef83c9 100644
 +        /// point.
 +        /// </summary>
 +        [Fact]
-+        [MethodImpl(MethodImplOptions.NoInlining)]
-+        public void ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge()
++        public async Task ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -273,11 +310,29 @@ index 2b2f170..3ef83c9 100644
 +            }
 +
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            (int scansBefore, int scansAfter, int dependentEdges, int totalEdges) = RefuseWithDependentEdge(context);
++
++            Assert.True(scansAfter > scansBefore,
++                $"no referrer scan was reported (kind 11 was {scansBefore}, now {scansAfter}), so the dependent-edge figures below would describe a different scan.");
++
++            Assert.True(dependentEdges > 0,
++                $"the ConditionalWeakTable dependent edge onto the condemned wrapper was not reported: kind 13 (dependent edges) is {dependentEdges} with kind 12 (total edges) at {totalEdges}. Descriptor scanning structurally cannot see this edge -- sgen zeroes the GC bitmap for Ephemeron -- so a zero here means the ephemeron pass did not run or did not match.");
++
++            await DriveTerminalAsync(context);
++        }
++
++        // Own non-inlined frame, for the reason given on RefuseAndReadScanCount, and here it also
++        // has to confine the CWT and its key: while either is reachable the dependent edge keeps
++        // the wrapper alive and the context cannot be driven terminal.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static (int ScansBefore, int ScansAfter, int DependentEdges, int TotalEdges) RefuseWithDependentEdge(
++            AssemblyLoadContext context)
++        {
 +            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
 +
-+            // The dependent edge: a live key whose VALUE is the condemned wrapper. The key must be
-+            // a distinct live object with no other path to the witness, so the only edge into the
-+            // witness from this table is the ephemeron one.
++            // The dependent edge: a live key whose VALUE is the condemned wrapper. The key is a
++            // distinct object with no other path to the witness, so the only edge into the witness
++            // from this table is the ephemeron one.
 +            var key = new object();
 +            var table = new ConditionalWeakTable<object, object>();
 +            table.Add(key, context);
@@ -286,18 +341,16 @@ index 2b2f170..3ef83c9 100644
 +            Assert.Equal(NotQuiescent, Force(context));
 +            GcQuiesce();
 +
-+            // Kind 11 must have advanced, or kinds 12/13 describe some earlier scan.
-+            Assert.True(ScoutStats(11) > scansBefore,
-+                $"no referrer scan was reported (kind 11 was {scansBefore}, now {ScoutStats(11)}), so the dependent-edge assertions below would describe a different scan.");
++            // Read every gauge BEFORE anything here becomes unreachable, so all three describe the
++            // same scan.
++            int scansAfter = ScoutStats(11);
++            int dependentEdges = ScoutStats(13);
++            int totalEdges = ScoutStats(12);
 +
-+            Assert.True(ScoutStats(13) > 0,
-+                $"the ConditionalWeakTable dependent edge onto the condemned wrapper was not reported: kind 13 (dependent edges) is {ScoutStats(13)} with kind 12 (total edges) at {ScoutStats(12)}. Descriptor scanning cannot see this edge, so a zero here means the ephemeron pass did not run or did not match.");
-+
-+            // Everything must outlive the assertions: dropping the table or the key would kill the
-+            // dependent edge, and dropping the probe would end the refusal.
 +            GC.KeepAlive(rooted);
 +            GC.KeepAlive(key);
 +            GC.KeepAlive(table);
++            return (scansBefore, scansAfter, dependentEdges, totalEdges);
 +        }
 +
 +        /// <summary>
@@ -312,8 +365,7 @@ index 2b2f170..3ef83c9 100644
 +        /// the budget's value rather than its existence.
 +        /// </summary>
 +        [Fact]
-+        [MethodImpl(MethodImplOptions.NoInlining)]
-+        public void ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports()
++        public async Task ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports()
 +        {
 +            if (BridgeMissing())
 +            {
@@ -326,11 +378,28 @@ index 2b2f170..3ef83c9 100644
 +            }
 +
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            (int scansBefore, int scansAfter, int totalEdges) = RefuseWithWideReferenceArray(context);
++
++            Assert.True(scansAfter > scansBefore,
++                $"the scan did not report with a large reference array live: kind 11 was {scansBefore}, now {scansAfter}. An unbounded per-slot cost would surface here as a hang or an abort rather than a missing report, so this failing at all is worth reading carefully.");
++
++            Assert.True(totalEdges > 0,
++                $"kind 12 (edges) is {totalEdges}: the array holding the condemned wrapper produced no edge, so either the slot budget cut the walk short before reaching it or the element was not scanned.");
++
++            await DriveTerminalAsync(context);
++        }
++
++        // Own non-inlined frame: the wide array holds the condemned wrapper in its last element, so
++        // it roots the witness and must be unreachable before the caller drives the context
++        // terminal.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static (int ScansBefore, int ScansAfter, int TotalEdges) RefuseWithWideReferenceArray(
++            AssemblyLoadContext context)
++        {
 +            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
 +
-+            // A large reference array whose elements are non-null, so every element costs a slot
-+            // charge. One element points at the condemned wrapper, so the array is also a genuine
-+            // referrer and the walk cannot skip it as uninteresting.
++            // Every element non-null, so every element costs a slot charge. The last points at the
++            // condemned wrapper, making the array a genuine referrer the walk cannot skip.
 +            object[] wide = new object[200_000];
 +            object filler = new object();
 +            for (int i = 0; i < wide.Length; i++)
@@ -343,25 +412,23 @@ index 2b2f170..3ef83c9 100644
 +            Assert.Equal(NotQuiescent, Force(context));
 +            GcQuiesce();
 +
-+            Assert.True(ScoutStats(11) > scansBefore,
-+                $"the scan did not report with a large reference array live: kind 11 was {scansBefore}, now {ScoutStats(11)}. An unbounded per-slot cost would show up here as a hang or an abort rather than a missing report, so this failing at all is worth reading carefully.");
-+
-+            Assert.True(ScoutStats(12) > 0,
-+                $"kind 12 (edges) is {ScoutStats(12)}: the array holding the condemned wrapper produced no edge, so either the slot budget cut the walk short before reaching it or the element was not scanned.");
++            int scansAfter = ScoutStats(11);
++            int totalEdges = ScoutStats(12);
 +
 +            GC.KeepAlive(rooted);
 +            GC.KeepAlive(wide);
 +            GC.KeepAlive(filler);
++            return (scansBefore, scansAfter, totalEdges);
 +        }
 +
          [Fact]
          public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
          {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..d1db809 100644
+index 1054345..99895f5 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,266 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,265 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -582,9 +649,9 @@ index 1054345..d1db809 100644
 +	 * that qualify the rows -- and that qualify their ABSENCE, which is the reading mistake
 +	 * this diagnostic is most likely to invite. */
 +	mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
-+		"[alc-referrers] witnesses=%u referenced=%d edges=%d described=%d objects=%d/%d slots=%d/%d ephemerons=%d saturated=%d",
++		"[alc-referrers] witnesses=%u referenced=%d edges=%d dependent=%d described=%d objects=%d/%d slots=%d/%d ephemerons=%d saturated=%d",
 +		g_hash_table_size (objects), scan.witnesses_referenced, scan.referrer_edges,
-+		scan.referrers_recorded, scan.objects_scanned, scan.objects_visited,
++		scan.dependent_edges, scan.referrers_recorded, scan.objects_scanned, scan.objects_visited,
 +		scan.reference_slots_visited, ALC_REFERRER_SCAN_SLOT_BUDGET,
 +		scan.ephemeron_entries_visited, scan.saturated ? 1 : 0);
 +
@@ -610,11 +677,10 @@ index 1054345..d1db809 100644
 +	 * The last-scan gauges are published BEFORE that counter is bumped, so a reader that sees a
 +	 * new kind 11 is guaranteed to be looking at this scan's figures and not the previous one's. */
 +	alc_referrer_last_edges = scan.referrer_edges;
-+	alc_referrer_last_dependent_edges = 0;
-+	for (gint32 i = 0; i < scan.referrers_recorded; ++i) {
-+		if (scan.referrers [i].dependent)
-+			alc_referrer_last_dependent_edges++;
-+	}
++	/* Straight from the scan, NOT recomputed from the described rows: an earlier revision counted
++	 * `dependent` rows in `referrers`, which reported 0 whenever the row or witness caps were
++	 * already spent -- so a dependent edge that WAS found could read as absent. */
++	alc_referrer_last_dependent_edges = scan.dependent_edges;
 +	alc_referrer_scans_reported++;
 +
 +	g_hash_table_destroy (objects);
@@ -628,7 +694,7 @@ index 1054345..d1db809 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1213,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1212,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -644,7 +710,7 @@ index 1054345..d1db809 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
-@@ -1032,7 +1298,22 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1032,7 +1297,24 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
  	 *
@@ -661,6 +727,8 @@ index 1054345..d1db809 100644
 +	 * DependentHandle). Kind 13 exists so a regression can prove the dependent-edge pass sees an
 +	 * edge that descriptor scanning structurally cannot: sgen zeroes the GC bitmap for
 +	 * System.Runtime.Ephemeron, so without that pass such a witness produces an empty report.
++	 * Both are EDGE counts taken from the scan itself, not row counts: the description caps must
++	 * never be able to make a found edge read as absent.
 +	 * These are LAST-SCAN values, not monotonic; read kind 11 around them to know which scan they
 +	 * describe. Independent gauges, not a tuple.
 +	 *
@@ -668,7 +736,7 @@ index 1054345..d1db809 100644
  	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
  	 * reasons in the "Root classification for condemned collectible contexts" block at the top
  	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
-@@ -1072,6 +1353,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1072,6 +1354,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
@@ -682,10 +750,10 @@ index 1054345..d1db809 100644
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index 1c51c11..01a182b 100644
+index 1c51c11..747d1fc 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -490,6 +490,144 @@ typedef struct {
+@@ -490,6 +490,149 @@ typedef struct {
  } MonoSgenCondemnedHandleScan;
  
  void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
@@ -806,6 +874,11 @@ index 1c51c11..01a182b 100644
 +	 * referrer_edges is a DESCRIPTION cap, not truncation of the search -- distinct from
 +	 * `saturated`, which reports the search itself being cut short. */
 +	gint32 referrer_edges;
++	/* OUT: of referrer_edges, how many were DEPENDENT edges (ephemeron key->value). Counted for
++	 * every such edge found, independent of whether a row was recorded for it -- the description
++	 * caps must not be able to make a found edge look absent, which is the whole reason this is
++	 * separate from counting `dependent` rows in `referrers`. */
++	gint32 dependent_edges;
 +	/* OUT: distinct condemned objects found to have at least one referrer. */
 +	gint32 witnesses_referenced;
 +	/* OUT: objects the heap iterators presented. This is the TRUE total, not an estimate: the
@@ -857,10 +930,10 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..8249739 100644
+index fd4e6e5..2a569d0 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,294 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -2064,6 +2064,299 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -929,8 +1002,12 @@ index fd4e6e5..8249739 100644
 +	MonoSgenCondemnedReferrerScan *scan = sgen_referrer_scan_current;
 +
 +	/* Every hit counts as an edge, described or not: the counts must stay honest even when the
-+	 * description caps hide the individual rows. */
++	 * description caps hide the individual rows. Dependent edges are counted the same way and
++	 * for the same reason -- a caller asking "did the ephemeron pass find anything" must not get
++	 * a zero merely because the row budget was already spent. */
 +	scan->referrer_edges++;
++	if (dependent)
++		scan->dependent_edges++;
 +
 +	/*
 +	 * The stored value is described + 1, so that "seen at all" and "seen but described zero
@@ -1042,6 +1119,7 @@ index fd4e6e5..8249739 100644
 +	memset (scan->referrers, 0, sizeof (scan->referrers));
 +	scan->referrers_recorded = 0;
 +	scan->referrer_edges = 0;
++	scan->dependent_edges = 0;
 +	scan->witnesses_referenced = 0;
 +	scan->objects_visited = 0;
 +	scan->objects_scanned = 0;
