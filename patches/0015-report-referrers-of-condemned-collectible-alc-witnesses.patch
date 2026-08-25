@@ -46,7 +46,7 @@ DOUBLE OPT-IN. MONO_WASM_ENABLE_ALC_UNLOAD does not arm this on its own; it
 also needs MONO_WASM_ALC_UNLOAD_REFERRER_SCAN. Unlike the snapshot -- a
 read-only gauge a caller chooses to poll -- this adds work to a collection
 pause, so a flagged session that has not asked for referrers pays one load
-and a branch.
+and a branch. The regression asserts that gating in both directions.
 
 WHAT IT BOUNDS, AND WHAT IT DOES NOT. object_budget caps the per-object
 reference scan and NOT the object enumeration: sgen's iterators run to
@@ -65,47 +65,158 @@ the assembly trace, so it is invisible without --trace=asm at info or finer.
 An empty console is therefore never evidence of anything, which the contract
 block says in those words.
 
-Two things worth flagging for review, both found while writing this:
+THE PRECONDITION IS NOT ASSERTED, and that is deliberate rather than an
+omission. Two successive drafts asserted it wrongly, both of which would have
+aborted the runtime on the first armed scan, so the candidates are now
+recorded at the site so neither returns:
 
-  * The precondition is asserted as sgen_is_world_stopped (), NOT as "a
-    collection is in progress". sgen clears
-    sgen_current_collection_generation at the end of the minor/major
-    collection function, which runs BEFORE sgen_restart_world, so at the
-    pre-start-world point the generation already reads -1 just as it does
-    outside a collection. An earlier draft asserted != -1 and would have
-    aborted the runtime on the first armed collection.
-  * Taking alcs_lock inside a GC pause would be a real hazard on a
-    threads-enabled runtime, where mono_coop_mutex_lock does a
-    MONO_ENTER_GC_SAFE transition when contended. It is sound here only
-    because this surface is DISABLE_THREADS-only and every MonoCoopMutex
-    operation is an empty inline there. The reasoning is recorded at the
-    call site rather than left implicit.
+  * sgen_current_collection_generation != -1 is false here. sgen clears the
+    generation at the end of the minor/major collection function, which runs
+    before sgen_restart_world.
+  * sgen_is_world_stopped () is also false here. sgen_restart_world clears
+    world_is_stopped BEFORE calling sgen_client_restart_world, so the flag is
+    already down when the hook runs. The mutators have NOT resumed --
+    unified_suspend_restart_world comes later in that same function -- but the
+    bookkeeping flag does not say so.
+
+mono_gc_walk_heap has the identical contract and asserts nothing about the
+world either; it states the requirement and relies on its callers. This
+follows that precedent, and the single guarded call site is what establishes
+the invariant. A flag set by that caller purely to be asserted would certify
+nothing, so there is none.
+
+Also worth flagging: taking alcs_lock inside a GC pause would be a real
+hazard on a threads-enabled runtime, where mono_coop_mutex_lock does a
+MONO_ENTER_GC_SAFE transition when contended. It is sound here only because
+this surface is DISABLE_THREADS-only and every MonoCoopMutex operation is an
+empty inline there. The reasoning is recorded at the call site rather than
+left implicit, because it stops being true the moment someone builds this
+with threads enabled.
+
+OBSERVABILITY, so this can actually be tested. The scan's only other output
+is trace text, so nothing could distinguish an armed scan from one that never
+ran -- which is precisely how two wrong assertions survived a fully green
+build. Stat kind 11 now counts scans that completed a heap walk AND emitted
+their report, deliberately excluding the early return taken when the
+condemned set has already emptied, so a bump cannot be earned by a scan that
+never looked at the heap. It is a lone monotonic gauge like kinds 7 and 10,
+not a field of a tuple, so it reintroduces none of the cross-read
+consistency problems that shaped the snapshot surface.
+
+ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection drives a refusal
+with the same rooted pointer-free probe the existing witness regression uses,
+forces a collection, and asserts kind 11 advanced when the second opt-in is
+set and did NOT advance when it is absent. It asserts the refusal itself
+rather than tolerating a Completed, since a Completed would make the rest
+vacuous.
 
 Temporary diagnostic scaffolding on the same terms and the same tracking
 issue (#176) as the snapshot it complements: it retires when the residual
 root is found and fixed, or when the stop-rule fires.
 
-NOT COMPILE-VERIFIED LOCALLY. This was authored against the pinned commit
-with the series applied, but building the WASM runtime is not something the
-author can do on this machine; the runtime CI on this PR is the first real
-compile. Reviewers should treat a green CI as the first evidence it builds,
-and the behaviour claims above as unexercised until someone runs a flagged
-session with the scan armed.
-
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- .../mono/metadata/assembly-load-context.c     | 209 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         |  91 ++++++++
+ .../tests/ForcedNativeUnloadTests.cs          |  70 ++++++
+ .../mono/metadata/assembly-load-context.c     | 233 +++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         |  91 +++++++
  src/mono/mono/metadata/loader-internals.h     |  15 ++
- src/mono/mono/metadata/sgen-mono.c            | 176 +++++++++++++++
+ src/mono/mono/metadata/sgen-mono.c            | 187 ++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 ++
- 5 files changed, 506 insertions(+), 1 deletion(-)
+ 6 files changed, 610 insertions(+), 2 deletions(-)
 
+diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+index 2b2f170..b9e708f 100644
+--- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
++++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
+@@ -178,6 +178,14 @@ private static bool FlagEnabled
+         private static bool GcHookRequested =>
+             Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK") == "1";
+ 
++        // Set by the CI single-threaded wasm leg: arms the pause-time condemned-REFERRER scan (the
++        // "Referrer lookup for condemned collectible contexts" block in assembly-load-context.c).
++        // It is a SECOND opt-in on top of MONO_WASM_ENABLE_ALC_UNLOAD, because that scan adds work
++        // to a collection pause rather than being a gauge a caller polls -- so the flag alone must
++        // not arm it, which the regression below asserts in both directions.
++        private static bool ReferrerScanRequested =>
++            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REFERRER_SCAN") == "1";
++
+         // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
+         // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
+         // masking the regression.
+@@ -1585,6 +1593,68 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
+             await RunConservativelyPinnedLosWitnessProtocol();
+         }
+ 
++        /// <summary>
++        /// A quiescence refusal must arm the condemned-referrer scan, and the next collection must
++        /// SERVE it -- and with the second opt-in absent, must not.
++        ///
++        /// This exists because the referrer scan's only other output is runtime trace text, which
++        /// no test can read: before this, CI never armed that code at all, so a wrong assertion
++        /// inside it survived a fully green build twice. Stat kind 11 counts scans that completed a
++        /// heap walk AND emitted their report, so a bump proves the whole serving path ran rather
++        /// than merely that a request was recorded.
++        ///
++        /// The refusal is produced with the same rooted pointer-free probe as
++        /// ForcedUnload_RootedPointerFreeObjects_BlockNativeFree: post-fix that probe roots the
++        /// witness deterministically, which is exactly the state whose holder this diagnostic
++        /// exists to identify.
++        /// </summary>
++        [Fact]
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        public void ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            int before = ScoutStats(11);
++
++            if (!ProtocolActive)
++            {
++                // No teardown protocol here: on a threads-enabled runtime the whole stat surface
++                // reports unavailable (-1), and with the flag off nothing is collectible to
++                // condemn. Either way the gauge must not move.
++                GcQuiesce();
++                Assert.Equal(before, ScoutStats(11));
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++
++            // The refusal is the trigger. If this ever reports Completed the probe stopped rooting
++            // the witness, which is a regression in its own right and would silently make the
++            // assertions below vacuous -- so it is asserted rather than tolerated.
++            Assert.Equal(NotQuiescent, Force(context));
++
++            GcQuiesce();
++
++            int after = ScoutStats(11);
++            if (ReferrerScanRequested)
++            {
++                Assert.True(after > before,
++                    $"MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set and a refusal was recorded, but no scan reported: kind 11 was {before} and is {after}. Either the pause hook never ran, or it aborted/returned before emitting its report.");
++            }
++            else
++            {
++                Assert.Equal(before, after);
++            }
++
++            // The probe must outlive every assertion above: dropping it earlier would let the
++            // witness die, clear the condemned set, and turn the refusal into a Completed.
++            GC.KeepAlive(rooted);
++        }
++
+         [Fact]
+         public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
+         {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..a2abd44 100644
+index 1054345..a6cace8 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,207 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,220 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -175,6 +286,15 @@ index 1054345..a2abd44 100644
 +/* Set by a refusal, consumed by the next collection pause. Coalescing, not a queue (see the
 + * block above). */
 +static gboolean alc_referrer_scan_requested;
++
++/* Monotonic count of scans that completed a heap walk AND emitted their report. Exposed as stat
++ * kind 11 so a regression can prove the serving path ran at all: without it the only evidence
++ * this code ever executes is trace output, which no test can read. Deliberately counts the
++ * REPORTED case only -- a request served when the condemned set had already emptied took the
++ * early return below and walked nothing, so counting it would let a test pass on a scan that
++ * never looked at the heap. A single independent gauge, not one field of a tuple: nothing here
++ * has to be read consistently with anything else. */
++static gint32 alc_referrer_scans_reported;
 +
 +/* Objects whose reference fields the pause-time walk may examine. Sized so the walk costs a
 + * bounded slice of a pause on the heaps this diagnostic runs against, in the same spirit as
@@ -302,6 +422,10 @@ index 1054345..a2abd44 100644
 +			row->referrer, row->field_offset);
 +	}
 +
++	/* AFTER the report: the counter's promise is that the summary and any rows were emitted, so
++	 * a test observing it knows the walk happened rather than merely that a request existed. */
++	alc_referrer_scans_reported++;
++
 +	g_hash_table_destroy (objects);
 +#else
 +	/* No sgen: no heap walk exists. Say so, rather than letting silence read as "no referrers". */
@@ -313,7 +437,7 @@ index 1054345..a2abd44 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1154,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1167,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -329,6 +453,31 @@ index 1054345..a2abd44 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
+@@ -1032,7 +1252,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
+ 	 * counter while kind 7 stays flat.
+ 	 *
+-	 * Kinds 11-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
++	 * Kind 11 — monotonic count of condemned-REFERRER scans that completed a heap walk and
++	 * emitted their report (see the "Referrer lookup for condemned collectible contexts" block).
++	 * It exists because that surface's only other output is trace text, so without it no test
++	 * can tell an armed scan from a scan that never ran. It is a lone gauge like kinds 7 and 10,
++	 * NOT a field of a tuple, so it carries none of the cross-read consistency requirements that
++	 * shaped the snapshot below.
++	 *
++	 * Kinds 12-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
+ 	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
+ 	 * reasons in the "Root classification for condemned collectible contexts" block at the top
+ 	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
+@@ -1072,6 +1299,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+ 		return collectible_alc_native_structs;
+ 	case 10:
+ 		return scout_completion_deferral_count;
++	case 11:
++		return alc_referrer_scans_reported;
+ 	default:
+ 		return -1;
+ 	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
 index 1c51c11..b9f99a2 100644
 --- a/src/mono/mono/metadata/gc-internals.h
@@ -458,10 +607,10 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..cb69a5d 100644
+index fd4e6e5..a331fc7 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,182 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -2064,6 +2064,193 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -606,13 +755,24 @@ index fd4e6e5..cb69a5d 100644
 +		return;
 +
 +	/*
-+	 * See PRECONDITION above. The check is sgen_is_world_stopped () and deliberately NOT
-+	 * "a collection is in progress": sgen clears sgen_current_collection_generation at the end
-+	 * of the minor/major collection function, which runs BEFORE sgen_restart_world, so at the
-+	 * pre-start-world point the generation already reads -1 just as it does outside a
-+	 * collection. World-stopped is the property this walk actually depends on.
++	 * See PRECONDITION above. It is NOT asserted, and that is deliberate: at this hook there is
++	 * no predicate that expresses it. Both obvious candidates are already false here, which is
++	 * recorded so neither gets re-added:
++	 *
++	 *   - sgen_current_collection_generation != -1. sgen clears the generation at the end of the
++	 *     minor/major collection function, which runs before sgen_restart_world, so it reads -1
++	 *     here exactly as it does outside a collection.
++	 *   - sgen_is_world_stopped (). sgen_restart_world clears world_is_stopped BEFORE calling
++	 *     sgen_client_restart_world, so the flag is already FALSE by the time this runs. The
++	 *     mutators have not resumed yet -- unified_suspend_restart_world comes later in that
++	 *     same function -- but the bookkeeping flag does not say so, and asserting on it aborts
++	 *     the runtime on the first armed scan.
++	 *
++	 * mono_gc_walk_heap has the identical contract and asserts nothing about the world either;
++	 * it states the requirement and relies on its callers. This follows that, and the one call
++	 * site (sgen_client_restart_world, guarded) is what actually establishes the invariant. A
++	 * self-certifying flag set by that caller would assert nothing of value, so there is none.
 +	 */
-+	g_assert (sgen_is_world_stopped ());
 +	g_assert (!sgen_referrer_scan_in_progress);
 +
 +	/* No unbounded mode, for the same reason the handle scan has none: a diagnostic that runs

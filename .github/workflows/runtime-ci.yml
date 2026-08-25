@@ -579,6 +579,14 @@ jobs:
         # pinned-holder construction window, and the pressure test asserts the fire counter
         # (kind 4) advanced at least once per init — reverting the holder pins fails this leg
         # deterministically instead of depending on stochastic churn.
+        # MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 arms the pause-time condemned-referrer scan. This
+        # is the ONLY leg that arms it, and it exists because nothing did: that code shipped a
+        # wrong precondition assertion twice while every build stayed green, since its only other
+        # output is trace text no test can read. Armed here,
+        # ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection asserts stat kind 11 advances
+        # after a refusal plus a collection — so an abort or an early return inside the pause hook
+        # fails this leg instead of passing silently. The MT leg deliberately stays unarmed: the
+        # surface is compiled out there and that job's charter is proving rejection.
         # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
         # earlier leg or rerun left behind, so the file this step validates can only have
         # been produced by the invocation below.
@@ -589,7 +597,7 @@ jobs:
         ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
           /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
           /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
+          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 --setenv=MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1"
         # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
         # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
         # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
