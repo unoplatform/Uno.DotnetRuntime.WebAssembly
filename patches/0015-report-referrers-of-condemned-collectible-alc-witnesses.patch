@@ -48,16 +48,39 @@ read-only gauge a caller chooses to poll -- this adds work to a collection
 pause, so a flagged session that has not asked for referrers pays one load
 and a branch. The regression asserts that gating in both directions.
 
-WHAT IT BOUNDS, AND WHAT IT DOES NOT. object_budget caps the per-object
-reference scan and NOT the object enumeration: sgen's iterators run to
-completion and their callbacks cannot stop them, and the walk passes
-ITERATE_OBJECTS_SWEEP_ALL exactly as mono_gc_walk_heap does, which forces a
-lazily-swept major heap to finish sweeping. So a scan costs a full
-enumeration plus at most object_budget reference scans, and the budget is a
-bound on the second half only. Because the iterators always finish,
-objects_visited is a TRUE total rather than an estimate, and
-objects_scanned/objects_visited plus `saturated` say exactly how much of the
-heap the answer covers.
+TWO PASSES, because one is not exhaustive. The heap walk is descriptor-driven,
+and sgen zeroes the GC descriptor bitmap for System.Runtime.Ephemeron
+(object.c, "An Ephemeron cannot be marked by sgen"), so a
+ConditionalWeakTable or DependentHandle value edge is invisible to it -- while
+being a genuine root, since sgen_client_mark_ephemerons marks the value
+whenever the key is alive. On mono that is not a corner case: DependentHandle
+IS an Ephemeron[] ("Instead of dependent handles, mono uses arrays of
+Ephemeron objects"), so every CWT goes through it. A witness held only that
+way would have produced an unsaturated EMPTY report -- a false negative of
+exactly the kind this surface exists to rule out. A second pass walks
+ephemeron_list at the same suspended point, mirroring the collector's own
+liveness and tombstone tests so it reports the edges the collector actually
+traverses, and records the KEY as the referrer with the row marked dependent.
+
+TWO BUDGETS, and neither bounds the pause. object_budget caps how many objects
+are ENTERED. reference_slot_budget caps the SET LOOKUPS, across every object
+entered and the ephemeron pass, and it exists because the object budget bounded
+nothing expensive: the per-object scan invokes its callback once per reference
+-- once per ELEMENT of a vector or complex array -- so one large object[] cost
+a single object unit while performing millions of lookups on the one suspended
+thread. That is the same defect shape as bounding a handle walk on classified
+hits instead of raw slots.
+
+What the budgets do NOT cover, stated because "bounded" was previously claimed
+too broadly: the slot enumeration WITHIN an object already entered cannot be
+interrupted (sgen-scan-object.h expands to a loop this code cannot break out
+of), the heap enumeration is unbounded, and ITERATE_OBJECTS_SWEEP_ALL forces a
+lazily-swept major heap to finish sweeping, exactly as mono_gc_walk_heap does.
+A scan costs that enumeration plus the intra-object slot loads of everything
+entered plus at most reference_slot_budget lookups. Because the iterators
+always finish, objects_visited is a TRUE total, and
+objects_scanned/objects_visited, reference_slots_visited and `saturated`
+together say how much of the heap an answer covers.
 
 A referrer row is direct evidence. An EMPTY report is much weaker and means
 anything only when the scan did not saturate -- and the report is written to
@@ -93,22 +116,33 @@ empty inline there. The reasoning is recorded at the call site rather than
 left implicit, because it stops being true the moment someone builds this
 with threads enabled.
 
-OBSERVABILITY, so this can actually be tested. The scan's only other output
-is trace text, so nothing could distinguish an armed scan from one that never
-ran -- which is precisely how two wrong assertions survived a fully green
-build. Stat kind 11 now counts scans that completed a heap walk AND emitted
-their report, deliberately excluding the early return taken when the
-condemned set has already emptied, so a bump cannot be earned by a scan that
-never looked at the heap. It is a lone monotonic gauge like kinds 7 and 10,
-not a field of a tuple, so it reintroduces none of the cross-read
-consistency problems that shaped the snapshot surface.
+OBSERVABILITY, so this can actually be tested. The scan's only other output is
+trace text, so nothing could distinguish an armed scan from one that never ran
+-- which is precisely how two wrong assertions survived a fully green build.
+Three stat kinds now exist: kind 11 counts scans that completed a walk AND
+emitted their report (excluding the early return taken when the condemned set
+has already emptied, so it cannot be earned by a scan that never looked at the
+heap), and kinds 12 and 13 report the last reported scan's total and DEPENDENT
+edge counts. Kind 13 is what makes the ephemeron blind spot testable at all.
+They are independent gauges, not a tuple: read kind 11 around 12/13 to know
+which scan they describe.
 
-ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection drives a refusal
-with the same rooted pointer-free probe the existing witness regression uses,
-forces a collection, and asserts kind 11 advanced when the second opt-in is
-set and did NOT advance when it is absent. It asserts the refusal itself
-rather than tolerating a Completed, since a Completed would make the rest
-vacuous.
+Three regressions, all on the single-threaded flag-ON leg, which now sets
+MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 -- the only leg that arms this code:
+
+  * ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection -- a refusal plus
+    a collection advances kind 11 with the second opt-in set, and does NOT
+    without it, so the double opt-in is asserted in both directions.
+  * ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge -- a
+    live CWT key whose value is the condemned wrapper must produce a dependent
+    edge. Descriptor scanning structurally cannot see it, so this fails if the
+    ephemeron pass regresses.
+  * ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports -- a 200k-element
+    reference array holding the wrapper must still report, which is where an
+    unbounded per-slot cost would surface.
+
+Each asserts the refusal itself rather than tolerating a Completed, since a
+Completed would make the rest vacuous.
 
 Temporary diagnostic scaffolding on the same terms and the same tracking
 issue (#176) as the snapshot it complements: it retires when the residual
@@ -116,16 +150,16 @@ root is found and fixed, or when the stop-rule fires.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- .../tests/ForcedNativeUnloadTests.cs          |  70 ++++++
- .../mono/metadata/assembly-load-context.c     | 233 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         |  91 +++++++
- src/mono/mono/metadata/loader-internals.h     |  15 ++
- src/mono/mono/metadata/sgen-mono.c            | 187 ++++++++++++++
- src/mono/mono/metadata/sgen-stw.c             |  16 ++
- 6 files changed, 610 insertions(+), 2 deletions(-)
+ .../tests/ForcedNativeUnloadTests.cs          | 181 +++++++++++
+ .../mono/metadata/assembly-load-context.c     | 291 +++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         | 138 +++++++++
+ src/mono/mono/metadata/loader-internals.h     |  15 +
+ src/mono/mono/metadata/sgen-mono.c            | 288 +++++++++++++++++
+ src/mono/mono/metadata/sgen-stw.c             |  16 +
+ 6 files changed, 927 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 2b2f170..b9e708f 100644
+index 2b2f170..3ef83c9 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -178,6 +178,14 @@ private static bool FlagEnabled
@@ -143,7 +177,7 @@ index 2b2f170..b9e708f 100644
          // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
          // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
          // masking the regression.
-@@ -1585,6 +1593,68 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
+@@ -1585,6 +1593,179 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
              await RunConservativelyPinnedLosWitnessProtocol();
          }
  
@@ -209,14 +243,125 @@ index 2b2f170..b9e708f 100644
 +            GC.KeepAlive(rooted);
 +        }
 +
++        /// <summary>
++        /// A witness reachable ONLY as the dependent value of a live ConditionalWeakTable key must
++        /// still be reported, with the edge marked dependent.
++        ///
++        /// This is the case descriptor scanning structurally cannot see: sgen zeroes the GC bitmap
++        /// for System.Runtime.Ephemeron ("An Ephemeron cannot be marked by sgen" in object.c), so
++        /// an ephemeron array reports no references at all, while sgen_client_mark_ephemerons
++        /// still marks the value whenever the key is alive. Without the dedicated ephemeron pass
++        /// such a witness produces an UNSATURATED EMPTY report — which would be a false negative
++        /// of exactly the kind this diagnostic exists to rule out.
++        ///
++        /// The witness used is the condemned context's own managed wrapper, which is a member of
++        /// the condemned identity set, so no unloadable-assembly type has to survive to make the
++        /// point.
++        /// </summary>
++        [Fact]
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        public void ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive || !ReferrerScanRequested)
++            {
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++
++            // The dependent edge: a live key whose VALUE is the condemned wrapper. The key must be
++            // a distinct live object with no other path to the witness, so the only edge into the
++            // witness from this table is the ephemeron one.
++            var key = new object();
++            var table = new ConditionalWeakTable<object, object>();
++            table.Add(key, context);
++
++            int scansBefore = ScoutStats(11);
++            Assert.Equal(NotQuiescent, Force(context));
++            GcQuiesce();
++
++            // Kind 11 must have advanced, or kinds 12/13 describe some earlier scan.
++            Assert.True(ScoutStats(11) > scansBefore,
++                $"no referrer scan was reported (kind 11 was {scansBefore}, now {ScoutStats(11)}), so the dependent-edge assertions below would describe a different scan.");
++
++            Assert.True(ScoutStats(13) > 0,
++                $"the ConditionalWeakTable dependent edge onto the condemned wrapper was not reported: kind 13 (dependent edges) is {ScoutStats(13)} with kind 12 (total edges) at {ScoutStats(12)}. Descriptor scanning cannot see this edge, so a zero here means the ephemeron pass did not run or did not match.");
++
++            // Everything must outlive the assertions: dropping the table or the key would kill the
++            // dependent edge, and dropping the probe would end the refusal.
++            GC.KeepAlive(rooted);
++            GC.KeepAlive(key);
++            GC.KeepAlive(table);
++        }
++
++        /// <summary>
++        /// One large reference array must not be able to spend an unbounded number of set lookups.
++        ///
++        /// The object budget alone bounded only how many objects are ENTERED, so a single
++        /// object[] with millions of elements cost one object unit while performing a lookup per
++        /// element on the suspended browser thread. The reference-slot budget bounds the lookups
++        /// instead; this asserts the scan still completes and reports, with the array live and
++        /// referenced, rather than asserting a particular saturation flag — the budget is sized
++        /// well above what a test heap can reach, so demanding saturation here would be asserting
++        /// the budget's value rather than its existence.
++        /// </summary>
++        [Fact]
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        public void ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive || !ReferrerScanRequested)
++            {
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++
++            // A large reference array whose elements are non-null, so every element costs a slot
++            // charge. One element points at the condemned wrapper, so the array is also a genuine
++            // referrer and the walk cannot skip it as uninteresting.
++            object[] wide = new object[200_000];
++            object filler = new object();
++            for (int i = 0; i < wide.Length; i++)
++            {
++                wide[i] = filler;
++            }
++            wide[wide.Length - 1] = context;
++
++            int scansBefore = ScoutStats(11);
++            Assert.Equal(NotQuiescent, Force(context));
++            GcQuiesce();
++
++            Assert.True(ScoutStats(11) > scansBefore,
++                $"the scan did not report with a large reference array live: kind 11 was {scansBefore}, now {ScoutStats(11)}. An unbounded per-slot cost would show up here as a hang or an abort rather than a missing report, so this failing at all is worth reading carefully.");
++
++            Assert.True(ScoutStats(12) > 0,
++                $"kind 12 (edges) is {ScoutStats(12)}: the array holding the condemned wrapper produced no edge, so either the slot budget cut the walk short before reaching it or the element was not scanned.");
++
++            GC.KeepAlive(rooted);
++            GC.KeepAlive(wide);
++            GC.KeepAlive(filler);
++        }
++
          [Fact]
          public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
          {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..a6cace8 100644
+index 1054345..d1db809 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,220 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,266 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -244,10 +389,18 @@ index 1054345..a6cace8 100644
 + * witnesses are nevertheless reachable, so the reference runs through the object graph -- and no
 + * amount of further handle classification can follow a graph.
 + *
-+ * WHAT THIS MEASURES. One bounded pass over the heap with the world already stopped, reporting
-+ * for each condemned witness the CLASS of the objects that reference it, plus the field offset
-+ * of the reference. That is the reverse of the snapshot's question, and it names the holder
-+ * directly instead of narrowing the search space.
++ * WHAT THIS MEASURES. Two bounded passes with the mutators still suspended, reporting for each
++ * condemned witness the CLASS of the objects that reference it, plus the field offset of the
++ * reference. That is the reverse of the snapshot's question, and it names the holder directly
++ * instead of narrowing the search space.
++ *
++ * TWO passes, because one is not exhaustive. The heap walk is descriptor-driven, and sgen zeroes
++ * the GC descriptor bitmap for System.Runtime.Ephemeron, so a ConditionalWeakTable or
++ * DependentHandle value edge is invisible to it -- while being a genuine root, since
++ * sgen_client_mark_ephemerons marks the value whenever the key is alive. A witness held only
++ * that way would otherwise produce an unsaturated EMPTY report, which is the one reading this
++ * surface must never get wrong. The second pass walks ephemeron_list and reports those edges
++ * marked as dependent, with the KEY as the referrer.
 + *
 + * WHEN IT RUNS -- and why it is not synchronous. The interesting moment is a REFUSAL: the
 + * quiescence gate answering not-quiescent is the only evidence that a witness is still held.
@@ -296,11 +449,32 @@ index 1054345..a6cace8 100644
 + * has to be read consistently with anything else. */
 +static gint32 alc_referrer_scans_reported;
 +
-+/* Objects whose reference fields the pause-time walk may examine. Sized so the walk costs a
-+ * bounded slice of a pause on the heaps this diagnostic runs against, in the same spirit as
-+ * ALC_CONDEMNED_HANDLE_SLOT_BUDGET: large enough to cover a stranding repro's heap, small
-+ * enough that saturation gets reported rather than silently paid for. */
++/* Referencing EDGES found by the most recently reported scan, and how many of those were
++ * DEPENDENT edges (ephemeron key->value). Exposed as stat kinds 12 and 13 so a regression can
++ * prove the dependent-edge pass finds an edge that descriptor scanning cannot see -- without
++ * them, a ConditionalWeakTable blind spot would be invisible to every test, which is exactly the
++ * gap that let two wrong assertions ship. Last-scan values rather than monotonic totals: the
++ * question a test asks is "what did THAT scan find", and kind 11 is the monotonic companion that
++ * says whether a new scan has happened at all. Read kind 11 before and after to know which scan
++ * these describe -- they are independent gauges, not a tuple. */
++static gint32 alc_referrer_last_edges;
++static gint32 alc_referrer_last_dependent_edges;
++
++/* Objects the pause-time walk may ENTER for reference scanning. Large enough to cover a
++ * stranding repro's heap, small enough that saturation is reported rather than silently paid
++ * for. */
 +#define ALC_REFERRER_SCAN_OBJECT_BUDGET 400000
++
++/* Reference slots the walk may LOOK UP, across every object entered and the ephemeron pass. This
++ * is the budget that bounds the dominant cost; the object budget above bounds only how many
++ * objects are entered, and one large array can carry millions of slots by itself.
++ *
++ * Deliberately NOT described as bounding the pause. It does not: the heap enumeration (including
++ * the forced major sweep) is unbounded, and the slot enumeration WITHIN an object already entered
++ * cannot be interrupted. See reference_slot_budget on MonoSgenCondemnedReferrerScan, which states
++ * precisely what each budget does and does not cover -- an earlier revision of this comment
++ * claimed a "bounded slice of a pause", which was not true of either budget. */
++#define ALC_REFERRER_SCAN_SLOT_BUDGET 2000000
 +
 +/* Explicit, separate opt-in on top of MONO_WASM_ENABLE_ALC_UNLOAD (see DOUBLE OPT-IN above).
 + * Read once: an env lookup must not be repeated inside a GC pause. */
@@ -401,29 +575,46 @@ index 1054345..a6cace8 100644
 +	memset (&scan, 0, sizeof (scan));
 +	scan.condemned_objects = objects;
 +	scan.object_budget = ALC_REFERRER_SCAN_OBJECT_BUDGET;
++	scan.reference_slot_budget = ALC_REFERRER_SCAN_SLOT_BUDGET;
 +	sgen_scan_referrers_of_condemned (&scan);
 +
 +	/* One summary line, then one line per described referrer. The summary carries the figures
 +	 * that qualify the rows -- and that qualify their ABSENCE, which is the reading mistake
 +	 * this diagnostic is most likely to invite. */
 +	mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
-+		"[alc-referrers] witnesses=%u referenced=%d edges=%d described=%d objects=%d/%d saturated=%d",
++		"[alc-referrers] witnesses=%u referenced=%d edges=%d described=%d objects=%d/%d slots=%d/%d ephemerons=%d saturated=%d",
 +		g_hash_table_size (objects), scan.witnesses_referenced, scan.referrer_edges,
 +		scan.referrers_recorded, scan.objects_scanned, scan.objects_visited,
-+		scan.saturated ? 1 : 0);
++		scan.reference_slots_visited, ALC_REFERRER_SCAN_SLOT_BUDGET,
++		scan.ephemeron_entries_visited, scan.saturated ? 1 : 0);
 +
 +	for (gint32 i = 0; i < scan.referrers_recorded; ++i) {
 +		MonoSgenCondemnedReferrer *row = &scan.referrers [i];
++		/* "<-" is an ordinary reference, "<=" a DEPENDENT one (the witness is the value of a
++		 * live ephemeron key: a ConditionalWeakTable or DependentHandle). The distinction is the
++		 * whole point of the second pass, so it must survive into the output -- and for a
++		 * dependent row the trailing number is the ephemeron INDEX, not a field offset. */
 +		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
-+			"[alc-referrers]   witness=%p <- %s.%s[%p] +%u",
++			"[alc-referrers]   witness=%p %s %s.%s[%p] %s%u",
 +			row->witness,
++			row->dependent ? "<=" : "<-",
 +			row->referrer_klass_namespace ? row->referrer_klass_namespace : "?",
 +			row->referrer_klass_name ? row->referrer_klass_name : "?",
-+			row->referrer, row->field_offset);
++			row->referrer,
++			row->dependent ? "idx=" : "+",
++			row->field_offset);
 +	}
 +
 +	/* AFTER the report: the counter's promise is that the summary and any rows were emitted, so
-+	 * a test observing it knows the walk happened rather than merely that a request existed. */
++	 * a test observing it knows the walk happened rather than merely that a request existed.
++	 * The last-scan gauges are published BEFORE that counter is bumped, so a reader that sees a
++	 * new kind 11 is guaranteed to be looking at this scan's figures and not the previous one's. */
++	alc_referrer_last_edges = scan.referrer_edges;
++	alc_referrer_last_dependent_edges = 0;
++	for (gint32 i = 0; i < scan.referrers_recorded; ++i) {
++		if (scan.referrers [i].dependent)
++			alc_referrer_last_dependent_edges++;
++	}
 +	alc_referrer_scans_reported++;
 +
 +	g_hash_table_destroy (objects);
@@ -437,7 +628,7 @@ index 1054345..a6cace8 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1167,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1213,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -453,7 +644,7 @@ index 1054345..a6cace8 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
-@@ -1032,7 +1252,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1032,7 +1298,22 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
  	 *
@@ -465,24 +656,36 @@ index 1054345..a6cace8 100644
 +	 * NOT a field of a tuple, so it carries none of the cross-read consistency requirements that
 +	 * shaped the snapshot below.
 +	 *
-+	 * Kinds 12-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
++	 * Kinds 12 and 13 — referencing EDGES found by the most recently REPORTED referrer scan, and
++	 * how many of those were DEPENDENT edges (ephemeron key->value, i.e. a ConditionalWeakTable or
++	 * DependentHandle). Kind 13 exists so a regression can prove the dependent-edge pass sees an
++	 * edge that descriptor scanning structurally cannot: sgen zeroes the GC bitmap for
++	 * System.Runtime.Ephemeron, so without that pass such a witness produces an empty report.
++	 * These are LAST-SCAN values, not monotonic; read kind 11 around them to know which scan they
++	 * describe. Independent gauges, not a tuple.
++	 *
++	 * Kinds 14-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
  	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
  	 * reasons in the "Root classification for condemned collectible contexts" block at the top
  	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
-@@ -1072,6 +1299,8 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1072,6 +1353,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
 +	case 11:
 +		return alc_referrer_scans_reported;
++	case 12:
++		return alc_referrer_last_edges;
++	case 13:
++		return alc_referrer_last_dependent_edges;
  	default:
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index 1c51c11..b9f99a2 100644
+index 1c51c11..01a182b 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -490,6 +490,97 @@ typedef struct {
+@@ -490,6 +490,144 @@ typedef struct {
  } MonoSgenCondemnedHandleScan;
  
  void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
@@ -501,21 +704,40 @@ index 1c51c11..b9f99a2 100644
 + * the referrers themselves.
 + *
 + * PRECONDITION, and the reason this one differs from its sibling: the heap walk is only legal
-+ * with the world already STOPPED and the collection finished, i.e. from the
-+ * MONO_GC_EVENT_PRE_START_WORLD point (see mono_gc_walk_heap's own contract in sgen-mono.c),
-+ * and it asserts sgen_is_world_stopped (). The handle scan runs with the world RUNNING instead,
-+ * from an ordinary icall, because it only reads handle slots and must not be able to observe a
-+ * collector mid-rewrite. Note that BOTH points see sgen_current_collection_generation == -1 --
-+ * sgen clears it before restarting the world -- so the generation cannot tell them apart and
-+ * neither assertion is phrased in terms of it.
++ * with the mutators still suspended and the collection finished, i.e. from the
++ * MONO_GC_EVENT_PRE_START_WORLD point (see mono_gc_walk_heap's own contract in sgen-mono.c).
++ * The handle scan runs with the world RUNNING instead, from an ordinary icall, because it only
++ * reads handle slots and must not observe a collector mid-rewrite.
++ *
++ * It is NOT asserted, and neither of the two predicates one would reach for says what it looks
++ * like it says at this point -- both read the same at the hook as they do outside a collection:
++ * sgen clears sgen_current_collection_generation before restarting, and sgen_restart_world
++ * clears world_is_stopped BEFORE calling sgen_client_restart_world, so sgen_is_world_stopped ()
++ * is already FALSE while the mutators are still suspended. The definition in sgen-mono.c
++ * records both dead ends; do not reintroduce either assertion.
++ *
++ * COMPLETENESS, which is what an unsaturated EMPTY result rests on. Descriptor scanning alone is
++ * NOT exhaustive: sgen deliberately zeroes the GC bitmap for System.Runtime.Ephemeron (object.c,
++ * "An Ephemeron cannot be marked by sgen"), so a ConditionalWeakTable / DependentHandle value
++ * edge is invisible to every descriptor-driven walk, including this one. Those edges are real --
++ * sgen_client_mark_ephemerons marks the value while the key is alive -- so a witness held only
++ * as a dependent value would produce an unsaturated empty report and directly contradict the
++ * contract. The scan therefore runs a SECOND pass over ephemeron_list at the same stopped-world
++ * point and reports those edges with `dependent` set. Root classes the collector marks outside
++ * object descriptors and outside ephemerons -- thread stacks and registers, native structures --
++ * remain outside this walk, and outside what an empty result can claim.
 + */
 +
 +/* Referrers described per witness before further hits on that witness are counted but not
 + * described. Small on purpose: the question is "what CLASS of thing holds this", and the first
 + * few answers settle it -- an unbounded list would turn a diagnostic into a heap dump. */
 +#define MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS 4
-+/* Distinct witnesses described per scan. A stranding repro accumulates one witness per cycle
-+ * and the referrer SHAPE repeats, so describing the first few is what identifies the holder. */
++/* Distinct witnesses ADMITTED for description per scan. A stranding repro accumulates one
++ * witness per cycle and the referrer SHAPE repeats, so describing the first few is what
++ * identifies the holder. This is an ENFORCED admission cap, not merely a factor in the array
++ * size below: once this many distinct witnesses hold rows, later ones are still COUNTED (in
++ * referrer_edges and witnesses_referenced) but receive none, so 32 witnesses with a single edge
++ * each cannot quietly consume the whole row array while this comment promises eight. */
 +#define MONO_SGEN_CONDEMNED_WITNESSES_REPORTED 8
 +
 +typedef struct {
@@ -529,8 +751,17 @@ index 1c51c11..b9f99a2 100644
 +	const char *referrer_klass_name;
 +	const char *referrer_klass_namespace;
 +	/* Byte offset of the referencing field within the referrer, as reported by the object
-+	 * scanner. Cheap to carry, and it separates "a field of X" from "an element of X". */
++	 * scanner. Cheap to carry, and it separates "a field of X" from "an element of X". For a
++	 * dependent edge (see `dependent`) it is the ephemeron's INDEX within its array instead: a
++	 * byte offset into a struct whose fields the collector reports none of would be meaningless.
++	 */
 +	guint32 field_offset;
++	/* TRUE when the row came from the ephemeron pass rather than descriptor scanning: the witness
++	 * is the dependent VALUE of a live key, i.e. reached through a ConditionalWeakTable or
++	 * DependentHandle. `referrer` is then the KEY, which is the identity worth having -- "alive
++	 * exactly as long as this key is" -- rather than the ephemeron array that happens to hold
++	 * the pair. */
++	gboolean dependent;
 +} MonoSgenCondemnedReferrer;
 +
 +typedef struct {
@@ -539,20 +770,32 @@ index 1c51c11..b9f99a2 100644
 +	 * inside the same pause: a set built earlier cannot be carried across a collection, because
 +	 * a moving collector relocates its members. */
 +	GHashTable *condemned_objects;
-+	/* IN: cap on objects whose REFERENCE FIELDS are examined. MUST be > 0 (asserted).
-+	 *
-+	 * READ THIS BEFORE TRUSTING AN EMPTY RESULT. The cap bounds the per-object REFERENCE SCAN
-+	 * and NOT the object enumeration, because sgen's heap iterators (sgen_scan_area_with_callback,
-+	 * the major collector's iterate_objects, sgen_los_iterate_objects) run to completion and
-+	 * their callbacks cannot stop them. So a scan costs a full enumeration of the heap -- which
-+	 * includes forcing the major collector to finish sweeping, since the walk passes
-+	 * ITERATE_OBJECTS_SWEEP_ALL exactly as mono_gc_walk_heap does, and that is NOT free on a
-+	 * lazily-swept heap -- plus at most `object_budget` reference scans on top. The budget bounds
-+	 * the second half only; it is not a bound on the whole operation and must not be read as one.
-+	 * Once it is spent, later objects are COUNTED but not examined, `saturated` is set, and every
-+	 * count below becomes a LOWER BOUND: an empty referrer list from a saturated scan says
-+	 * nothing at all. */
++	/* IN: cap on the NUMBER OF OBJECTS entered for reference scanning. MUST be > 0 (asserted).
++	 * This bounds how many objects are entered and says nothing about what each one costs -- see
++	 * reference_slot_budget, which is the bound that actually matters. */
 +	gint32 object_budget;
++	/* IN: cap on REFERENCE SLOTS looked up, across every object entered and the ephemeron pass.
++	 * MUST be > 0 (asserted).
++	 *
++	 * This exists because object_budget alone bounded nothing expensive. The per-object scan
++	 * invokes the reference callback once per reference -- once per ELEMENT for a vector or
++	 * complex array -- so one large object[] costs a single object unit while performing
++	 * millions of pointer loads and set lookups on the browser's one suspended thread. That is
++	 * the same defect shape as bounding a handle walk on classified hits rather than raw slots.
++	 *
++	 * WHAT IT BOUNDS AND WHAT IT DOES NOT, stated narrowly because "the pause is bounded" would
++	 * be false:
++	 *   - It bounds the SET LOOKUPS, the dominant per-slot cost, across the whole scan rather
++	 *     than per object.
++	 *   - It does NOT interrupt the enumeration of one object's slots. sgen-scan-object.h expands
++	 *     to a loop this code cannot break out of, so every object entered pays all of its own
++	 *     pointer loads even with the budget already spent.
++	 *   - It does NOT bound the object enumeration (see object_budget), nor the forced major
++	 *     sweep from ITERATE_OBJECTS_SWEEP_ALL, which mono_gc_walk_heap also performs.
++	 * A scan therefore costs: a full heap enumeration including that sweep, plus the intra-object
++	 * slot loads of every object entered, plus at most `reference_slot_budget` lookups. It is not
++	 * a bound on total pause work and must not be read as one. */
++	gint32 reference_slot_budget;
 +
 +	/* OUT: referrer rows, filled in discovery order up to the caps above. */
 +	MonoSgenCondemnedReferrer referrers [MONO_SGEN_CONDEMNED_WITNESSES_REPORTED * MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS];
@@ -569,10 +812,17 @@ index 1c51c11..b9f99a2 100644
 +	 * iterators always run to completion (see object_budget), so no denominator is fabricated. */
 +	gint32 objects_visited;
 +	/* OUT: objects whose reference fields were actually examined, i.e. the part of
-+	 * objects_visited the budget paid for. */
++	 * objects_visited that object_budget paid for. */
 +	gint32 objects_scanned;
-+	/* OUT: TRUE when objects_scanned < objects_visited, i.e. the budget ran out and the search
-+	 * is incomplete (see object_budget). */
++	/* OUT: reference slots for which a set lookup was performed, the ephemeron pass included.
++	 * Bounded by reference_slot_budget. */
++	gint32 reference_slots_visited;
++	/* OUT: ephemeron entries examined -- live-keyed entries of live ephemeron arrays. Reported
++	 * separately because zero here alongside a non-empty heap walk means the dependent-edge pass
++	 * had nothing to look at, which is a different statement from finding no dependent edge. */
++	gint32 ephemeron_entries_visited;
++	/* OUT: TRUE when EITHER budget ran out. The search is then incomplete, every count above is
++	 * a LOWER BOUND, and an empty referrer list says nothing at all. */
 +	gboolean saturated;
 +} MonoSgenCondemnedReferrerScan;
 +
@@ -607,10 +857,10 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..a331fc7 100644
+index fd4e6e5..8249739 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,193 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -2064,6 +2064,294 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -642,12 +892,39 @@ index fd4e6e5..a331fc7 100644
 +static gboolean sgen_referrer_scan_in_progress;
 +
 +/* Per-witness description budget. Keyed on the witness pointer, value is the number of rows
-+ * already emitted for it, so the caps in gc-internals.h are enforced per witness rather than
-+ * letting one heavily-referenced object consume every row. */
++ * already emitted for it PLUS ONE, so the caps in gc-internals.h are enforced per witness rather
++ * than letting one heavily-referenced object consume every row. The +1 bias makes "seen but
++ * described zero times" representable; see sgen_referrer_record. */
 +static GHashTable *sgen_referrer_scan_described;
 +
++/* Distinct witnesses ADMITTED for description so far. Enforces
++ * MONO_SGEN_CONDEMNED_WITNESSES_REPORTED, which without this was only a factor in the row-array
++ * size: 32 witnesses with one edge each would each get a row and exhaust the array, while the
++ * contract said eight. Witnesses beyond the cap are still counted, just not described. */
++static gint32 sgen_referrer_scan_witnesses_admitted;
++
++/*
++ * Charge one reference slot against the budget. Returns FALSE once the budget is spent, at which
++ * point the caller must skip the lookup -- the expensive part -- and the scan is saturated. The
++ * counter is incremented only when the charge succeeds, so reference_slots_visited means "slots
++ * we actually looked up" and never "slots we walked past".
++ */
++static gboolean
++sgen_referrer_charge_slot (void)
++{
++	MonoSgenCondemnedReferrerScan *scan = sgen_referrer_scan_current;
++
++	if (scan->reference_slots_visited >= scan->reference_slot_budget) {
++		scan->saturated = TRUE;
++		return FALSE;
++	}
++
++	scan->reference_slots_visited++;
++	return TRUE;
++}
++
 +static void
-+sgen_referrer_record (GCObject *referrer, GCObject *witness, uintptr_t offset)
++sgen_referrer_record (GCObject *referrer, GCObject *witness, uintptr_t offset, gboolean dependent)
 +{
 +	MonoSgenCondemnedReferrerScan *scan = sgen_referrer_scan_current;
 +
@@ -668,8 +945,17 @@ index fd4e6e5..a331fc7 100644
 +
 +	if (!prior) {
 +		scan->witnesses_referenced++;
-+		/* Mark seen BEFORE either cap below can return early. */
++		/* Mark seen BEFORE any cap below can return early. */
 +		g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (1));
++		/* Admission: a NEW witness only gets rows while there is room in the distinct-witness
++		 * cap. Counted above regardless, so the totals stay honest past the cap. */
++		if (sgen_referrer_scan_witnesses_admitted >= MONO_SGEN_CONDEMNED_WITNESSES_REPORTED)
++			return;
++		sgen_referrer_scan_witnesses_admitted++;
++	} else if (described == 0) {
++		/* Seen before but never admitted: it lost the admission race above and stays undescribed
++		 * for the rest of the scan rather than sneaking rows in on a later edge. */
++		return;
 +	}
 +
 +	if (described >= MONO_SGEN_CONDEMNED_REFERRERS_PER_WITNESS)
@@ -681,6 +967,7 @@ index fd4e6e5..a331fc7 100644
 +	row->witness = witness;
 +	row->referrer = referrer;
 +	row->field_offset = (guint32)offset;
++	row->dependent = dependent;
 +
 +	/* NULL-safe on purpose: a referrer whose vtable or class cannot be read is still worth
 +	 * reporting as an edge, and this is a diagnostic that must not be able to abort the runtime
@@ -694,11 +981,22 @@ index fd4e6e5..a331fc7 100644
 +	g_hash_table_insert (sgen_referrer_scan_described, witness, GUINT_TO_POINTER (described + 2));
 +}
 +
++/*
++ * One reference slot. The lookup is charged to reference_slot_budget HERE rather than per
++ * object, because this is what a large array actually costs: sgen-scan-object.h expands to a
++ * loop over every element and calls this macro for each one. Once the budget is spent the
++ * lookups stop and the scan is marked saturated; the loop itself cannot be broken out of, so
++ * the pointer loads of an object already entered still happen (stated in gc-internals.h).
++ */
 +#undef HANDLE_PTR
 +#define HANDLE_PTR(ptr,obj)	do {	\
 +		GCObject *__ref = *(ptr);	\
-+		if (__ref && g_hash_table_contains (sgen_referrer_scan_current->condemned_objects, __ref))	\
-+			sgen_referrer_record ((GCObject*)start, __ref, (char*)(ptr) - (char*)start);	\
++		if (__ref) {	\
++			if (!sgen_referrer_charge_slot ())	\
++				break;	\
++			if (g_hash_table_contains (sgen_referrer_scan_current->condemned_objects, __ref))	\
++				sgen_referrer_record ((GCObject*)start, __ref, (char*)(ptr) - (char*)start, FALSE);	\
++		}	\
 +	} while (0)
 +
 +static void
@@ -747,6 +1045,8 @@ index fd4e6e5..a331fc7 100644
 +	scan->witnesses_referenced = 0;
 +	scan->objects_visited = 0;
 +	scan->objects_scanned = 0;
++	scan->reference_slots_visited = 0;
++	scan->ephemeron_entries_visited = 0;
 +	scan->saturated = FALSE;
 +
 +	/* Nothing to find referrers of: skip the sweep entirely rather than walking the whole heap
@@ -779,10 +1079,12 @@ index fd4e6e5..a331fc7 100644
 +	 * inside a GC pause on the single browser thread must carry a bound by construction, so a
 +	 * non-positive budget is a caller bug rather than a mode. */
 +	g_assert (scan->object_budget > 0);
++	g_assert (scan->reference_slot_budget > 0);
 +
 +	sgen_referrer_scan_in_progress = TRUE;
 +	sgen_referrer_scan_current = scan;
 +	sgen_referrer_scan_described = g_hash_table_new (g_direct_hash, g_direct_equal);
++	sgen_referrer_scan_witnesses_admitted = 0;
 +
 +	/*
 +	 * The same three regions mono_gc_walk_heap covers, in the same order, because between them
@@ -796,8 +1098,57 @@ index fd4e6e5..a331fc7 100644
 +	sgen_major_collector.iterate_objects (ITERATE_OBJECTS_SWEEP_ALL, sgen_referrer_visit_object, scan);
 +	sgen_los_iterate_objects (sgen_referrer_visit_object, scan);
 +
++	/*
++	 * SECOND PASS: dependent edges, which the three passes above CANNOT see.
++	 *
++	 * sgen zeroes the GC bitmap for System.Runtime.Ephemeron (object.c, "An Ephemeron cannot be
++	 * marked by sgen"), so an ephemeron array's descriptor reports no references and every
++	 * descriptor-driven walk -- including this one -- misses the key->value edge entirely. The
++	 * edge is nonetheless a real root: sgen_client_mark_ephemerons marks the value whenever the
++	 * key is alive, which is exactly how a ConditionalWeakTable or DependentHandle keeps its
++	 * value reachable. Without this pass a witness held only as a dependent value would produce
++	 * an UNSATURATED EMPTY report, contradicting the one thing an empty report is supposed to
++	 * mean.
++	 *
++	 * The liveness test and the tombstone skip mirror sgen_client_mark_ephemerons so that this
++	 * pass reports the same edges the collector actually traverses -- a dead key's value is not
++	 * a root, and reporting it would invent a holder. The referrer recorded is the KEY, since
++	 * "alive as long as this key is" is the actionable identity; the array is not.
++	 */
++	for (EphemeronLinkNode *current = ephemeron_list; current; current = current->next) {
++		MonoArray *array = current->array;
++		if (!array || !sgen_is_object_alive_for_current_gen ((GCObject*)array))
++			continue;
++
++		Ephemeron *cur = mono_array_addr_internal (array, Ephemeron, 0);
++		Ephemeron *array_end = cur + mono_array_length_internal (array);
++		GCObject *tombstone = SGEN_LOAD_VTABLE ((GCObject*)array)->domain->ephemeron_tombstone;
++
++		for (; cur < array_end; ++cur) {
++			GCObject *key = cur->key;
++			if (!key || key == tombstone)
++				continue;
++			if (!sgen_is_object_alive_for_current_gen (key))
++				continue;
++
++			GCObject *value = cur->value;
++			if (!value)
++				continue;
++
++			/* Charged like any other reference slot, so one enormous CWT cannot cost more than
++			 * the budget allows. */
++			if (!sgen_referrer_charge_slot ())
++				break;
++
++			scan->ephemeron_entries_visited++;
++			if (g_hash_table_contains (scan->condemned_objects, value))
++				sgen_referrer_record (key, value, (guint32)(cur - mono_array_addr_internal (array, Ephemeron, 0)), TRUE);
++		}
++	}
++
 +	g_hash_table_destroy (sgen_referrer_scan_described);
 +	sgen_referrer_scan_described = NULL;
++	sgen_referrer_scan_witnesses_admitted = 0;
 +	sgen_referrer_scan_current = NULL;
 +	sgen_referrer_scan_in_progress = FALSE;
 +}
