@@ -57,10 +57,26 @@ whenever the key is alive. On mono that is not a corner case: DependentHandle
 IS an Ephemeron[] ("Instead of dependent handles, mono uses arrays of
 Ephemeron objects"), so every CWT goes through it. A witness held only that
 way would have produced an unsaturated EMPTY report -- a false negative of
-exactly the kind this surface exists to rule out. A second pass walks
-ephemeron_list at the same suspended point, mirroring the collector's own
-liveness and tombstone tests so it reports the edges the collector actually
-traverses, and records the KEY as the referrer with the row marked dependent.
+exactly the kind this surface exists to rule out.
+
+The ephemeron pass runs FIRST and applies NO liveness predicate, both
+deliberately.
+
+No predicate, because one would be wrong here and is also unnecessary.
+sgen_client_clear_unreachable_ephemerons already ran inside the finishing
+collection: it unlinked and freed nodes whose array was dead and tombstoned
+every entry whose key was dead, clearing its value. The list is therefore
+already pruned to exactly the live arrays and live-keyed entries, and skipping
+NULL/tombstone keys is the whole test needed. An earlier revision mirrored the
+collector and called sgen_is_object_alive_for_current_gen, which silently
+dropped live PROMOTED entries: the major pass passes ITERATE_OBJECTS_SWEEP_ALL,
+marksweep's sweep_block clears block->mark_words, and with
+sgen_current_collection_generation already -1 that predicate falls through to
+sgen_major_is_object_alive and reads the cleared bit.
+
+First, because it shares the slot budget and running it last let a saturating
+heap walk starve it completely -- silently reinstating the blind spot it exists
+to close, in exactly the small-budget/large-heap case where it matters most.
 
 TWO BUDGETS, and neither bounds the pause. object_budget caps how many objects
 are ENTERED. reference_slot_budget caps the SET LOOKUPS, across every object
@@ -127,31 +143,49 @@ edge counts. Kind 13 is what makes the ephemeron blind spot testable at all.
 They are independent gauges, not a tuple: read kind 11 around 12/13 to know
 which scan they describe.
 
-Three regressions, all on the single-threaded flag-ON leg, which now sets
-MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 -- the only leg that arms this code:
+FALSIFIABILITY. Three things were previously asserted only by comment, and are
+now testable:
 
-  * ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection -- a refusal plus
-    a collection advances kind 11 with the second opt-in set, and does NOT
-    without it, so the double opt-in is asserted in both directions.
-  * ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge -- a
-    live CWT key whose value is the condemned wrapper must produce a dependent
-    edge. Descriptor scanning structurally cannot see it, so this fails if the
-    ephemeron pass regresses.
-  * ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports -- a 200k-element
-    reference array holding the wrapper must still report, which is where an
-    unbounded per-slot cost would surface.
+  * The slot budget is overridable DOWNWARD via
+    MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET, clamped to the production value
+    so an override can only ever shrink the walk. Without it saturation was
+    unreachable from a test -- a test heap cannot produce two million reference
+    slots -- so deleting the per-slot charge outright left every assertion
+    passing.
+  * Kinds 14 and 15 report the last scan's slot count and saturation flag, so
+    the cutoff can be asserted rather than inferred.
+  * Kinds 11-13 report scans reported, total edges and DEPENDENT edges, all as
+    edge counts taken from the scan itself rather than from the described rows,
+    so the description caps can never make a found edge read as absent.
 
-Each asserts the refusal itself rather than tolerating a Completed, since a
-Completed would make the rest vacuous, and each then drives its context
-TERMINAL. That last part is not tidiness: this suite has a standing invariant
-that every test leaves no context pending -- stated in
-Unload_DroppedRootsWithoutAnyForcedAttempt's own comment and asserted through
-PendingUnloadsGauge -- and a first revision of these three sustained their
-refusals past the end of the test, which failed two OTHER tests. The refusal
-half of each now lives in its own non-inlined frame so the rooting probe (and
-the CWT, and the wide array) are unreachable before the teardown runs, which a
-local in the test's frame would not reliably be: the interpreter scans its live
-slot region conservatively.
+Four legs, and each covers something the others cannot:
+
+  * ST flag OFF -- feature inactive.
+  * ST flag ON + scan armed + lowered slot budget -- the only leg that executes
+    this code. Asserts kind 11 advances after a refusal, that a CWT dependent
+    edge onto the condemned wrapper is reported (with the table, key and array
+    PROMOTED first, which is the configuration the invalid liveness predicate
+    dropped), and that a reference array sized from the lowered budget crosses
+    the cutoff exactly at it.
+  * ST flag ON + scan OFF -- new. The feature is active so refusals are real,
+    and the scan must still do nothing. Nothing asserted this before: flag OFF
+    cannot (no refusal is possible) and MT cannot (the surface is compiled
+    out), so deleting the second opt-in -- making every flagged session pay for
+    a heap walk in every pause -- would have stayed green everywhere.
+  * MT -- the surface is compiled out and rejection is proved.
+
+The loader sentinel gained a scan dimension that REQUIRES all three referrer
+tests present and passed on both ST feature-ON legs. It previously returned OK
+with all three names absent, so deleting them was a silent no-op.
+
+Each test drives its context TERMINAL afterwards. That is not tidiness: this
+suite has a standing invariant that no test leaves a context pending -- stated
+in Unload_DroppedRootsWithoutAnyForcedAttempt's own comment and asserted
+through PendingUnloadsGauge -- and a first revision sustained its refusals past
+the end of the test, failing two OTHER tests. The refusal half of each now
+lives in its own non-inlined frame so the probe, the CWT and the wide array are
+unreachable before teardown, which a local in the test's frame would not
+reliably be given the interpreter scans its live slot region conservatively.
 
 Temporary diagnostic scaffolding on the same terms and the same tracking
 issue (#176) as the snapshot it complements: it retires when the residual
@@ -159,19 +193,19 @@ root is found and fixed, or when the stop-rule fires.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 232 ++++++++++++++
- .../mono/metadata/assembly-load-context.c     | 292 ++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         | 143 +++++++++
+ .../tests/ForcedNativeUnloadTests.cs          | 296 +++++++++++++++
+ .../mono/metadata/assembly-load-context.c     | 343 +++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         | 148 ++++++++
  src/mono/mono/metadata/loader-internals.h     |  15 +
- src/mono/mono/metadata/sgen-mono.c            | 293 ++++++++++++++++++
+ src/mono/mono/metadata/sgen-mono.c            | 306 ++++++++++++++++
  src/mono/mono/metadata/sgen-stw.c             |  16 +
- 6 files changed, 989 insertions(+), 2 deletions(-)
+ 6 files changed, 1122 insertions(+), 2 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 2b2f170..b51d33a 100644
+index 2b2f170..0bb1a45 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-@@ -178,6 +178,14 @@ private static bool FlagEnabled
+@@ -178,6 +178,28 @@ private static bool FlagEnabled
          private static bool GcHookRequested =>
              Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK") == "1";
  
@@ -183,10 +217,24 @@ index 2b2f170..b51d33a 100644
 +        private static bool ReferrerScanRequested =>
 +            Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REFERRER_SCAN") == "1";
 +
++        // Set by the armed CI leg to LOWER the referrer scan's reference-slot budget (the runtime
++        // clamps it to the production value, so it can only ever shrink). Without it, saturation is
++        // unreachable from a test -- a test heap cannot produce two million reference slots -- so
++        // deleting the per-slot charge outright would leave every assertion passing. Parsed rather
++        // than compared to "1" because the value is the budget.
++        private static int ReferrerScanSlotBudget
++        {
++            get
++            {
++                string value = Environment.GetEnvironmentVariable("MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET");
++                return int.TryParse(value, out int budget) && budget > 0 ? budget : 0;
++            }
++        }
++
          // Returns true (and the caller should no-op) only on a genuinely unpatched runtime. When CI
          // asserts the bridge must exist, a missing member fails loudly instead of self-skipping and
          // masking the regression.
-@@ -240,6 +248,17 @@ private static void GcQuiesce()
+@@ -240,6 +262,17 @@ private static void GcQuiesce()
          // Each NotQuiescent attempt must leave the once-only latch clear so a later attempt can
          // still Complete — i.e. the single retry is never consumed by a premature force.
          [MethodImpl(MethodImplOptions.NoInlining)]
@@ -204,7 +252,7 @@ index 2b2f170..b51d33a 100644
          private static async Task<int> ForceUntilCompletedAsync(AssemblyLoadContext context, int maxAttempts)
          {
              int outcome = NotQuiescent;
-@@ -1585,6 +1604,219 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
+@@ -1585,6 +1618,269 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
              await RunConservativelyPinnedLosWitnessProtocol();
          }
  
@@ -304,13 +352,22 @@ index 2b2f170..b51d33a 100644
 +                return;
 +            }
 +
-+            if (!ProtocolActive || !ReferrerScanRequested)
++            if (!ProtocolActive)
 +            {
 +                return;
 +            }
 +
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
 +            (int scansBefore, int scansAfter, int dependentEdges, int totalEdges) = RefuseWithDependentEdge(context);
++
++            if (!ReferrerScanRequested)
++            {
++                // Feature on, scan opt-in absent: the second gate must actually gate. Asserted
++                // rather than skipped, so deleting that opt-in cannot stay green.
++                Assert.Equal(scansBefore, scansAfter);
++                await DriveTerminalAsync(context);
++                return;
++            }
 +
 +            Assert.True(scansAfter > scansBefore,
 +                $"no referrer scan was reported (kind 11 was {scansBefore}, now {scansAfter}), so the dependent-edge figures below would describe a different scan.");
@@ -336,6 +393,13 @@ index 2b2f170..b51d33a 100644
 +            var key = new object();
 +            var table = new ConditionalWeakTable<object, object>();
 +            table.Add(key, context);
++
++            // PROMOTE the table, the key and the ephemeron array out of the nursery before the
++            // armed collection. This is the configuration that regressed: an earlier revision
++            // applied the collector's liveness predicate inside the ephemeron pass, and after
++            // ITERATE_OBJECTS_SWEEP_ALL cleared the major mark bits it read every promoted entry
++            // as dead and skipped it. Nursery-only entries would not have caught that.
++            GcQuiesce();
 +
 +            int scansBefore = ScoutStats(11);
 +            Assert.Equal(NotQuiescent, Force(context));
@@ -372,19 +436,51 @@ index 2b2f170..b51d33a 100644
 +                return;
 +            }
 +
-+            if (!ProtocolActive || !ReferrerScanRequested)
++            if (!ProtocolActive)
 +            {
 +                return;
 +            }
 +
++            int budget = ReferrerScanSlotBudget;
 +            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
-+            (int scansBefore, int scansAfter, int totalEdges) = RefuseWithWideReferenceArray(context);
++
++            // Enough non-null elements to cross a lowered budget several times over. Sized from the
++            // budget itself rather than hard-coded, so the test cannot silently stop crossing it if
++            // the leg's value changes.
++            int elements = budget > 0 ? Math.Min(budget * 4, 2_000_000) : 200_000;
++            (int scansBefore, int scansAfter, int totalEdges, int slotsVisited, int saturated) =
++                RefuseWithWideReferenceArray(context, elements);
++
++            if (!ReferrerScanRequested)
++            {
++                Assert.Equal(scansBefore, scansAfter);
++                await DriveTerminalAsync(context);
++                return;
++            }
 +
 +            Assert.True(scansAfter > scansBefore,
 +                $"the scan did not report with a large reference array live: kind 11 was {scansBefore}, now {scansAfter}. An unbounded per-slot cost would surface here as a hang or an abort rather than a missing report, so this failing at all is worth reading carefully.");
 +
-+            Assert.True(totalEdges > 0,
-+                $"kind 12 (edges) is {totalEdges}: the array holding the condemned wrapper produced no edge, so either the slot budget cut the walk short before reaching it or the element was not scanned.");
++            if (budget > 0)
++            {
++                // THE POINT OF THIS TEST. With the budget lowered below the array's element count,
++                // the charge must actually cut the walk off: slots looked up must stop AT the
++                // budget and saturation must be reported. Delete sgen_referrer_charge_slot and
++                // both of these fail, which the earlier version of this test could not detect --
++                // 200k elements never approached the 2,000,000 production budget, so guarded and
++                // unguarded code behaved identically.
++                Assert.Equal(1, saturated);
++                Assert.Equal(budget, slotsVisited);
++            }
++            else
++            {
++                // No lowered budget on this leg: the cutoff is unreachable, so only report that
++                // the walk completed. Explicitly NOT asserting saturation here -- with the
++                // production budget it would be asserting the constant's value.
++                Assert.Equal(0, saturated);
++                Assert.True(totalEdges > 0,
++                    $"kind 12 (edges) is {totalEdges}: the array holding the condemned wrapper produced no edge, so the element was not scanned.");
++            }
 +
 +            await DriveTerminalAsync(context);
 +        }
@@ -393,14 +489,14 @@ index 2b2f170..b51d33a 100644
 +        // it roots the witness and must be unreachable before the caller drives the context
 +        // terminal.
 +        [MethodImpl(MethodImplOptions.NoInlining)]
-+        private static (int ScansBefore, int ScansAfter, int TotalEdges) RefuseWithWideReferenceArray(
-+            AssemblyLoadContext context)
++        private static (int ScansBefore, int ScansAfter, int TotalEdges, int SlotsVisited, int Saturated)
++            RefuseWithWideReferenceArray(AssemblyLoadContext context, int elements)
 +        {
 +            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
 +
 +            // Every element non-null, so every element costs a slot charge. The last points at the
 +            // condemned wrapper, making the array a genuine referrer the walk cannot skip.
-+            object[] wide = new object[200_000];
++            object[] wide = new object[elements];
 +            object filler = new object();
 +            for (int i = 0; i < wide.Length; i++)
 +            {
@@ -414,21 +510,23 @@ index 2b2f170..b51d33a 100644
 +
 +            int scansAfter = ScoutStats(11);
 +            int totalEdges = ScoutStats(12);
++            int slotsVisited = ScoutStats(14);
++            int saturated = ScoutStats(15);
 +
 +            GC.KeepAlive(rooted);
 +            GC.KeepAlive(wide);
 +            GC.KeepAlive(filler);
-+            return (scansBefore, scansAfter, totalEdges);
++            return (scansBefore, scansAfter, totalEdges, slotsVisited, saturated);
 +        }
 +
          [Fact]
          public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
          {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..99895f5 100644
+index 1054345..bda279b 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,265 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,306 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -527,6 +625,14 @@ index 1054345..99895f5 100644
 +static gint32 alc_referrer_last_edges;
 +static gint32 alc_referrer_last_dependent_edges;
 +
++/* Reference slots looked up by the most recently reported scan, and whether that scan SATURATED.
++ * Kinds 14 and 15. Without these the slot budget could only be asserted by reading the source:
++ * a test heap cannot reach the production budget, so nothing could tell a working charge from a
++ * deleted one. With a lowered budget (see alc_referrer_scan_slot_budget) a test can cross the
++ * cutoff deliberately and assert that it was crossed. */
++static gint32 alc_referrer_last_slots_visited;
++static gint32 alc_referrer_last_saturated;
++
 +/* Objects the pause-time walk may ENTER for reference scanning. Large enough to cover a
 + * stranding repro's heap, small enough that saturation is reported rather than silently paid
 + * for. */
@@ -542,6 +648,37 @@ index 1054345..99895f5 100644
 + * precisely what each budget does and does not cover -- an earlier revision of this comment
 + * claimed a "bounded slice of a pause", which was not true of either budget. */
 +#define ALC_REFERRER_SCAN_SLOT_BUDGET 2000000
++
++/*
++ * Test-visible LOWER bound for the slot budget, via
++ * MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET. Clamped to
++ * ALC_REFERRER_SCAN_SLOT_BUDGET, so an override can only ever SHRINK the walk and never lift the
++ * ceiling this surface promises -- the same direction-of-travel rule the condemned-handle walk's
++ * budget follows.
++ *
++ * It exists because saturation was otherwise unreachable from a test: a test heap cannot produce
++ * two million reference slots, so deleting the charge entirely would have left every assertion
++ * passing. A bound nothing can cross is a bound asserted by comment. Read once, because an env
++ * lookup must not happen inside a GC pause.
++ */
++static gint32
++alc_referrer_scan_slot_budget (void)
++{
++	static gint32 budget = -1;
++	if (budget == -1) {
++		budget = ALC_REFERRER_SCAN_SLOT_BUDGET;
++		char *val = g_getenv ("MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET");
++		if (val) {
++			gint64 parsed = g_ascii_strtoll (val, NULL, 10);
++			/* Only a positive, strictly smaller value is honoured; anything else leaves the
++			 * production budget in place rather than silently accepting nonsense. */
++			if (parsed > 0 && parsed < ALC_REFERRER_SCAN_SLOT_BUDGET)
++				budget = (gint32)parsed;
++			g_free (val);
++		}
++	}
++	return budget;
++}
 +
 +/* Explicit, separate opt-in on top of MONO_WASM_ENABLE_ALC_UNLOAD (see DOUBLE OPT-IN above).
 + * Read once: an env lookup must not be repeated inside a GC pause. */
@@ -642,7 +779,7 @@ index 1054345..99895f5 100644
 +	memset (&scan, 0, sizeof (scan));
 +	scan.condemned_objects = objects;
 +	scan.object_budget = ALC_REFERRER_SCAN_OBJECT_BUDGET;
-+	scan.reference_slot_budget = ALC_REFERRER_SCAN_SLOT_BUDGET;
++	scan.reference_slot_budget = alc_referrer_scan_slot_budget ();
 +	sgen_scan_referrers_of_condemned (&scan);
 +
 +	/* One summary line, then one line per described referrer. The summary carries the figures
@@ -652,7 +789,7 @@ index 1054345..99895f5 100644
 +		"[alc-referrers] witnesses=%u referenced=%d edges=%d dependent=%d described=%d objects=%d/%d slots=%d/%d ephemerons=%d saturated=%d",
 +		g_hash_table_size (objects), scan.witnesses_referenced, scan.referrer_edges,
 +		scan.dependent_edges, scan.referrers_recorded, scan.objects_scanned, scan.objects_visited,
-+		scan.reference_slots_visited, ALC_REFERRER_SCAN_SLOT_BUDGET,
++		scan.reference_slots_visited, alc_referrer_scan_slot_budget (),
 +		scan.ephemeron_entries_visited, scan.saturated ? 1 : 0);
 +
 +	for (gint32 i = 0; i < scan.referrers_recorded; ++i) {
@@ -681,6 +818,8 @@ index 1054345..99895f5 100644
 +	 * `dependent` rows in `referrers`, which reported 0 whenever the row or witness caps were
 +	 * already spent -- so a dependent edge that WAS found could read as absent. */
 +	alc_referrer_last_dependent_edges = scan.dependent_edges;
++	alc_referrer_last_slots_visited = scan.reference_slots_visited;
++	alc_referrer_last_saturated = scan.saturated ? 1 : 0;
 +	alc_referrer_scans_reported++;
 +
 +	g_hash_table_destroy (objects);
@@ -694,7 +833,7 @@ index 1054345..99895f5 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1212,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1253,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -710,7 +849,7 @@ index 1054345..99895f5 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
-@@ -1032,7 +1297,24 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1032,7 +1338,30 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
  	 *
@@ -732,11 +871,17 @@ index 1054345..99895f5 100644
 +	 * These are LAST-SCAN values, not monotonic; read kind 11 around them to know which scan they
 +	 * describe. Independent gauges, not a tuple.
 +	 *
-+	 * Kinds 14-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
++	 * Kinds 14 and 15 — reference slots looked up by the most recently reported referrer scan,
++	 * and whether that scan SATURATED. They exist so the slot budget is falsifiable: a test heap
++	 * cannot reach the production budget, so without a lowered budget (see
++	 * MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET) and these two gauges, deleting the per-slot
++	 * charge outright would leave every assertion passing. Last-scan values, like kinds 12 and 13.
++	 *
++	 * Kinds 16-24 DO NOT EXIST: the condemned-set root classification is not a family of stat
  	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
  	 * reasons in the "Root classification for condemned collectible contexts" block at the top
  	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
-@@ -1072,6 +1354,12 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1072,6 +1401,16 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
@@ -746,14 +891,18 @@ index 1054345..99895f5 100644
 +		return alc_referrer_last_edges;
 +	case 13:
 +		return alc_referrer_last_dependent_edges;
++	case 14:
++		return alc_referrer_last_slots_visited;
++	case 15:
++		return alc_referrer_last_saturated;
  	default:
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index 1c51c11..747d1fc 100644
+index 1c51c11..ca0f255 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -490,6 +490,149 @@ typedef struct {
+@@ -490,6 +490,154 @@ typedef struct {
  } MonoSgenCondemnedHandleScan;
  
  void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
@@ -879,6 +1028,11 @@ index 1c51c11..747d1fc 100644
 +	 * caps must not be able to make a found edge look absent, which is the whole reason this is
 +	 * separate from counting `dependent` rows in `referrers`. */
 +	gint32 dependent_edges;
++	/* OUT: of referrer_edges, how many were DEPENDENT edges (ephemeron key->value). Counted for
++	 * every such edge found, independent of whether a row was recorded for it -- the description
++	 * caps must not be able to make a found edge look absent, which is the whole reason this is
++	 * separate from counting `dependent` rows in `referrers`. */
++	gint32 dependent_edges;
 +	/* OUT: distinct condemned objects found to have at least one referrer. */
 +	gint32 witnesses_referenced;
 +	/* OUT: objects the heap iterators presented. This is the TRUE total, not an estimate: the
@@ -930,10 +1084,10 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..2a569d0 100644
+index fd4e6e5..d22e3ef 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,299 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -2064,6 +2064,312 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -1165,37 +1319,39 @@ index fd4e6e5..2a569d0 100644
 +	sgen_referrer_scan_witnesses_admitted = 0;
 +
 +	/*
-+	 * The same three regions mono_gc_walk_heap covers, in the same order, because between them
-+	 * they are the heap: the nursery, the major heap, and the large-object space. Missing one
-+	 * would silently narrow the search and make an empty result untrustworthy in a way
-+	 * `saturated` does not report.
-+	 */
-+	sgen_clear_nursery_fragments ();
-+	sgen_scan_area_with_callback (sgen_nursery_section->data, sgen_nursery_section->end_data,
-+			sgen_referrer_visit_object, scan, FALSE, TRUE);
-+	sgen_major_collector.iterate_objects (ITERATE_OBJECTS_SWEEP_ALL, sgen_referrer_visit_object, scan);
-+	sgen_los_iterate_objects (sgen_referrer_visit_object, scan);
-+
-+	/*
-+	 * SECOND PASS: dependent edges, which the three passes above CANNOT see.
++	 * FIRST PASS: dependent edges, which the heap walk below CANNOT see.
 +	 *
 +	 * sgen zeroes the GC bitmap for System.Runtime.Ephemeron (object.c, "An Ephemeron cannot be
 +	 * marked by sgen"), so an ephemeron array's descriptor reports no references and every
-+	 * descriptor-driven walk -- including this one -- misses the key->value edge entirely. The
-+	 * edge is nonetheless a real root: sgen_client_mark_ephemerons marks the value whenever the
-+	 * key is alive, which is exactly how a ConditionalWeakTable or DependentHandle keeps its
++	 * descriptor-driven walk -- including the one below -- misses the key->value edge entirely.
++	 * The edge is nonetheless a real root: sgen_client_mark_ephemerons marks the value whenever
++	 * the key is alive, which is exactly how a ConditionalWeakTable or DependentHandle keeps its
 +	 * value reachable. Without this pass a witness held only as a dependent value would produce
 +	 * an UNSATURATED EMPTY report, contradicting the one thing an empty report is supposed to
 +	 * mean.
 +	 *
-+	 * The liveness test and the tombstone skip mirror sgen_client_mark_ephemerons so that this
-+	 * pass reports the same edges the collector actually traverses -- a dead key's value is not
-+	 * a root, and reporting it would invent a holder. The referrer recorded is the KEY, since
-+	 * "alive as long as this key is" is the actionable identity; the array is not.
++	 * NO LIVENESS TEST, deliberately, and it would be WRONG to add one here.
++	 * sgen_client_clear_unreachable_ephemerons already ran inside the collection that is
++	 * finishing: it unlinked and freed every node whose array was dead, and tombstoned every
++	 * entry whose key was dead (clearing its value). So this list is ALREADY pruned to exactly
++	 * the live arrays and live-keyed entries, and skipping NULL/tombstone keys is the entire
++	 * test required. An earlier revision called sgen_is_object_alive_for_current_gen here to
++	 * mirror the collector, which silently dropped live PROMOTED entries: the major pass below
++	 * passes ITERATE_OBJECTS_SWEEP_ALL, marksweep's sweep_block clears block->mark_words, and
++	 * with sgen_current_collection_generation already -1 that predicate falls through to
++	 * sgen_major_is_object_alive and reads the cleared bit.
++	 *
++	 * RUNS FIRST, for two reasons. It shares the slot budget, and running it after the heap walk
++	 * meant a saturating walk could starve it completely -- silently reinstating the blind spot
++	 * this pass exists to close, in exactly the small-budget/large-heap case where it matters
++	 * most. It is also the cheapest pass and the one whose findings are most actionable.
++	 *
++	 * The referrer recorded is the KEY: "alive exactly as long as this key is" is the actionable
++	 * identity, and the ephemeron array that happens to hold the pair is not.
 +	 */
 +	for (EphemeronLinkNode *current = ephemeron_list; current; current = current->next) {
 +		MonoArray *array = current->array;
-+		if (!array || !sgen_is_object_alive_for_current_gen ((GCObject*)array))
++		if (!array)
 +			continue;
 +
 +		Ephemeron *cur = mono_array_addr_internal (array, Ephemeron, 0);
@@ -1206,15 +1362,13 @@ index fd4e6e5..2a569d0 100644
 +			GCObject *key = cur->key;
 +			if (!key || key == tombstone)
 +				continue;
-+			if (!sgen_is_object_alive_for_current_gen (key))
-+				continue;
 +
 +			GCObject *value = cur->value;
 +			if (!value)
 +				continue;
 +
-+			/* Charged like any other reference slot, so one enormous CWT cannot cost more than
-+			 * the budget allows. */
++			/* Charged like any other reference slot, so one enormous CWT cannot outspend the
++			 * budget. */
 +			if (!sgen_referrer_charge_slot ())
 +				break;
 +
@@ -1223,6 +1377,19 @@ index fd4e6e5..2a569d0 100644
 +				sgen_referrer_record (key, value, (guint32)(cur - mono_array_addr_internal (array, Ephemeron, 0)), TRUE);
 +		}
 +	}
++
++	/*
++	 * SECOND PASS: the same three regions mono_gc_walk_heap covers, in the same order, because
++	 * between them they are the heap: the nursery, the major heap, and the large-object space.
++	 * Missing one would silently narrow the search and make an empty result untrustworthy in a
++	 * way `saturated` does not report.
++	 */
++	sgen_clear_nursery_fragments ();
++	sgen_scan_area_with_callback (sgen_nursery_section->data, sgen_nursery_section->end_data,
++			sgen_referrer_visit_object, scan, FALSE, TRUE);
++	sgen_major_collector.iterate_objects (ITERATE_OBJECTS_SWEEP_ALL, sgen_referrer_visit_object, scan);
++	sgen_los_iterate_objects (sgen_referrer_visit_object, scan);
++
 +
 +	g_hash_table_destroy (sgen_referrer_scan_described);
 +	sgen_referrer_scan_described = NULL;

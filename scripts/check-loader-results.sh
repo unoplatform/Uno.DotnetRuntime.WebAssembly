@@ -8,21 +8,32 @@
 #   1. requires a real number of EXECUTED tests (passed + failed, i.e. excluding skipped);
 #   2. requires each named ALC lifecycle test to be PRESENT and PASSED (not skipped / not missing).
 #
-# Usage: check-loader-results.sh <testResults.xml> <label> [mode]
+# Usage: check-loader-results.sh <testResults.xml> <label> [mode] [scan]
 #   mode "st" (default): single-threaded browser leg. Requires the always-run lifecycle tests and
 #     intentionally does NOT require the threads-enabled rejection test (it is
 #     [ConditionalFact(IsThreadingSupported)] and self-skips there).
 #   mode "mt": multithread (WasmEnableThreads=true) leg. Additionally REQUIRES
 #     ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected to be present AND passed (not skipped) —
 #     this is the only leg where that test executes, proving the runtime rejects the feature.
+#   scan "referrer": additionally REQUIRES the condemned-referrer scan tests to be present and
+#     passed. Passed on the ST legs where the collectible feature is ON — BOTH with the scan
+#     opt-in and without it, because the unarmed run asserts that the second opt-in actually
+#     gates, so those tests execute either way. Without this dimension the sentinel returned OK
+#     with all three names absent, i.e. deleting them was a silent no-op.
 set -euo pipefail
 
 results="${1:?usage: check-loader-results.sh <testResults.xml> <label> [st|mt]}"
 label="${2:-run}"
 mode="${3:-st}"
+scan="${4:-none}"
 
 if [ "$mode" != "st" ] && [ "$mode" != "mt" ]; then
   echo "[$label] unknown mode '$mode' (expected 'st' or 'mt')"
+  exit 1
+fi
+
+if [ "$scan" != "none" ] && [ "$scan" != "referrer" ]; then
+  echo "[$label] unknown scan '$scan' (expected 'referrer' or omitted)"
   exit 1
 fi
 
@@ -92,6 +103,17 @@ ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected
 else
   : # ST legs: ForceNativeUnload_OnThreadsEnabledRuntime_IsRejected intentionally NOT required —
     # it self-skips there; the dedicated multithread leg (mode=mt) requires it instead.
+fi
+
+if [ "$scan" = "referrer" ]; then
+  # These execute on every ST leg with the collectible feature ON, armed or not: the unarmed run
+  # asserts the scan opt-in gates. Requiring them here is what stops their deletion — or a
+  # regression to self-skipping — from reading as green.
+  required_tests="$required_tests
+ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection
+ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge
+ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports
+"
 fi
 
 fail=0
