@@ -19,7 +19,8 @@
 #     passed. Passed on the ST legs where the collectible feature is ON — BOTH with the scan
 #     opt-in and without it, because the unarmed run asserts that the second opt-in actually
 #     gates, so those tests execute either way. Without this dimension the sentinel returned OK
-#     with all three names absent, i.e. deleting them was a silent no-op.
+#     with every one of those names absent, i.e. deleting them was a silent no-op. Add every new
+#     ForcedUnload_ReferrerScan_* test to the list below, or deleting it reads as green.
 set -euo pipefail
 
 results="${1:?usage: check-loader-results.sh <testResults.xml> <label> [st|mt]}"
@@ -111,6 +112,7 @@ if [ "$scan" = "referrer" ]; then
   # regression to self-skipping — from reading as green.
   required_tests="$required_tests
 ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection
+ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest
 ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge
 ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports
 "

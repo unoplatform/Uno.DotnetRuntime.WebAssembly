@@ -35,18 +35,61 @@ search space.
     tables; all this walk needs is one hash lookup per reference.
   * assembly-load-context.c owns the trigger, the condemned set and the
     report. A quiescence refusal is the only evidence a witness is still
-    held, so a refusal RECORDS A REQUEST; the next collection's
-    pre-start-world point serves it, because a heap walk is only legal with
-    the world stopped. Requests coalesce rather than queue, so a host that
-    retries in a loop gets one report rather than one per retry.
-  * sgen-stw.c calls the consumer at that point, before the profiler event,
-    under DISABLE_THREADS only.
+    held, so a refusal RECORDS A REQUEST; the END OF THE NEXT COLLECTION
+    serves it, because a heap walk is only legal with the world stopped and
+    the collection finished. Requests coalesce rather than queue, so a host
+    that retries in a loop gets one report rather than one per retry.
+  * sgen_client_collection_end is a NEW sgen client hook -- declared in
+    sgen/sgen-client.h, defined in sgen-mono.c, called from
+    sgen_perform_collection_inner immediately before sgen_restart_world --
+    that carries that call, under DISABLE_THREADS only. See A COLLECTION-ONLY
+    HOOK below for why the request cannot be served from
+    sgen_client_restart_world.
 
 DOUBLE OPT-IN. MONO_WASM_ENABLE_ALC_UNLOAD does not arm this on its own; it
 also needs MONO_WASM_ALC_UNLOAD_REFERRER_SCAN. Unlike the snapshot -- a
 read-only gauge a caller chooses to poll -- this adds work to a collection
 pause, so a flagged session that has not asked for referrers pays one load
 and a branch. The regression asserts that gating in both directions.
+
+A COLLECTION-ONLY HOOK, because the restart hook is not one. sgen_restart_world
+is reached from stop-the-worlds that never collect, so serving the one-shot
+request from sgen_client_restart_world let an unrelated caller consume it
+against an unswept heap:
+
+  * sgen_get_total_allocated_bytes (TRUE) -- the implementation of the
+    perfectly ordinary public GC.GetTotalAllocatedBytes (precise: true) -- does
+    LOCK_GC, sgen_stop_world, sgen_update_allocation_count, sgen_restart_world.
+    No collection.
+  * sgen_check_whole_heap_stw () does the same in verification mode.
+  * Neither argument discriminates: both pass generation 0, exactly as a
+    nursery collection does. sgen-stw.c's own "this is the wrong spot at we can
+    STW for non collection reasons" comment sits immediately above where the
+    call used to be.
+
+So after a refusal, a caller that merely read precise allocation bytes before
+the next GC.Collect would spend the request on a heap where
+sgen_client_clear_unreachable_ephemerons had not run. The ephemeron pass --
+which deliberately applies NO liveness predicate, precisely because it relies on
+that pruning -- could then report a dead-key or dead-array edge, and the
+descriptor pass a reference held only by unreachable garbage. Both are false
+positives on a surface whose whole value is that a negative result can be
+trusted, and both contradict the pruned-list invariant the pass rests on.
+
+The new hook is unreachable from either path by construction: it is called only
+from sgen_perform_collection_inner, inside `if (stw)`, after the collection and
+before the world restarts. A thin client hook rather than a direct call out of
+sgen-gc.c, because sgen-gc.c is collector core and includes nothing from
+metadata/ -- only sgen/ and utils/ -- so reaching loader-internals.h from there
+would have inverted that layering. sgen-mono.c is the mono client of sgen, it
+already includes a dozen metadata/ headers, and it is where every other
+sgen_client_* entry point lives.
+
+The discriminating regression is
+ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest:
+refuse, read kind 11, call GC.GetTotalAllocatedBytes (precise: true), require
+kind 11 UNCHANGED, then collect and require it to advance. Against the old call
+site the first assertion fails; against a hook that never fires the second does.
 
 TWO PASSES, because one is not exhaustive. The heap walk is descriptor-driven,
 and sgen zeroes the GC descriptor bitmap for System.Runtime.Ephemeron
@@ -104,25 +147,22 @@ the assembly trace, so it is invisible without --trace=asm at info or finer.
 An empty console is therefore never evidence of anything, which the contract
 block says in those words.
 
-THE PRECONDITION IS NOT ASSERTED, and that is deliberate rather than an
-omission. Two successive drafts asserted it wrongly, both of which would have
-aborted the runtime on the first armed scan, so the candidates are now
-recorded at the site so neither returns:
+HALF THE PRECONDITION IS NOW ASSERTED, which the old call site made impossible:
 
-  * sgen_current_collection_generation != -1 is false here. sgen clears the
-    generation at the end of the minor/major collection function, which runs
-    before sgen_restart_world.
-  * sgen_is_world_stopped () is also false here. sgen_restart_world clears
-    world_is_stopped BEFORE calling sgen_client_restart_world, so the flag is
-    already down when the hook runs. The mutators have NOT resumed --
-    unified_suspend_restart_world comes later in that same function -- but the
-    bookkeeping flag does not say so.
+  * STOPPED -- asserted. sgen_client_collection_end runs BEFORE
+    sgen_restart_world clears world_is_stopped, so sgen_is_world_stopped () is
+    TRUE there and the scan checks it. At the old site the flag had already been
+    cleared, and a draft that asserted it there aborted the runtime on the first
+    armed scan; the fix was the call site, not the assertion. It doubles as the
+    tripwire against moving the call back.
+  * FINISHED -- still not assertable, and recorded so it does not return. sgen
+    clears sgen_current_collection_generation at the end of the minor/major
+    collection function, which runs before the hook, so it reads -1 here exactly
+    as it does outside a collection. What establishes this half is the call
+    site, which is the entire point of the new hook.
 
 mono_gc_walk_heap has the identical contract and asserts nothing about the
-world either; it states the requirement and relies on its callers. This
-follows that precedent, and the single guarded call site is what establishes
-the invariant. A flag set by that caller purely to be asserted would certify
-nothing, so there is none.
+world either; it states the requirement and relies on its callers.
 
 Also worth flagging: taking alcs_lock inside a GC pause would be a real
 hazard on a threads-enabled runtime, where mono_coop_mutex_lock does a
@@ -162,11 +202,12 @@ Four legs, and each covers something the others cannot:
 
   * ST flag OFF -- feature inactive.
   * ST flag ON + scan armed + lowered slot budget -- the only leg that executes
-    this code. Asserts kind 11 advances after a refusal, that a CWT dependent
-    edge onto the condemned wrapper is reported (with the table, key and array
-    PROMOTED first, which is the configuration the invalid liveness predicate
-    dropped), and that a reference array sized from the lowered budget crosses
-    the cutoff exactly at it.
+    this code. Asserts kind 11 advances after a refusal, that a non-collection
+    stop-the-world does NOT advance it while the collection that follows does,
+    that a CWT dependent edge onto the condemned wrapper is reported (with the
+    table, key and array PROMOTED first, which is the configuration the invalid
+    liveness predicate dropped), and that a reference array sized from the
+    lowered budget crosses the cutoff exactly at it.
   * ST flag ON + scan OFF -- new. The feature is active so refusals are real,
     and the scan must still do nothing. Nothing asserted this before: flag OFF
     cannot (no refusal is possible) and MT cannot (the surface is compiled
@@ -174,9 +215,9 @@ Four legs, and each covers something the others cannot:
     a heap walk in every pause -- would have stayed green everywhere.
   * MT -- the surface is compiled out and rejection is proved.
 
-The loader sentinel gained a scan dimension that REQUIRES all three referrer
-tests present and passed on both ST feature-ON legs. It previously returned OK
-with all three names absent, so deleting them was a silent no-op.
+The loader sentinel's scan dimension REQUIRES all FOUR referrer tests present
+and passed on both ST feature-ON legs, so deleting one cannot read as green. It
+once returned OK with every one of those names absent.
 
 Each test drives its context TERMINAL afterwards. That is not tidiness: this
 suite has a standing invariant that no test leaves a context pending -- stated
@@ -193,16 +234,17 @@ root is found and fixed, or when the stop-rule fires.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 ---
- .../tests/ForcedNativeUnloadTests.cs          | 296 +++++++++++++++
- .../mono/metadata/assembly-load-context.c     | 350 +++++++++++++++++-
- src/mono/mono/metadata/gc-internals.h         | 143 +++++++
- src/mono/mono/metadata/loader-internals.h     |  15 +
- src/mono/mono/metadata/sgen-mono.c            | 306 +++++++++++++++
- src/mono/mono/metadata/sgen-stw.c             |  16 +
- 6 files changed, 1124 insertions(+), 2 deletions(-)
+ .../tests/ForcedNativeUnloadTests.cs          | 390 ++++++++++++++++++
+ .../mono/metadata/assembly-load-context.c     | 375 ++++++++++++++++-
+ src/mono/mono/metadata/gc-internals.h         | 148 +++++++
+ src/mono/mono/metadata/loader-internals.h     |  18 +
+ src/mono/mono/metadata/sgen-mono.c            | 345 ++++++++++++++++
+ src/mono/mono/sgen/sgen-client.h              |  18 +
+ src/mono/mono/sgen/sgen-gc.c                  |  14 +-
+ 7 files changed, 1304 insertions(+), 4 deletions(-)
 
 diff --git a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
-index 2b2f170..0bb1a45 100644
+index 2b2f170..b4462d6 100644
 --- a/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 +++ b/src/libraries/System.Runtime.Loader/tests/ForcedNativeUnloadTests.cs
 @@ -178,6 +178,28 @@ private static bool FlagEnabled
@@ -252,7 +294,7 @@ index 2b2f170..0bb1a45 100644
          private static async Task<int> ForceUntilCompletedAsync(AssemblyLoadContext context, int maxAttempts)
          {
              int outcome = NotQuiescent;
-@@ -1585,6 +1618,269 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
+@@ -1585,6 +1618,363 @@ public async Task ForcedUnload_RootedPointerFreeObjects_BlockNativeFree()
              await RunConservativelyPinnedLosWitnessProtocol();
          }
  
@@ -519,14 +561,108 @@ index 2b2f170..0bb1a45 100644
 +            return (scansBefore, scansAfter, totalEdges, slotsVisited, saturated);
 +        }
 +
++        /// <summary>
++        /// A stop-the-world that is NOT a collection must not consume the one-shot referrer-scan
++        /// request.
++        ///
++        /// The request used to be served from sgen_client_restart_world, which every
++        /// stop-the-world reaches -- not only collections. GC.GetTotalAllocatedBytes(precise: true)
++        /// is an ordinary public API that goes straight through to
++        /// sgen_get_total_allocated_bytes(TRUE): LOCK_GC, sgen_stop_world, update the allocation
++        /// counters, sgen_restart_world. It collects nothing at all, and sgen_check_whole_heap_stw
++        /// does the same in verification mode. Neither argument can discriminate either, because
++        /// both pass generation 0 exactly as a nursery collection does.
++        ///
++        /// Serving the request from there means serving it on an UNSWEPT heap, before
++        /// sgen_client_clear_unreachable_ephemerons has pruned the ephemeron list: the ephemeron
++        /// pass (which deliberately applies no liveness predicate, precisely because it relies on
++        /// that pruning) could report a dead-key or dead-array edge, and the descriptor pass could
++        /// report a reference held only by unreachable garbage -- while the real collection that
++        /// follows finds the request already spent and reports nothing.
++        ///
++        /// So: arm the request with a refusal, take a precise allocation-bytes reading, and require
++        /// stat kind 11 to be UNCHANGED; then collect and require it to advance. Moving the hook
++        /// back onto the restart path inverts both halves.
++        /// </summary>
++        [Fact]
++        public async Task ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest()
++        {
++            if (BridgeMissing())
++            {
++                return;
++            }
++
++            if (!ProtocolActive)
++            {
++                return;
++            }
++
++            var context = new ResourceAssemblyLoadContext(true) { LoadBy = LoadBy.Stream };
++            (int armed, int afterPreciseStw, int afterCollection) = RefuseThenStopTheWorldWithoutCollecting(context);
++
++            if (!ReferrerScanRequested)
++            {
++                // Feature on, scan opt-in absent: nothing is ever armed, so nothing may move --
++                // the same both-directions gating the sibling referrer tests assert.
++                Assert.Equal(armed, afterPreciseStw);
++                Assert.Equal(armed, afterCollection);
++                await DriveTerminalAsync(context);
++                return;
++            }
++
++            Assert.True(afterPreciseStw == armed,
++                $"GC.GetTotalAllocatedBytes(precise: true) stops the world WITHOUT collecting, but it consumed the armed referrer-scan request: kind 11 was {armed} and is now {afterPreciseStw}. The scan is being served from a stop-the-world hook instead of from collection completion (sgen_client_collection_end), so it can run on an unswept heap -- before sgen_client_clear_unreachable_ephemerons -- and report dead-key or unreachable-garbage edges.");
++
++            Assert.True(afterCollection > afterPreciseStw,
++                $"the request correctly survived the non-collection stop-the-world, but the collection that followed did not serve it: kind 11 is still {afterCollection}. The one-shot request must be consumed at collection completion, not merely left armed.");
++
++            // Undo the sustained refusal: see DriveTerminalAsync.
++            await DriveTerminalAsync(context);
++        }
++
++        // Own non-inlined frame, for the reason given on RefuseAndReadScanCount: the probe roots
++        // the witness across the refusal and both stop-the-worlds, and must be unreachable before
++        // the caller drives the context terminal.
++        [MethodImpl(MethodImplOptions.NoInlining)]
++        private static (int Armed, int AfterPreciseStw, int AfterCollection) RefuseThenStopTheWorldWithoutCollecting(
++            AssemblyLoadContext context)
++        {
++            object[] rooted = LoadUnloadReturningRootedPointerFreeProbe(context, losArray: true, new WeakReference[1]);
++
++            // Refuse once and let a REAL collection serve that first request, so the gauge is
++            // settled and the nursery is empty before the discriminating sequence below. Without
++            // this, an incidental nursery collection could serve the armed request between the
++            // arming force and the precise-bytes call, making the first assertion vacuous and the
++            // second one fail.
++            Assert.Equal(NotQuiescent, Force(context));
++            GcQuiesce();
++
++            // Arm. Nothing between here and the precise-bytes reading may collect; on a freshly
++            // quiesced nursery the few hundred bytes these two calls allocate cannot cause one.
++            Assert.Equal(NotQuiescent, Force(context));
++            int armed = ScoutStats(11);
++
++            // THE DISCRIMINATOR. Reaches sgen_get_total_allocated_bytes(TRUE), which stops and
++            // restarts the world and collects nothing. The armed request must survive it.
++            _ = GC.GetTotalAllocatedBytes(precise: true);
++            int afterPreciseStw = ScoutStats(11);
++
++            // And a real collection must then serve it.
++            GcQuiesce();
++            int afterCollection = ScoutStats(11);
++
++            GC.KeepAlive(rooted);
++            return (armed, afterPreciseStw, afterCollection);
++        }
++
          [Fact]
          public async Task ForceNativeUnload_AfterCompleted_ManagedLoadApisReject()
          {
 diff --git a/src/mono/mono/metadata/assembly-load-context.c b/src/mono/mono/metadata/assembly-load-context.c
-index 1054345..9b86cff 100644
+index 1054345..232d736 100644
 --- a/src/mono/mono/metadata/assembly-load-context.c
 +++ b/src/mono/mono/metadata/assembly-load-context.c
-@@ -515,6 +515,313 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
+@@ -515,6 +515,338 @@ alc_condemned_snapshot_fill (gint32 *fields, gint32 length, gint32 slot_budget)
  	return ALC_SNAPSHOT_FIELD_COUNT;
  }
  
@@ -541,8 +677,11 @@ index 1054345..9b86cff 100644
 + * REMOVAL. Temporary diagnostic scaffolding, on exactly the same terms and the same tracking
 + * issue as the snapshot.
 + * TODO(unoplatform/Uno.DotnetRuntime.WebAssembly#176): remove this block,
-+ * mono_alc_referrer_scan_at_gc_pause, its call site in sgen_client_restart_world and
-+ * sgen_scan_referrers_of_condemned once EITHER (a) the residual root is identified and fixed,
++ * mono_alc_referrer_scan_at_gc_pause, sgen_scan_referrers_of_condemned, and the
++ * sgen_client_collection_end hook added to carry the call (its declaration in
++ * sgen/sgen-client.h, its definition in sgen-mono.c and its call in sgen_perform_collection_inner
++ * -- unless another client has taken it up by then) once EITHER (a) the residual root is
++ * identified and fixed,
 + * or (b) the stop-rule fires.
 + *
 + * WHY THIS EXISTS AND THE SNAPSHOT DOES NOT SUFFICE. The snapshot answered its question in the
@@ -571,11 +710,31 @@ index 1054345..9b86cff 100644
 + * quiescence gate answering not-quiescent is the only evidence that a witness is still held.
 + * But that gate runs from an icall with the world RUNNING, and a heap walk is only legal with
 + * the world stopped and the collection finished (mono_gc_walk_heap's own contract). So a
-+ * refusal RECORDS A REQUEST and the next collection's pre-start-world point SERVES it. The
-+ * consequence is worth stating plainly: the report is not attributable to one specific refusal,
-+ * and if the process never collects again after a refusal, no report is ever produced. In the
-+ * host that motivated this, the drain loop collects between attempts, so a request is served
-+ * within one collection.
++ * refusal RECORDS A REQUEST and the END OF THE NEXT COLLECTION serves it, from
++ * sgen_client_collection_end -- the hook sgen calls with the collection complete and the mutators
++ * still suspended, immediately before restarting the world.
++ *
++ * NOT from sgen_client_restart_world, which is where an earlier revision put it and which is
++ * wrong: that hook runs on EVERY stop-the-world, and several ordinary ones never collect.
++ * sgen_get_total_allocated_bytes (TRUE) -- reached from the perfectly public
++ * GC.GetTotalAllocatedBytes (precise: true) -- only stops the world, updates counters and
++ * restarts it, and sgen_check_whole_heap_stw () does the same in verification mode; sgen-stw.c's
++ * own "this is the wrong spot at we can STW for non collection reasons" comment says as much. The
++ * arguments cannot discriminate either, since both of those pass generation 0 exactly as a
++ * nursery collection does. Served from there, a caller that merely read precise allocation bytes
++ * after a refusal would CONSUME the one-shot request against an UNSWEPT heap on which
++ * sgen_client_clear_unreachable_ephemerons had not run: the ephemeron pass could report a
++ * dead-key or dead-array edge, and the descriptor pass a reference held only by unreachable
++ * garbage -- both false positives, and both contradicting the pruned-list invariant the ephemeron
++ * pass rests on (see NO LIVENESS TEST in sgen_scan_referrers_of_condemned).
++ * ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest is the regression:
++ * refuse, read precise allocation bytes, require the request to SURVIVE, then collect and require
++ * it to be served.
++ *
++ * The consequence of serving at a collection is worth stating plainly: the report is not
++ * attributable to one specific refusal, and if the process never collects again after a refusal,
++ * no report is ever produced. In the host that motivated this, the drain loop collects between
++ * attempts, so a request is served within one collection.
 + *
 + * A request is a single flag, not a queue: while one is outstanding, further refusals coalesce
 + * into it. The alternative -- one report per refusal -- would emit the same referrer shape once
@@ -721,8 +880,10 @@ index 1054345..9b86cff 100644
 +}
 +
 +/*
-+ * Serve an outstanding request. Runs from sgen_client_restart_world with the world STOPPED and
-+ * the collection finished, which is the only point a heap walk is legal.
++ * Serve an outstanding request. Runs from sgen_client_collection_end with the world STOPPED and
++ * the collection FINISHED, which is the only point a heap walk is legal -- and, unlike
++ * sgen_client_restart_world, a hook that non-collection stop-the-worlds cannot reach. See WHEN IT
++ * RUNS above.
 + *
 + * The condemned object set is rebuilt HERE, inside the pause, and never carried in from the
 + * refusal that requested the scan: a moving collector relocates objects, so a set captured
@@ -840,7 +1001,7 @@ index 1054345..9b86cff 100644
  static void
  retired_scout_targets_add (MonoMemoryManager *memory_manager)
  {
-@@ -953,8 +1260,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
+@@ -953,8 +1285,14 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalForceNativeUnload (g
  	if (!alc->unloading)
  		return FORCE_UNLOAD_REJECTED;
  
@@ -856,7 +1017,7 @@ index 1054345..9b86cff 100644
  
  	mono_alc_free (alc);
  	return FORCE_UNLOAD_COMPLETED;
-@@ -1032,7 +1345,30 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1032,7 +1370,30 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  	 * scout ran and refused" from "the scout never ran": a never-dying witness climbs this
  	 * counter while kind 7 stays flat.
  	 *
@@ -888,7 +1049,7 @@ index 1054345..9b86cff 100644
  	 * kinds at all. It is delivered as one whole tuple by InternalGetCondemnedSnapshot, for the
  	 * reasons in the "Root classification for condemned collectible contexts" block at the top
  	 * of this file, which is its only contract. Unknown kinds keep returning -1 here.
-@@ -1072,6 +1408,16 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
+@@ -1072,6 +1433,16 @@ ves_icall_System_Runtime_Loader_AssemblyLoadContext_InternalGetScoutRetirementSt
  		return collectible_alc_native_structs;
  	case 10:
  		return scout_completion_deferral_count;
@@ -906,10 +1067,10 @@ index 1054345..9b86cff 100644
  		return -1;
  	}
 diff --git a/src/mono/mono/metadata/gc-internals.h b/src/mono/mono/metadata/gc-internals.h
-index 1c51c11..747d1fc 100644
+index 1c51c11..4483e9f 100644
 --- a/src/mono/mono/metadata/gc-internals.h
 +++ b/src/mono/mono/metadata/gc-internals.h
-@@ -490,6 +490,149 @@ typedef struct {
+@@ -490,6 +490,154 @@ typedef struct {
  } MonoSgenCondemnedHandleScan;
  
  void sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan);
@@ -928,17 +1089,22 @@ index 1c51c11..747d1fc 100644
 + * the referrers themselves.
 + *
 + * PRECONDITION, and the reason this one differs from its sibling: the heap walk is only legal
-+ * with the mutators still suspended and the collection finished, i.e. from the
-+ * MONO_GC_EVENT_PRE_START_WORLD point (see mono_gc_walk_heap's own contract in sgen-mono.c).
-+ * The handle scan runs with the world RUNNING instead, from an ordinary icall, because it only
-+ * reads handle slots and must not observe a collector mid-rewrite.
++ * with the mutators still suspended AND the collection finished, i.e. from
++ * sgen_client_collection_end (see mono_gc_walk_heap's own contract in sgen-mono.c). The handle
++ * scan runs with the world RUNNING instead, from an ordinary icall, because it only reads handle
++ * slots and must not observe a collector mid-rewrite.
 + *
-+ * It is NOT asserted, and neither of the two predicates one would reach for says what it looks
-+ * like it says at this point -- both read the same at the hook as they do outside a collection:
-+ * sgen clears sgen_current_collection_generation before restarting, and sgen_restart_world
-+ * clears world_is_stopped BEFORE calling sgen_client_restart_world, so sgen_is_world_stopped ()
-+ * is already FALSE while the mutators are still suspended. The definition in sgen-mono.c
-+ * records both dead ends; do not reintroduce either assertion.
++ * The STOPPED half is asserted. sgen calls sgen_client_collection_end before sgen_restart_world
++ * clears world_is_stopped, so sgen_is_world_stopped () is TRUE there and the definition in
++ * sgen-mono.c checks it -- which doubles as the tripwire against moving the call back into
++ * sgen_client_restart_world, where the flag has already been cleared and where non-collection
++ * stop-the-worlds arrive too.
++ *
++ * The FINISHED half cannot be asserted at all: sgen clears sgen_current_collection_generation at
++ * the end of the minor/major collection function, so it reads -1 here exactly as it does outside
++ * a collection. Do not reintroduce that assertion. The CALL SITE is what establishes it, and
++ * sgen_client_collection_end exists so that the site cannot be a stop-the-world which never
++ * collected.
 + *
 + * COMPLETENESS, which is what an unsaturated EMPTY result rests on. Descriptor scanning alone is
 + * NOT exhaustive: sgen deliberately zeroes the GC bitmap for System.Runtime.Ephemeron (object.c,
@@ -1060,19 +1226,22 @@ index 1c51c11..747d1fc 100644
  
  #endif /* __MONO_METADATA_GC_INTERNAL_H__ */
 diff --git a/src/mono/mono/metadata/loader-internals.h b/src/mono/mono/metadata/loader-internals.h
-index 4275a39..4a3191e 100644
+index 4275a39..7047067 100644
 --- a/src/mono/mono/metadata/loader-internals.h
 +++ b/src/mono/mono/metadata/loader-internals.h
-@@ -291,6 +291,21 @@ mono_alc_get_all_loaded_assemblies (void);
+@@ -291,6 +291,24 @@ mono_alc_get_all_loaded_assemblies (void);
  GPtrArray*
  mono_alc_get_all (void);
  
 +#ifdef DISABLE_THREADS
 +/*
 + * Serve an outstanding condemned-referrer scan request. MUST be called with the world STOPPED
-+ * and the collection finished (the MONO_GC_EVENT_PRE_START_WORLD point), which is the only
-+ * place a heap walk is legal; sgen_client_restart_world is the sole caller. A no-op unless a
-+ * quiescence refusal requested a scan AND MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set.
++ * and the collection FINISHED, which is the only point a heap walk is legal;
++ * sgen_client_collection_end is the sole caller. That hook exists precisely so this cannot be
++ * reached from a stop-the-world that is not a collection -- see its comment in
++ * sgen/sgen-client.h -- and calling this from sgen_client_restart_world, as an earlier revision
++ * did, is wrong. A no-op unless a quiescence refusal requested a scan AND
++ * MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set.
 + *
 + * Diagnostic scaffolding for the host-triggered collectible-ALC unload work. The contract lives
 + * in the "Referrer lookup for condemned collectible contexts" block of assembly-load-context.c,
@@ -1086,10 +1255,18 @@ index 4275a39..4a3191e 100644
  mono_mem_manager_new (MonoAssemblyLoadContext **alcs, int nalcs, gboolean collectible);
  
 diff --git a/src/mono/mono/metadata/sgen-mono.c b/src/mono/mono/metadata/sgen-mono.c
-index fd4e6e5..d22e3ef 100644
+index fd4e6e5..5a7690c 100644
 --- a/src/mono/mono/metadata/sgen-mono.c
 +++ b/src/mono/mono/metadata/sgen-mono.c
-@@ -2064,6 +2064,312 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
+@@ -29,6 +29,7 @@
+ #include "metadata/sgen-mono.h"
+ #include "metadata/sgen-mono-ilgen.h"
+ #include "metadata/gc-internals.h"
++#include "metadata/loader-internals.h"
+ #include "metadata/handle.h"
+ #include "metadata/abi-details.h"
+ #include "utils/mono-memory-model.h"
+@@ -2064,8 +2065,352 @@ sgen_scan_handles_into_managers (MonoSgenCondemnedHandleScan *scan)
  
  	sgen_condemned_scan_in_progress = FALSE;
  }
@@ -1289,24 +1466,28 @@ index fd4e6e5..d22e3ef 100644
 +		return;
 +
 +	/*
-+	 * See PRECONDITION above. It is NOT asserted, and that is deliberate: at this hook there is
-+	 * no predicate that expresses it. Both obvious candidates are already false here, which is
-+	 * recorded so neither gets re-added:
++	 * See PRECONDITION above, and note that exactly one half of it is checkable here.
 +	 *
-+	 *   - sgen_current_collection_generation != -1. sgen clears the generation at the end of the
-+	 *     minor/major collection function, which runs before sgen_restart_world, so it reads -1
-+	 *     here exactly as it does outside a collection.
-+	 *   - sgen_is_world_stopped (). sgen_restart_world clears world_is_stopped BEFORE calling
-+	 *     sgen_client_restart_world, so the flag is already FALSE by the time this runs. The
-+	 *     mutators have not resumed yet -- unified_suspend_restart_world comes later in that
-+	 *     same function -- but the bookkeeping flag does not say so, and asserting on it aborts
-+	 *     the runtime on the first armed scan.
++	 * STOPPED -- asserted. The sole caller is sgen_client_collection_end, which sgen invokes from
++	 * sgen_perform_collection_inner BEFORE sgen_restart_world, so world_is_stopped is still set.
++	 * The assertion is kept deliberately as the TRIPWIRE against moving the call back into
++	 * sgen_client_restart_world: that hook runs after sgen_restart_world has cleared the flag --
++	 * and, worse, runs on stop-the-worlds that never collected at all -- so a move back aborts on
++	 * the first armed scan instead of quietly reporting edges off an unswept heap. An earlier
++	 * revision DID assert this from that hook and had to remove it; the fix was the call site, not
++	 * the assertion.
 +	 *
-+	 * mono_gc_walk_heap has the identical contract and asserts nothing about the world either;
-+	 * it states the requirement and relies on its callers. This follows that, and the one call
-+	 * site (sgen_client_restart_world, guarded) is what actually establishes the invariant. A
-+	 * self-certifying flag set by that caller would assert nothing of value, so there is none.
++	 * FINISHED -- not assertable, and recorded so it does not get re-added. sgen clears
++	 * sgen_current_collection_generation at the end of the minor/major collection function, which
++	 * runs before the hook, so it reads -1 here exactly as it does outside a collection. What makes
++	 * the property hold is the CALL SITE: sgen_client_collection_end is reached only from the
++	 * collection path, which is the entire reason that hook exists instead of reusing
++	 * sgen_client_restart_world (see its comment in sgen/sgen-client.h).
++	 *
++	 * mono_gc_walk_heap has the identical contract and asserts nothing about the world either; it
++	 * states the requirement and relies on its callers.
 +	 */
++	g_assert (sgen_is_world_stopped ());
 +	g_assert (!sgen_referrer_scan_in_progress);
 +
 +	/* No unbounded mode, for the same reason the handle scan has none: a diagnostic that runs
@@ -1401,38 +1582,94 @@ index fd4e6e5..d22e3ef 100644
 +}
  #endif /* DISABLE_THREADS */
  
- /*
-diff --git a/src/mono/mono/metadata/sgen-stw.c b/src/mono/mono/metadata/sgen-stw.c
-index daaafba..7818d1e 100644
---- a/src/mono/mono/metadata/sgen-stw.c
-+++ b/src/mono/mono/metadata/sgen-stw.c
-@@ -25,6 +25,7 @@
- #include "sgen/sgen-client.h"
- #include "metadata/sgen-bridge-internals.h"
- #include "metadata/gc-internals.h"
-+#include "metadata/loader-internals.h"
- #include "utils/mono-threads.h"
- #include "utils/mono-threads-debug.h"
- #ifdef HOST_BROWSER
-@@ -195,6 +196,21 @@ sgen_client_restart_world (int generation, gboolean serial_collection, gint64 *s
- 	if (MONO_PROFILER_ENABLED (gc_resize))
- 		mono_sgen_gc_event_resize ();
- 
++/*
++ * Collection-completion hook: sgen calls this from sgen_perform_collection_inner immediately
++ * before sgen_restart_world, so the collection has FINISHED and the mutators are still suspended.
++ * Nothing else is dispatched from here; see sgen/sgen-client.h for the contract.
++ *
++ * It exists because sgen_client_restart_world -- where an earlier revision of the diagnostic below
++ * was called from -- is NOT a collection-only hook. The world is also stopped and restarted with
++ * no collection at all by sgen_get_total_allocated_bytes (TRUE), which is the implementation of
++ * the ordinary public GC.GetTotalAllocatedBytes (precise: true), and by sgen_check_whole_heap_stw
++ * () in verification mode; sgen-stw.c's own "this is the wrong spot at we can STW for non
++ * collection reasons" comment says as much. The arguments cannot discriminate either, since both
++ * of those pass generation 0 exactly as a nursery collection does.
++ *
++ * From the restart hook, a caller that merely read precise allocation bytes after a refusal would
++ * CONSUME the one-shot referrer-scan request against an unswept heap on which
++ * sgen_client_clear_unreachable_ephemerons had not run: the ephemeron pass could then report a
++ * dead-key or dead-array edge, and the descriptor pass a reference held only by unreachable
++ * garbage. Both are false positives, and both contradict the pruned-list invariant that pass
++ * rests on. Do not move the call back;
++ * ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest fails if anyone does,
++ * and sgen_scan_referrers_of_condemned's sgen_is_world_stopped () assertion aborts on the first
++ * armed scan.
++ *
++ * The generation/serial_collection arguments mirror the stop/restart pair this sits beside and
++ * describe the collection that just ended; nothing dispatched from here needs them yet.
++ */
++void
++sgen_client_collection_end (int generation, gboolean serial_collection)
++{
 +#ifdef DISABLE_THREADS
-+	/*
-+	 * Diagnostic scaffolding for the host-triggered collectible-ALC unload work: a quiescence
-+	 * refusal cannot walk the heap itself (it runs with the world running), so it records a
-+	 * request and this point -- world stopped, collection finished -- serves it. A no-op unless
-+	 * a request is outstanding and MONO_WASM_ALC_UNLOAD_REFERRER_SCAN is set, so an ordinary
-+	 * collection pays one load and a branch. See the "Referrer lookup for condemned collectible
-+	 * contexts" block in assembly-load-context.c, which names the tracking issue for removal.
-+	 *
-+	 * Placed BEFORE the profiler event so it observes the same heap a PRE_START_WORLD handler
-+	 * would, and cannot be reordered behind a handler that allocates.
-+	 */
 +	mono_alc_referrer_scan_at_gc_pause ();
 +#endif
++}
 +
- 	MONO_PROFILER_RAISE (gc_event, (MONO_GC_EVENT_PRE_START_WORLD, generation, serial_collection));
+ /*
+  * Threads
+  */
+diff --git a/src/mono/mono/sgen/sgen-client.h b/src/mono/mono/sgen/sgen-client.h
+index 6ecfa09..5ffd275 100644
+--- a/src/mono/mono/sgen/sgen-client.h
++++ b/src/mono/mono/sgen/sgen-client.h
+@@ -192,6 +192,24 @@ void sgen_client_stop_world (int generation, gboolean serial_collection)
+ void sgen_client_restart_world (int generation, gboolean serial_collection, gint64 *stw_time)
+     MONO_PERMIT (need (sgen_gc_locked));
  
- 	FOREACH_THREAD_ALL (info) {
++/*
++ * Called at the end of a COLLECTION, with the mutators still suspended, immediately before the
++ * world is restarted.
++ *
++ * This is deliberately NOT `sgen_client_restart_world`, which is reached from every
++ * stop-the-world, collection or not.  `sgen_get_total_allocated_bytes (TRUE)` -- the
++ * implementation of the ordinary public `GC.GetTotalAllocatedBytes (precise: true)` -- and
++ * `sgen_check_whole_heap_stw ()` both stop the world, do their work and restart it WITHOUT
++ * collecting anything, and the arguments cannot tell the cases apart either, since both of those
++ * pass generation 0 exactly as a nursery collection does.
++ *
++ * So client work that depends on the collection having FINISHED -- a swept heap, unreachable
++ * objects no longer holding references, `sgen_client_clear_unreachable_ephemerons` having pruned
++ * the ephemeron list -- belongs here, and is silently wrong in the restart hook.
++ */
++void sgen_client_collection_end (int generation, gboolean serial_collection)
++    MONO_PERMIT (need (sgen_gc_locked, sgen_world_stopped));
++
+ /*
+  * Must return FALSE.  The bridge is not supported outside of Mono.
+  */
+diff --git a/src/mono/mono/sgen/sgen-gc.c b/src/mono/mono/sgen/sgen-gc.c
+index 5457c34..8345b98 100644
+--- a/src/mono/mono/sgen/sgen-gc.c
++++ b/src/mono/mono/sgen/sgen-gc.c
+@@ -2709,8 +2709,18 @@ sgen_perform_collection_inner (size_t requested_size, int generation_to_collect,
+ 
+ 	time_max = MAX (time_max, time_last);
+ 
+-	if (stw)
+-		sgen_restart_world (oldest_generation_collected, forced_serial || !sgen_major_collector.is_concurrent);
++	if (stw) {
++		gboolean restart_serial = forced_serial || !sgen_major_collector.is_concurrent;
++
++		/*
++		 * The collection is finished and the mutators are still suspended: the one point at which a
++		 * client may look at a fully swept heap.  Kept separate from `sgen_client_restart_world`,
++		 * which is also reached from stop-the-worlds that never collect -- see the hook's comment in
++		 * sgen-client.h.
++		 */
++		sgen_client_collection_end (oldest_generation_collected, restart_serial);
++		sgen_restart_world (oldest_generation_collected, restart_serial);
++	}
+ }
+ 
+ #ifdef HOST_BROWSER
