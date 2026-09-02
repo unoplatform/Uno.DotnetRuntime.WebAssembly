@@ -23,7 +23,7 @@
 #     ForcedUnload_ReferrerScan_* test to the list below, or deleting it reads as green.
 set -euo pipefail
 
-results="${1:?usage: check-loader-results.sh <testResults.xml> <label> [st|mt]}"
+results="${1:?usage: check-loader-results.sh <testResults.xml> <label> [st|mt] [none|referrer]}"
 label="${2:-run}"
 mode="${3:-st}"
 scan="${4:-none}"
