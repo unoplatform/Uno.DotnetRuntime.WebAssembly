@@ -55,7 +55,7 @@ executed=$((passed + failed))
 echo "[$label] mode=$mode passed=$passed failed=$failed skipped=$skipped executed(passed+failed)=$executed"
 
 # A real threshold on EXECUTED (non-skipped) tests: a vacuous or all-skipped run must fail. Kept
-# meaningfully close to the observed count (47 on the ST legs, 48 on MT at the time of writing) so
+# meaningfully close to the observed count (48 on the ST legs, 49 on MT at the time of writing) so
 # a partial run cannot slip through, with enough headroom that adding or splitting a test does not
 # require touching this line. Raise it whenever the required list below grows substantially.
 MIN_EXECUTED=44
@@ -115,6 +115,7 @@ ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection
 ForcedUnload_ReferrerScan_NonCollectionStopTheWorldDoesNotServeTheRequest
 ForcedUnload_ReferrerScan_ReportsConditionalWeakTableDependentEdge
 ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports
+ForcedUnload_ReferrerScan_NurseryOnlyCollectionDoesNotServeTheRequest
 "
 fi
 
