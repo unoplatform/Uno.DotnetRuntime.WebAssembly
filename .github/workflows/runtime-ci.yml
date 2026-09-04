@@ -539,36 +539,14 @@ jobs:
         # MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 arms the deterministic native GC hook that collects
         # inside the reflection-hash construction window (kind 4 of the stats icall); with the
         # flag OFF no ALC is collectible, so the tests assert the armed hook never fires.
-        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
-        # earlier leg or rerun left behind, so the file this step validates can only have
-        # been produced by the invocation below.
-        suite=artifacts/bin/System.Runtime.Loader.Tests
-        if [ -d "$suite" ]; then
-          find "$suite" -name testResults.xml -delete
-        fi
-        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
-          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
-          /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
-        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
-        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
-        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
-        # 0 without emitting results, and another leg in this same job leaves its own
-        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
-        # while the guard still passed. Zero matches means this invocation produced nothing;
-        # more than one means the selection is ambiguous. Both are hard failures.
-        matches=$(find "$suite" -name testResults.xml)
-        count=$(printf '%s\n' "$matches" | grep -c . || true)
-        if [ "$count" -ne 1 ]; then
-          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
-          printf '%s\n' "$matches" >&2
-          exit 1
-        fi
-        results=$matches
-        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-off.xml"
-        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
-        # file mode — a newly-added .sh may land without the executable bit on checkout.
-        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag OFF"
+        # The stale-result guard, the build invocation and the sentinel call live in
+        # scripts/run-loader-leg.sh, shared by all three single-threaded legs. Invoked via `bash`
+        # (not by path) so the step is robust regardless of the script's file mode — a newly-added
+        # .sh may land without the executable bit on checkout.
+        bash "$GITHUB_WORKSPACE/scripts/run-loader-leg.sh" "flag OFF" loader-results-flag-off.xml st none \
+          --setenv=MONO_WASM_ENABLE_ALC_UNLOAD=0 \
+          --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1
 
     - name: Run System.Runtime.Loader tests (flag ON — MONO_WASM_ENABLE_ALC_UNLOAD)
       run: |
@@ -579,36 +557,53 @@ jobs:
         # pinned-holder construction window, and the pressure test asserts the fire counter
         # (kind 4) advanced at least once per init — reverting the holder pins fails this leg
         # deterministically instead of depending on stochastic churn.
-        # Stale-result guard (see the exactly-one selection below): clear any testResults.xml a
-        # earlier leg or rerun left behind, so the file this step validates can only have
-        # been produced by the invocation below.
-        suite=artifacts/bin/System.Runtime.Loader.Tests
-        if [ -d "$suite" ]; then
-          find "$suite" -name testResults.xml -delete
-        fi
-        ./dotnet.sh build /t:Test src/libraries/System.Runtime.Loader/tests \
-          /p:TargetOS=browser /p:TargetArchitecture=wasm /p:Configuration=Release \
-          /p:InstallV8ForTests=true \
-          "/p:WasmXHarnessMonoArgs=--setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1"
-        # Exactly-one selection (stale-result guard): every testResults.xml under the suite's
-        # artifacts dir was deleted BEFORE the invocation above, so require EXACTLY ONE here.
-        # A newest-file selector plus a `-z` emptiness check was not enough: `/t:Test` can exit
-        # 0 without emitting results, and another leg in this same job leaves its own
-        # testResults.xml behind, so the selector would silently re-validate the OTHER leg's XML
-        # while the guard still passed. Zero matches means this invocation produced nothing;
-        # more than one means the selection is ambiguous. Both are hard failures.
-        matches=$(find "$suite" -name testResults.xml)
-        count=$(printf '%s\n' "$matches" | grep -c . || true)
-        if [ "$count" -ne 1 ]; then
-          echo "::error::Expected exactly one testResults.xml under $suite produced by this invocation, found $count." >&2
-          printf '%s\n' "$matches" >&2
-          exit 1
-        fi
-        results=$matches
-        cp "$results" "$GITHUB_WORKSPACE/loader-results-flag-on.xml"
-        # Invoke via `bash` (not by path) so the step is robust regardless of the script's
-        # file mode — a newly-added .sh may land without the executable bit on checkout.
-        bash "$GITHUB_WORKSPACE/scripts/check-loader-results.sh" "$results" "flag ON"
+        # MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET=50000 LOWERS the referrer scan's reference-slot
+        # budget (the runtime clamps it to the production value, so an override can only shrink the
+        # walk). Without it saturation is unreachable from a test — a test heap cannot produce two
+        # million reference slots — so deleting the per-slot charge outright would leave every
+        # assertion passing. ForcedUnload_ReferrerScan_LargeReferenceArrayStillReports sizes its
+        # array from this value and asserts the cutoff is crossed exactly at it.
+        # MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 arms the pause-time condemned-referrer scan. This
+        # is the ONLY leg that arms it, and it exists because nothing did: that code shipped a
+        # wrong precondition assertion twice while every build stayed green, since its only other
+        # output is trace text no test can read. Armed here,
+        # ForcedUnload_ReferrerScan_RefusalIsServedAtNextCollection asserts stat kind 11 advances
+        # after a refusal plus a collection — so an abort or an early return inside the pause hook
+        # fails this leg instead of passing silently. The MT leg deliberately stays unarmed: the
+        # surface is compiled out there and that job's charter is proving rejection.
+        # Shared leg body: see scripts/run-loader-leg.sh.
+        bash "$GITHUB_WORKSPACE/scripts/run-loader-leg.sh" "flag ON" loader-results-flag-on.xml st referrer \
+          --setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_REFERRER_SCAN=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_REFERRER_SLOT_BUDGET=50000
+
+    - name: Run System.Runtime.Loader tests (flag ON, referrer scan OFF — second opt-in gates)
+      run: |
+        set -e
+        cd runtime
+        # THE DOUBLE OPT-IN LEG. MONO_WASM_ENABLE_ALC_UNLOAD=1 with
+        # MONO_WASM_ALC_UNLOAD_REFERRER_SCAN deliberately ABSENT: the collectible teardown feature
+        # is fully active, so refusals are real and the referrer scan's request path is reachable —
+        # and it must still do nothing, because the scan needs its own opt-in.
+        #
+        # Without this leg that gating was asserted nowhere. The flag-OFF leg cannot cover it (with
+        # the feature off nothing is collectible, so no refusal happens at all) and the MT leg
+        # cannot (the surface is compiled out). So deleting the second opt-in check — making a
+        # flagged session silently pay for a heap walk in every collection pause — would have
+        # stayed green on every leg.
+        #
+        # The referrer tests assert kind 11 does NOT advance here after a real refusal, and the
+        # sentinel requires them present and passed, so they cannot regress to self-skipping and
+        # take the coverage with them.
+        #
+        # Shared leg body: see scripts/run-loader-leg.sh. The --setenv list is the flag-ON leg's
+        # MINUS the two referrer variables, which is the whole experiment.
+        bash "$GITHUB_WORKSPACE/scripts/run-loader-leg.sh" "flag ON scan OFF" loader-results-flag-on-scan-off.xml st referrer \
+          --setenv=MONO_WASM_ENABLE_ALC_UNLOAD=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_REQUIRE_BRIDGE=1 \
+          --setenv=MONO_WASM_ALC_UNLOAD_TEST_GC_HOOK=1
 
     - uses: actions/upload-artifact@v4
       if: ${{ always() }}
@@ -616,6 +611,7 @@ jobs:
         name: loader-wasm-test-logs
         path: |
           loader-results-flag-off.xml
+          loader-results-flag-on-scan-off.xml
           loader-results-flag-on.xml
           runtime/artifacts/log/**
 
